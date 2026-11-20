@@ -1,0 +1,27 @@
+node_modules
+dist
+dist-ssr
+*.local
+.vite
+coverage
+
+# 編輯器與系統檔
+.DS_Store
+Thumbs.db
+.idea
+.vscode/*
+!.vscode/extensions.json
+*.swp
+
+# 除錯用輸出
+*.log
+dev-debug.log
+
+# Windows 上 esbuild 的暫存目錄（TMPDIR 指向它，內容是隨機暫存檔，不該入庫）
+.tmp
+
+# 自簽憑證流程產出的金鑰（只在 VPS 上需要，絕不進版控）
+deploy/certs
+
+# 部署環境檔（含網域等本机設定）
+.env

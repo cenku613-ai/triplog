@@ -1,0 +1,33 @@
+{
+  "name": "tripest",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "TripLog — 離線優先的旅行行程與支出記錄 PWA",
+  "scripts": {
+    "dev": "vite",
+    "icons": "node scripts/gen-icons.mjs",
+    "build": "npm run icons && tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "dexie": "^4.0.8",
+    "leaflet": "^1.9.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.2"
+  },
+  "devDependencies": {
+    "@types/leaflet": "^1.9.12",
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.2",
+    "fake-indexeddb": "^6.0.0",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.6",
+    "vite-plugin-pwa": "^0.20.5",
+    "vitest": "^2.1.1"
+  }
+}

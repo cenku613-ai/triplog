@@ -1,0 +1,19 @@
+# 依賴與產物在映像內重建，不要從本機帶進去
+node_modules
+dist
+.vite
+
+# 版控與本機環境
+.git
+.gitignore
+*.log
+npm-debug.log*
+.DS_Store
+.env
+.env.*
+
+# 測試與編輯器
+src/**/*.test.ts
+coverage
+.idea
+.vscode

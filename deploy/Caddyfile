@@ -1,0 +1,24 @@
+# 只對外開放 443 的作法（不開 80）：
+# 關掉自動 HTTP→HTTPS 轉址後，Caddy 不會建立傾聽 80 的 server，
+# ACME 因此改用 TLS-ALPN-01 挑戰（只需要 443 能從公網連入）。
+# 若哪天開了 80，把 auto_https 那行拿掉即可回復轉址與 HTTP-01。
+{
+	auto_https disable_redirects
+	grace_period 3s
+}
+
+# Caddy 看到真正的網域作為 site address 時，會自動申請 Let's Encrypt 憑證。
+# TRIPLOG_DOMAIN 由 docker-compose 注入。
+{$TRIPLOG_DOMAIN} {
+	encode zstd gzip
+
+	# PWA 的安裝橫幅與 SW 註冊需要 HTTPS
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+	reverse_proxy triplog:8080
+
+	log {
+		output file /data/access.log
+		format console
+	}
+}

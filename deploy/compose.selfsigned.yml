@@ -1,0 +1,11 @@
+# 覆寫用：把 Caddy 換成「自簽 IP 憑證」模式。
+#   docker compose -f docker-compose.yml -f deploy/compose.selfsigned.yml --profile tls up -d --build
+services:
+  caddy:
+    environment:
+      TRIPLOG_IP: ${TRIPLOG_IP:?請先在 .env 寫 TRIPLOG_IP=<公網IP>，並跑 deploy/make-selfsigned.sh}
+    volumes:
+      - ./deploy/Caddyfile.selfsigned:/etc/caddy/Caddyfile:ro
+      - ./deploy/certs:/etc/caddy/certs:ro
+      - caddy_data:/data
+      - caddy_config:/config

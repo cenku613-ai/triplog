@@ -1,0 +1,18 @@
+# 沒有網域、只有公網 IP 時用這份：
+#   bash deploy/make-selfsigned.sh <你的IP>
+#   echo "TRIPLOG_IP=<你的IP>" >> .env
+#   docker compose -f docker-compose.yml -f deploy/compose.selfsigned.yml --profile tls up -d --build
+#
+# 憑證是自簽的，第一次開會看到警告；信任之後 Service Worker 才會註冊。
+{$TRIPLOG_IP} {
+	tls /etc/caddy/certs/triplog.crt /etc/caddy/certs/triplog.key
+
+	encode zstd gzip
+
+	reverse_proxy triplog:8080
+
+	log {
+		output file /data/access.log
+		format console
+	}
+}

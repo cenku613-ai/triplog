@@ -1,0 +1,49 @@
+name: triplog
+
+services:
+  triplog:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: triplog:latest
+    container_name: triplog
+    restart: unless-stopped
+    # 沒有網域時直接用它：http://<VPS IP>:${TRIPLOG_PORT}
+    # 有 Caddy 時建議只在本機綁 127.0.0.1，避免繞過 HTTPS 直連
+    ports:
+      - "${TRIPLOG_BIND:-0.0.0.0}:${TRIPLOG_PORT:-8080}:8080"
+    networks:
+      - triplog
+
+  # 有網域、要 HTTPS（PWA 安裝與 Service Worker 的必要條件）時才啟用：
+  #   docker compose --profile tls up -d --build
+  # Caddy 會自動申請並續期 Let's Encrypt 憑證
+  caddy:
+    image: caddy:2-alpine
+    container_name: triplog-caddy
+    restart: unless-stopped
+    profiles:
+      - tls
+    depends_on:
+      - triplog
+    ports:
+      # 只對外界 443：憑證用 TLS-ALPN-01 簽，不需要 80
+      # （Oracle 的 VCN 安全清單只要開 443 就夠）
+      - "443:443"
+    environment:
+      # 沒有值時 Caddyfile 的 site address 會變成空，deploy.sh 會先擋掉這種組合
+      TRIPLOG_DOMAIN: ${TRIPLOG_DOMAIN:-}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - triplog
+
+networks:
+  triplog:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:

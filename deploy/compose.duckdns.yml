@@ -1,0 +1,17 @@
+# 覆寫用：搭配 DuckDNS 免費子域名（沒有自有網域時的正規 HTTPS 解法）。
+#   .env 需要：DUCKDNS_SUBDOMAIN=你的名字  DUCKDNS_TOKEN=帳密token  TRIPLOG_DOMAIN=你的名字.duckdns.org
+#   docker compose -f docker-compose.yml -f deploy/compose.duckdns.yml --profile tls up -d --build
+# 每 5 分鐘把這台 VPS 的公網 IP 更新到 DuckDNS，Caddy 再自動簽 Let's Encrypt 憑證。
+services:
+  duckdns:
+    image: ghcr.io/linuxserver/duckdns:latest
+    container_name: triplog-duckdns
+    restart: unless-stopped
+    profiles:
+      - tls
+    environment:
+      SUBDOMAINS: ${DUCKDNS_SUBDOMAIN:?請在 .env 填 DUCKDNS_SUBDOMAIN（不含 .duckdns.org）}
+      TOKEN: ${DUCKDNS_TOKEN:?請在 .env 填 DuckDNS 的 token}
+      TZ: Asia/Taipei
+    networks:
+      - triplog
