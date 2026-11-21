@@ -21,6 +21,7 @@ import {
   loadAccount,
   loginWithGoogle,
   mountGoogleButton,
+  sameOriginBase,
   type AuthConfig,
 } from '../../lib/account';
 
@@ -29,7 +30,7 @@ type Phase = 'probing' | 'signin' | 'other';
 export function LoginGate({ onSkip, skipLabel }: { onSkip: () => void; skipLabel: string }) {
   const { t, lang } = useI18n();
   const saved = loadAccount();
-  const [server, setServer] = useState(saved?.baseUrl ?? loadSyncConfig()?.baseUrl ?? '');
+  const [server, setServer] = useState(saved?.baseUrl ?? loadSyncConfig()?.baseUrl ?? sameOriginBase());
   const [cfg, setCfg] = useState<AuthConfig | null>(null);
   const [phase, setPhase] = useState<Phase>(server ? 'probing' : 'signin');
   const [error, setError] = useState('');

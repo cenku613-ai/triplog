@@ -14,7 +14,7 @@ import { usePwaUpdate } from './pwa';
 import { useI18n } from '../i18n';
 import { describeSyncError, loadSyncConfig, syncNow } from '../lib/sync';
 import { isSessionToken } from '../lib/tokens';
-import { fetchAuthConfig, gateFor, loadAccount, rememberedMode } from '../lib/account';
+import { fetchAuthConfig, gateFor, loadAccount, rememberedMode, sameOriginBase } from '../lib/account';
 import { LoginGate } from '../features/auth/LoginGate';
 
 /**
@@ -266,8 +266,9 @@ function RouteGate() {
  * 帳號模式的閘門：只擋「這台裝置沒有有效 session、而伺服器只認帳號」這一種情況。
  *
  * 判斷順序是「本機有沒有憑證 → 這台部署是不是帳號模式」。模式先問本機記過的值，
- * 沒記過（或記的是舊的金鑰模式）而且有填過伺服器位址時，才補打一次公開的
- * /api/auth/config。金鑰模式改成帳號模式部署時，老裝置因此不會靜靜地一直 401。
+ * 沒記過（或記的是舊的金鑰模式）時補打一次公開的 /api/auth/config：位址取自已存的同步
+ * 設定，沒有就退回同一個 origin（正式機是 app 與 API 同站，新裝置不該為了看到登入鈕
+ * 而先去貼金鑰）。金鑰模式改成帳號模式部署時，老裝置因此不會靜靜地一直 401。
  */
 function AuthGate({ children }: { children: ReactNode }) {
   const { t } = useI18n();
@@ -289,7 +290,7 @@ function AuthGate({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (account || mode === 'account' || !navigator.onLine) return;
-    const server = loadSyncConfig()?.baseUrl ?? '';
+    const server = loadSyncConfig()?.baseUrl ?? sameOriginBase();
     if (!server) return;
     let cancelled = false;
     fetchAuthConfig(server)

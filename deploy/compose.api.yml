@@ -35,6 +35,22 @@ services:
       # 配對碼只有 8 個字（約 40 bits），靠這一條限制「別人亂猜」的 throughput：
       # 同一個 IP 每分鐘最多試 8 次，試錯不會累加，但洪水會被 429 擋下
       TRIPLOG_RATE_PAIR: ${TRIPLOG_RATE_PAIR:-8}
+      # ---- 帳號模式（Google 登入）----
+      # 不開啟 TRIPLOG_AUTH 時這裡全部是裝飾，伺服器維持金鑰模式，舊裝置感覺不到差別。
+      # 開了但沒給 CLIENT_ID 時容器會直接 exit（index.js 的 die），不會啟動一個沒人登得進來的站。
+      TRIPLOG_AUTH: ${TRIPLOG_AUTH:-0}
+      TRIPLOG_GOOGLE_CLIENT_ID: ${TRIPLOG_GOOGLE_CLIENT_ID:-}
+      # 要限死哪種信箱才登得了（例如只用學校那顆）時才填
+      TRIPLOG_GOOGLE_HOSTED_DOMAIN: ${TRIPLOG_GOOGLE_HOSTED_DOMAIN:-}
+      # session 有效天數，以及「登入已失效」時前端提示用的預設值
+      TRIPLOG_SESSION_DAYS: ${TRIPLOG_SESSION_DAYS:-30}
+      # 帳號模式下是否還接受主金鑰／tlk_ 憑證。預設「是」：MCP 與還沒登入的裝置不會斷；
+      # 等所有裝置都走過 Google 登入、且確認撤銷路徑沒問題，再改成 0 收緊
+      TRIPLOG_AUTH_ALLOW_KEYS: ${TRIPLOG_AUTH_ALLOW_KEYS:-1}
+      # 換 token 與驗證碼的限流（每分鐘、每 IP）；登入這條路有簽章要驗，預設給得比配對碼更寬
+      TRIPLOG_RATE_AUTH: ${TRIPLOG_RATE_AUTH:-12}
+      # 自架 JWKS only for 測試（本地冒煙用自簽 RSA）；正式環境留空走 Google 那組
+      TRIPLOG_GOOGLE_JWKS_URL: ${TRIPLOG_GOOGLE_JWKS_URL:-}
     volumes:
       - triplog_data:/data
     networks:

@@ -27,6 +27,7 @@ import {
   rememberMode,
   rememberedMode,
   revokeMySession,
+  sameOriginBase,
   sessionLive,
   type AccountState,
   type AuthConfig,
@@ -73,7 +74,7 @@ export function AccountCard() {
   // 沒登入時也要知道這台部署到底開沒開帳號模式，否則這張卡只能說「不知道」
   useEffect(() => {
     if (signedIn) return;
-    const server = loadSyncConfig()?.baseUrl ?? '';
+    const server = loadSyncConfig()?.baseUrl ?? sameOriginBase();
     if (!server) {
       setCfg(null);
       return;
@@ -121,7 +122,7 @@ export function AccountCard() {
           setBusy('login');
           setError('');
           try {
-            const server = loadSyncConfig()?.baseUrl ?? '';
+            const server = loadSyncConfig()?.baseUrl ?? sameOriginBase();
             const { account: next } = await loginWithGoogle(server, token, guessDeviceName());
             await finishLogin(next);
             window.location.hash = '#/';
@@ -221,7 +222,7 @@ export function AccountCard() {
   /* ------------------------------------------------------------- 未登入 */
 
   if (!signedIn) {
-    const server = loadSyncConfig()?.baseUrl ?? '';
+    const server = loadSyncConfig()?.baseUrl ?? sameOriginBase();
     return (
       <section className="card card-pad stack">
         <h3>{t('auth.title')}</h3>

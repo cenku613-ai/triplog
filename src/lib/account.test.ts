@@ -13,6 +13,7 @@ import {
   normalizeBase,
   rememberedMode,
   saveAccount,
+  sameOriginBase,
   sessionLive,
   type AccountState,
 } from './account';
@@ -162,6 +163,20 @@ describe('伺服器位址', () => {
     expect(() => normalizeBase('http://example.com')).toThrow(AuthError);
     expect(() => normalizeBase('not a url')).toThrow(AuthError);
     expect(normalizeBase('http://127.0.0.1:8788')).toBe('http://127.0.0.1:8788');
+  });
+
+  it('同站部署沒填過同步設定時，用頁面自己的 origin 問模式', () => {
+    vi.stubGlobal('location', { protocol: 'https:', origin: 'https://triplogmo.duckdns.org' });
+    expect(sameOriginBase()).toBe('https://triplogmo.duckdns.org');
+  });
+
+  it('檔開（file://）與沒有來源時回空字串：呼叫方要跳過探問，不是打一個打不通的位址', () => {
+    vi.stubGlobal('location', { protocol: 'file:', origin: 'null' });
+    expect(sameOriginBase()).toBe('');
+    vi.stubGlobal('location', { protocol: 'https:', origin: 'null' });
+    expect(sameOriginBase()).toBe('');
+    vi.stubGlobal('location', undefined);
+    expect(sameOriginBase()).toBe('');
   });
 });
 

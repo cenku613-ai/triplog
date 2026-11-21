@@ -141,6 +141,21 @@ export function gateFor(
 
 /* ------------------------------------------------------------ 伺服器位址 */
 
+/**
+ * 自己托管自己的部署（正式機就是這樣：app 與 /api 同一個 origin）在還沒填過
+ * 「設定 → 跨裝置同步」時也問得到模式。沒有這條 fallback，新裝置第一次開 app 就永遠
+ * 不會看到登入門——它必須先去貼金鑰，而那正是帳號制度想免掉的事。
+ *
+ * 只認 http(s)：檔開（file://）或 `origin === 'null'`（例如 about:blank）時回空字串，
+ * 呼叫方就跳過探問，本機記錄照用。
+ */
+export function sameOriginBase(): string {
+  if (typeof location === 'undefined') return '';
+  if (location.protocol !== 'https:' && location.protocol !== 'http:') return '';
+  const origin = String(location.origin ?? '');
+  return origin && origin !== 'null' ? origin.replace(/\/+$/, '') : '';
+}
+
 /** 去尾斜線＋檢查協定；https 以外只允許本機（開發時的 vite ↔ api） */
 export function normalizeBase(input: string): string {
   const raw = String(input ?? '').trim().replace(/\/+$/, '');
