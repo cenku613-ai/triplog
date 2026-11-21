@@ -13,6 +13,7 @@ import type { Trip } from '../db/types';
 import { usePwaUpdate } from './pwa';
 import { useI18n } from '../i18n';
 import { describeSyncError, loadSyncConfig, syncNow } from '../lib/sync';
+import { isSessionToken } from '../lib/tokens';
 import { fetchAuthConfig, gateFor, loadAccount, rememberedMode } from '../lib/account';
 import { LoginGate } from '../features/auth/LoginGate';
 
@@ -22,6 +23,13 @@ import { LoginGate } from '../features/auth/LoginGate';
  * 所以整包（含表單邏輯）只有走到 /share/ 時才載。
  */
 const SharePage = lazy(() => import('../features/share/SharePage').then((m) => ({ default: m.SharePage })));
+
+/**
+ * 「一起記的行程」是受邀者那一側的入口，只在有登入憑證時才掛進側欄：
+ * 金鑰模式下沒有可比對的身分，列出來只是一個按下去會報錯的選項。
+ * 整包跟分享頁一樣是 lazy——用不到的人不必多載共筆的表單邏輯。
+ */
+const SharedTripsPage = lazy(() => import('../features/share/SharedTripsPage').then((m) => ({ default: m.SharedTripsPage })));
 
 function Shell() {
   const { toast } = useUi();
@@ -76,9 +84,14 @@ function Shell() {
     }
   }, [needRefresh, offlineReady, reload, toast, t]);
 
+  // 共筆的入口只在「這台裝置是用 Google 登入的」時出現：金鑰模式沒有可比對的身分
+  const shared = loadSyncConfig();
   const nav = [
     { to: '/', label: t('nav.trips'), icon: '🧳', end: true },
     { to: '/expenses', label: t('nav.expenses'), icon: '💸', end: false },
+    ...(shared && isSessionToken(shared.apiKey)
+      ? [{ to: '/shared', label: t('invite.mineTitle'), icon: '🤝', end: false }]
+      : []),
     { to: '/settings', label: t('nav.settings'), icon: '⚙', end: false },
   ];
 
@@ -136,6 +149,12 @@ function Shell() {
         </Link>
         {!online ? <span className="badge">{t('net.offline')}</span> : null}
         <div className="actions">
+          {/* 手機沒有側欄，共筆的入口就掛在標頭上；金鑰模式下這顆不出現 */}
+          {shared && isSessionToken(shared.apiKey) ? (
+            <Link to="/shared" className="btn btn-sm">
+              {t('invite.mineTitle')}
+            </Link>
+          ) : null}
           <button className="btn btn-sm" onClick={() => setQuick(true)}>
             {t('expense.quickBtn')}
           </button>
@@ -148,6 +167,14 @@ function Shell() {
           <Route path="/t/:tripId" element={<TripDetailPage />} />
           <Route path="/expenses" element={<AllExpensesPage trips={trips} />} />
           <Route path="/settings" element={<SettingsPage />} />
+          <Route
+            path="/shared"
+            element={
+              <Suspense fallback={<div className='page' />}>
+                <SharedTripsPage />
+              </Suspense>
+            }
+          />
           <Route
             path="/quick-expense"
             element={<TripsLaunch onReady={() => setQuick(true)} />}

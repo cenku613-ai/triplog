@@ -212,6 +212,12 @@ const SCHEMA_HINT = {
     },
     serverSets: 'tripId (always the shared trip), createdAt, updatedAt, baseAmount',
   },
+  sharedByAccount: {
+    via: 'GET /api/trips/<tripId>/shared  ·  POST /api/trips/<tripId>/shared/expense|item  (bearer = 你自己那條 tls_ session)',
+    setup: 'POST /api/invites {tripId, email, role: read|write} · GET /api/invites · GET /api/invites/mine · POST /api/invites/revoke {id} · POST /api/invites/leave {tripId}',
+    rules: '認的是受邀者 Google 帳號裡那顆已驗證信箱，不是連結上的祕密；讀的是邀請人那份帳本的這一趟（不含照片）；role=write 才追加得動，一樣改不了別人的記錄、沒有刪除入口。',
+    dataLandsIn: '邀請人的分帳（snapshots.user_id），受邀者自己那份不會憑空多出一筆；他本機要看到這一趟就 GET /api/trips/<id>/shared 拉回來的確切副本。',
+  },
   notes: [
     'Write via POST /api/backup with a full triplog-backup document; the server merges by id and keeps the newest updatedAt.',
     'Prefer POST /api/sync with a partial document {trips: [], dayItems?, expenses?, categories?, photos?} so you never overwrite rows you did not read; the arrays you leave out must be [] (missing trips is treated as a malformed upload, not as an empty one).',
@@ -222,6 +228,7 @@ const SCHEMA_HINT = {
     'Pairing (no long key on the new device): POST /api/tokens/pairings {label,scope,expiresInMinutes<=120} (master only) returns an 8-char code shown once; the new device posts it to POST /api/pair {code,device} without any bearer and receives a fresh token (365 days). Codes are single-use, expire, and can be voided with POST /api/tokens/pairings/revoke {id}; GET /api/tokens/pairings lists them.',
     'Master key lifecycle: GET /api/tokens/master reports whether the key was rotated (once rotated, the .env TRIPLOG_API_KEY and TRIPLOG_READ_KEY stop being accepted). POST /api/tokens/master/rotate {confirm:"rotate-master"} returns the new key once; it refuses unless at least one live token exists (or confirm:"rotate-master-no-backup") so you cannot lock yourself out. Rolling back needs SSH: node server/src/cli.js master-reset.',
     'Accounts (only when the server runs with TRIPLOG_AUTH=1): GET /api/auth/config tells you the Google OAuth client id; POST /api/auth/google {idToken} exchanges a Google ID token for a tls_ session (first login claims the pre-account data); GET /api/auth/me and /api/auth/sessions use it; POST /api/auth/logout {id?} retires one session. Bearer slot takes the tls_ session or a tlk_/master key alike.',
+    'Sharing by identity (needs TRIPLOG_AUTH=1): POST /api/invites {tripId,email,role} binds one trip to a Google account\'s verified email; that person reads GET /api/trips/<tripId>/shared and, when role=write, appends with POST /api/trips/<tripId>/shared/expense|item into the inviter\'s ledger. Revoking the invite (or POST /api/invites/leave) cuts access at the next request; no rows are deleted in either direction.',
     'Tenancy: every read, write, stats and share call is scoped to the authenticated account. Sessions see that person\'s own ledger; the master key and tlk_ agent tokens see the legacy ledger (the one the app used before accounts existed), which is empty once somebody has claimed it. Check GET /api/health for auth.mode.',
   ],
 };
@@ -270,7 +277,8 @@ async function route(req, res) {
     return handleAuth(req, res, action, clientIp(req));
   }
 
-  const { uid, isMaster, issued, canRead, canWrite, reason } = resolveAuth(req);
+  const auth = resolveAuth(req);
+  const { uid, isMaster, issued, canRead, canWrite, reason } = auth;
   if (!canRead) {
     // 「還沒登入」與「金鑰不對」要分開講：前者缺的是登入鈕，後者缺的是正確的憑證
     if (AUTH_MODE && reason !== 'bad-credential') {
@@ -308,6 +316,13 @@ async function route(req, res) {
         .map(({ id, name, startDate, endDate, baseCurrency, color, archived, updatedAt }) => ({ id, name, startDate, endDate, baseCurrency, color, archived, updatedAt }));
       return send(res, 200, { ok: true, trips, counts: counts(snapshot) });
     }
+    // 共筆：受邀者讀的是邀請人那份帳本裡的那一趟，所以要在下面讀自己 base 之前分流出去
+    if (resource === 'trips' && parts[2] && parts[3] === 'shared') {
+      const grant = grantForRequest(auth, parts[2]);
+      if (!grant) return fail(res, 403, grantDenyReason(auth), { need: 'invite' });
+      return sharedReadForGrant(res, grant);
+    }
+    if (resource === 'invites') return handleInvites(req, res, parts[2] === 'mine' ? 'mine' : '', auth, null);
     if (resource === 'trips' && parts[2]) {
       const id = parts[2];
       if (parts[3] === 'export') {
@@ -525,6 +540,22 @@ async function route(req, res) {
       secret: minted.key,
       warning: '舊的主金鑰與只讀金鑰已失效；還在用舊鑰的裝置要重新配對或貼上新主金鑰',
     });
+  }
+
+  /* -------------------------------------------- 共筆邀請（受邀者憑信箱認身） */
+
+  if (resource === 'invites') return handleInvites(req, res, parts[2] ?? '', auth, body);
+
+  // 受邀者代記：寫進邀請人那份帳本，走的是與匿名連結同一條驗證，只能追加
+  if (resource === 'trips' && parts[2] && parts[3] === 'shared') {
+    const action = parts[4];
+    if (action !== 'expense' && action !== 'item') return fail(res, 404, '共筆只能追加 expense 或 item', {});
+    const grant = grantForRequest(auth, parts[2]);
+    if (!grant) return fail(res, 403, grantDenyReason(auth), { need: 'invite' });
+    if (grant.role !== 'write') return fail(res, 403, '這張邀請是唯讀的：看得到這趟，但不能替它記帳', {});
+    if (!limitShareWrite(`grant:${grant.id}|${ip}`)) return fail(res, 429, 'too many writes', { retryAfterMs: 60_000 });
+    const { snapshot: ownerBase } = store.base(grant.owner);
+    return sharedAppend(res, { snapshot: ownerBase, tripId: grant.tripId, uid: grant.owner, action, body });
   }
 
   /* ------------------------------------------------ 分享連結管理（要金鑰） */
@@ -828,24 +859,160 @@ async function handleShare(req, res, tokenPart, action) {
     } catch (err) {
       return fail(res, err.status ?? 400, err.message, {});
     }
-    const trip = findTrip(snapshot, share.tripId);
-    if (!trip) return fail(res, 404, '這趟旅行已經不在伺服器上（可能被清除，或還沒同步）', {});
-    const rows = snapshotRows(snapshot, share.tripId);
-    const ctx = { trip, existing: rows.existing, itemIds: rows.itemIds, maxOrder: rows.maxOrder, now: new Date().toISOString() };
-    let row;
-    let table;
-    try {
-      row = action === 'expense' ? sanitizeExpense(body, ctx) : sanitizeItem(body, ctx);
-      table = action === 'expense' ? 'expenses' : 'dayItems';
-    } catch (err) {
-      return fail(res, err instanceof ShareError ? err.status : 400, String(err.message ?? err), {});
-    }
-    const saved = store.put(partialOf(table, row), { uid: share.uid, source: 'share' });
-    store.touchShare(token, { write: true });
-    return send(res, 200, { ok: true, [action]: row, saved: { id: saved.id, unchanged: saved.unchanged === true } });
+    const out = sharedAppend(res, { snapshot, tripId: share.tripId, uid: share.uid, action, body, source: 'share' });
+    if (out === true) store.touchShare(token, { write: true });
+    return out;
   }
 
   return fail(res, 405, 'method not allowed', {});
+}
+
+/**
+ * 共筆寫入的共用核心：匿名連結與身分邀請最後都走到這裡，規則完全相同——
+ * 只能追加一筆支出或一筆行程項目，改不了別人的記錄，也沒有任何刪除的入口。
+ * 回傳 true 代表「回應已送出而且寫成了」，讓呼叫端決定要不要記一筆最後使用時間。
+ */
+function sharedAppend(res, { snapshot, tripId, uid, action, body, source = 'shared' }) {
+  const trip = findTrip(snapshot, tripId);
+  if (!trip) return fail(res, 404, '這趟旅行已經不在伺服器上（可能被清除，或還沒同步）', {});
+  const rows = snapshotRows(snapshot, tripId);
+  const ctx = { trip, existing: rows.existing, itemIds: rows.itemIds, maxOrder: rows.maxOrder, now: new Date().toISOString() };
+  let row;
+  let table;
+  try {
+    row = action === 'expense' ? sanitizeExpense(body, ctx) : sanitizeItem(body, ctx);
+    table = action === 'expense' ? 'expenses' : 'dayItems';
+  } catch (err) {
+    return fail(res, err instanceof ShareError ? err.status : 400, String(err.message ?? err), {});
+  }
+  const saved = store.put(partialOf(table, row), { uid, source });
+  send(res, 200, { ok: true, [action]: row, saved: { id: saved.id, unchanged: saved.unchanged === true } });
+  return true;
+}
+
+/**
+ * 受邀者憑身分能碰到哪一趟：比對的是他 Google 帳號裡那顆已驗證的信箱，
+ * 不是連結上的某個祕密。金鑰模式下 auth.user 是空的（那個世界裡沒有「人」），
+ * 沒有信箱可以比對，就當他沒被邀請過。
+ */
+function grantForRequest(auth, tripId) {
+  if (!AUTH_MODE || !auth?.user?.email) return null;
+  const grant = store.grantFor(String(tripId ?? '').slice(0, 64), auth.user.email);
+  return grant && !grant.revokedAt ? grant : null;
+}
+
+/** 為什麼這個人碰不到這趟：三種原因要分開講，否則使用者會去翻設定頁找一把根本不需要的金鑰 */
+function grantDenyReason(auth) {
+  if (!AUTH_MODE) return '這台伺服器還是金鑰模式，沒有身分邀請這回事：要同行代記就用分享連結';
+  if (!auth?.user?.email) return '共筆認的是 Google 帳號裡那顆已驗證的信箱，金鑰與 agent token 沒有身分可比對';
+  return `這趟旅行沒有邀請到 ${auth.user.email}，請邀請人在「同行與分享」裡加你的信箱`;
+}
+
+/** 邀請清單上那一趟的名字：同一個人的基準檔只解析一次，清單才不會被反覆讀檔拖慢 */
+function tripNameOf(cache, uid, tripId) {
+  if (!cache.has(uid)) {
+    try {
+      cache.set(uid, store.base(uid).snapshot);
+    } catch {
+      cache.set(uid, null);
+    }
+  }
+  const snap = cache.get(uid);
+  return snap ? findTrip(snap, tripId)?.name ?? null : null;
+}
+
+/** 讀給受邀者看的那一趟：讀的是邀請人那份帳本，不含照片，也不碰別的旅行 */
+function sharedReadForGrant(res, grant) {
+  const { snapshot } = store.base(grant.owner);
+  let payload;
+  try {
+    payload = sharePayload(snapshot, grant.tripId, { createdAt: grant.createdAt });
+  } catch (err) {
+    return fail(res, err.status ?? 500, String(err.message ?? err), {});
+  }
+  return send(res, 200, { ok: true, scope: 'grant', grant: { role: grant.role, tripId: grant.tripId }, ...payload });
+}
+
+/* ------------------------------------------------------------------ 邀請 */
+
+const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+/**
+ * 共筆邀請：身分就是那顆信箱，所以這裡不寄信、也不生出第二套 token。
+ *
+ * 邀請人記下「a@b.com 可以動這趟」，那個人用同一個信箱的 Google 帳號登入之後，
+ * 資料端點自己就認得出來；他換了信箱、或邀請被撤銷，權限跟著失效。連結在這條路上
+ * 只是「請他來著陸」的方便物，本身不帶任何授權，被轉傳十次也不會多出一個權限。
+ *
+ * 能邀的對象只有已驗證信箱：後端在登入那關就要求 `email_verified`（否則 403），
+ * 所以這裡不需要再假設「也許那顆信箱不是他的」。
+ */
+function handleInvites(req, res, action, auth, body) {
+  if (!AUTH_MODE) {
+    return fail(res, 403, '邀請是帳號模式才有的東西：現在這台伺服器只認金鑰，沒有可比的信箱', {});
+  }
+  if (!auth.user?.email) {
+    return fail(res, 403, '這要把你的 Google 帳號當身分，請先用 Google 登入（金鑰與 agent token 辦不到）', {});
+  }
+  const me = auth.user.email;
+
+  if (req.method === 'GET') {
+    if (action === 'mine') {
+      // 別人邀我的：撤掉的不算，那代表邀請人已經反悔
+      const names = new Map();
+      const invites = store.listGrantsFor(me).map((g) => ({
+        ...g,
+        ownerName: store.user(g.owner)?.name ?? null,
+        // 受邀者這側沒有這一趟的本機副本，清單要認得出來靠的就是這個名字
+        tripName: tripNameOf(names, g.owner, g.tripId),
+      }));
+      return send(res, 200, { ok: true, email: me, invites });
+    }
+    if (!action) {
+      return send(res, 200, { ok: true, invites: store.listGrants(auth.uid) });
+    }
+    return fail(res, 404, 'not found', {});
+  }
+
+  if (req.method !== 'POST') return fail(res, 405, 'method not allowed', {});
+
+  if (!action) {
+    const email = String(body?.email ?? '').trim().toLowerCase();
+    const role = body?.role === 'read' ? 'read' : 'write';
+    const tripId = String(body?.tripId ?? '').slice(0, 64);
+    if (!EMAIL_SHAPE.test(email) || email.length > 320) {
+      return fail(res, 400, '那顆信箱的形狀不對：邀請要用完整的電子郵件地址', {});
+    }
+    if (email === me) {
+      return fail(res, 400, '不用邀自己，那趟本來就在你的帳本裡', {});
+    }
+    const trip = findTrip(store.base(auth.uid).snapshot, tripId);
+    if (!trip) return fail(res, 404, '這趟旅行不在你的帳本裡，邀不了人', {});
+    const grant = store.upsertGrant({ tripId, owner: auth.uid, email, role });
+    // 回來的東西要能直接複製給人：那趟的名字與受邀信箱都回出來，
+    // app 才講得出「已邀請 alice@example.com 一起記〈日本關西 5 日〉」這種完整的話。
+    return send(res, 200, {
+      ok: true,
+      invite: { ...grant, tripName: trip.name, landingUrl: `/#/shared/${tripId}` },
+    });
+  }
+
+  if (action === 'revoke') {
+    const id = String(body?.id ?? '').slice(0, 64);
+    const row = store.grant(id);
+    // 不是自己發的邀請，就當作不存在：這張表不該讓任何人探測到別人的合作關係
+    if (!row || row.owner !== auth.uid) return fail(res, 404, '找不到這張邀請', {});
+    const changed = store.revokeGrant(id, auth.uid);
+    return send(res, 200, { ok: true, changed, invite: store.grant(id) });
+  }
+
+  if (action === 'leave') {
+    const tripId = String(body?.tripId ?? '').slice(0, 64);
+    const changed = store.leaveGrant(tripId, me);
+    return send(res, 200, { ok: true, changed });
+  }
+
+  return fail(res, 404, 'not found', {});
 }
 
 /** 這一趟現有的列：拿來擋跨趟覆寫、驗證 dayItemId 歸屬，以及決定新行程項的排序 */

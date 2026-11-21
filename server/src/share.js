@@ -151,7 +151,7 @@ export function sharePayload(snapshot, tripId, share) {
       byCurrency: byCurrency(expenses),
       lastWrite: expenses.concat(items).reduce((m, r) => (String(r.updatedAt) > m ? String(r.updatedAt) : m), ''),
     },
-    share: { label: share.label ?? '', createdAt: share.createdAt, expiresAt: share.expiresAt ?? null },
+    share: { label: share?.label ?? '', createdAt: share?.createdAt ?? null, expiresAt: share?.expiresAt ?? null },
   };
 }
 

@@ -1172,6 +1172,126 @@ await check('登入限流：打爆就 429，而且發不出 token，已登入的
   }
 });
 
+/* -------------------------------------------- 共筆邀請（身分就是那顆信箱） */
+
+// Bo 在「登出只斷這一條 session」那條檢查裡把手上那條斷了，這裡重新登一次拿一條活的
+sessionB = (await login({ sub: '998877665544332211009', email: 'bo@example.com', name: 'Bo' })).token;
+
+let inviteBo = null;
+
+await check('邀請記的是信箱：雙方都列得到，而且這條路上不需要任何連結', async () => {
+  const r = await A2('/api/invites', { method: 'POST', token: sessionA, body: { tripId: 'trip_a', email: 'Bo@Example.com' } });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.invite.email, 'bo@example.com', '信箱要洗成小寫，才比得上 Google 回傳的那顆');
+  assert.equal(r.json.invite.role, 'write', '沒指定就是可記帳');
+  assert.match(r.json.invite.tripName, /Kyoto/);
+  assert.equal(r.json.invite.landingUrl, '/#/shared/trip_a');
+  inviteBo = r.json.invite;
+  const mine = await A2('/api/invites', { token: sessionA });
+  assert.ok(mine.json.invites.some((g) => g.id === inviteBo.id), mine.text);
+  const forBo = await A2('/api/invites/mine', { token: sessionB });
+  assert.equal(forBo.json.email, 'bo@example.com', forBo.text);
+  const got = forBo.json.invites.find((g) => g.tripId === 'trip_a');
+  assert.ok(got, `受邀者要看到別人邀他的那一趟：${forBo.text}`);
+  assert.ok(typeof got.tripName === 'string' && got.tripName.length > 0, `受邀者的清單要寫得出那一趟的名字：${JSON.stringify(got)}`);
+  assert.ok(typeof got.ownerName === 'string' && got.ownerName.length > 0, `清單要講得出是誰邀的：${JSON.stringify(got)}`);
+});
+
+await check('信箱形狀不對、邀自己、或那一趟不在你帳本裡，都不算邀請', async () => {
+  const bad = await A2('/api/invites', { method: 'POST', token: sessionA, body: { tripId: 'trip_a', email: 'bo-at-example' } });
+  assert.equal(bad.status, 400, bad.text);
+  const self = await A2('/api/invites', { method: 'POST', token: sessionA, body: { tripId: 'trip_a', email: 'ana@example.com' } });
+  assert.equal(self.status, 400, self.text);
+  const steal = await A2('/api/invites', { method: 'POST', token: sessionA, body: { tripId: 'trip_z', email: 'bo@example.com' } });
+  assert.equal(steal.status, 404, `trip_z 是 Bo 的行程，安娜邀不了人：${steal.text}`);
+  const noKey = await A2('/api/invites', { method: 'POST', token: KEY, body: { tripId: 'trip_a', email: 'x@y.tw' } });
+  assert.equal(noKey.status, 403, `金鑰沒有身分可比對，邀不了人：${noKey.text}`);
+  const noLogin = await A2('/api/invites', { method: 'POST', body: { tripId: 'trip_a', email: 'x@y.tw' } });
+  assert.equal(noLogin.status, 401, noLogin.text);
+});
+
+await check('受邀者讀的是邀請人那一趟：看不到別的旅行，也拿不到照片', async () => {
+  const r = await A2('/api/trips/trip_a/shared', { token: sessionB });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.scope, 'grant');
+  assert.equal(r.json.trip.id, 'trip_a');
+  assert.ok(r.json.items.length > 0 && r.json.expenses.length > 0, `要能看到這一趟已有的項目與支出：${r.text}`);
+  assert.equal(r.json.photos, undefined, '共筆讀取不含照片');
+  assert.equal(JSON.stringify(r.json).includes('trip_z'), false, '不能把別人的別的趟漏出去');
+  const notYours = await A2('/api/trips/trip_z/shared', { token: sessionA });
+  assert.equal(notYours.status, 403, notYours.text);
+  assert.equal(notYours.json.need, 'invite');
+  assert.match(notYours.json.error, /ana@example\.com/, '要點名是哪顆信箱沒被邀請，使用者才聽得懂');
+});
+
+await check('代記寫進邀請人那份帳本，受邀者自己那裡不會憑空多出一筆', async () => {
+  const r = await A2('/api/trips/trip_a/shared/expense', {
+    method: 'POST',
+    token: sessionB,
+    body: { amount: 700, currency: 'JPY', rateToBase: 0.2, date: '2026-03-02', payee: 'Bo', category: 'food', note: '共筆拉麵' },
+  });
+  assert.equal(r.status, 200, r.text);
+  const id = r.json.expense.id;
+  const inAna = await A2('/api/expenses?tripId=trip_a', { token: sessionA });
+  assert.ok(inAna.json.expenses.some((e) => e.id === id), `那筆要落在安娜的帳本裡：${inAna.text}`);
+  const inBo = await A2('/api/base', { token: sessionB });
+  assert.equal(inBo.status, 200, inBo.text);
+  assert.equal(JSON.stringify(inBo.json.base).includes(id), false, 'Bo 那份帳本不該出現安娜的支出');
+  const item = await A2('/api/trips/trip_a/shared/item', {
+    method: 'POST',
+    token: sessionB,
+    body: { title: '共筆景點', date: '2026-03-03', type: 'sight' },
+  });
+  assert.equal(item.status, 200, item.text);
+  const outside = await A2('/api/trips/trip_a/shared/expense', {
+    method: 'POST',
+    token: sessionB,
+    body: { amount: 10, date: '2026-12-01' },
+  });
+  assert.equal(outside.status, 400, `日期超出這一趟還是要擋：${outside.text}`);
+});
+
+await check('唯讀邀請看得到、記不下去；撤銷之後連看都不給看', async () => {
+  const c = await login({ sub: '445566778899001122334', email: 'carol@example.com', name: 'Carol' });
+  const invite = await A2('/api/invites', { method: 'POST', token: sessionA, body: { tripId: 'trip_a', email: 'carol@example.com', role: 'read' } });
+  assert.equal(invite.status, 200, invite.text);
+  assert.equal(invite.json.invite.role, 'read');
+  const peek = await A2('/api/trips/trip_a/shared', { token: c.token });
+  assert.equal(peek.status, 200, peek.text);
+  const write = await A2('/api/trips/trip_a/shared/expense', { method: 'POST', token: c.token, body: { amount: 10, date: '2026-03-02' } });
+  assert.equal(write.status, 403, write.text);
+  assert.match(write.json.error, /唯讀/);
+  const gone = await A2('/api/invites/revoke', { method: 'POST', token: sessionA, body: { id: invite.json.invite.id } });
+  assert.equal(gone.status, 200, gone.text);
+  assert.equal(gone.json.changed, true);
+  const after = await A2('/api/trips/trip_a/shared', { token: c.token });
+  assert.equal(after.status, 403, `撤銷邀請要立刻失效：${after.text}`);
+  const again = await A2('/api/invites/revoke', { method: 'POST', token: sessionA, body: { id: invite.json.invite.id } });
+  assert.equal(again.json.changed, false, '撤過再一次不算錯，但要講清楚這次沒變動');
+  const steal = await A2('/api/invites/revoke', { method: 'POST', token: sessionB, body: { id: inviteBo.id } });
+  assert.equal(steal.status, 404, `不是自己發的邀請不能撤，也不能讓人家探測到它存在：${steal.text}`);
+});
+
+await check('受邀者能自己退出，而退出只砍邀請、不動邀請人的資料', async () => {
+  const before = await A2('/api/expenses?tripId=trip_a', { token: sessionA });
+  const leave = await A2('/api/invites/leave', { method: 'POST', token: sessionB, body: { tripId: 'trip_a' } });
+  assert.equal(leave.status, 200, leave.text);
+  assert.equal(leave.json.changed, true);
+  const mine = await A2('/api/invites/mine', { token: sessionB });
+  assert.equal(mine.json.invites.some((g) => g.tripId === 'trip_a'), false, '已退出的邀請不該還列在清單上');
+  const blocked = await A2('/api/trips/trip_a/shared', { token: sessionB });
+  assert.equal(blocked.status, 403, blocked.text);
+  const after = await A2('/api/expenses?tripId=trip_a', { token: sessionA });
+  assert.equal(after.json.expenses.length, before.json.expenses.length, '退出共筆不能刪掉任何一筆記錄');
+});
+
+await check('共筆沒有刪除的入口：DELETE 一律 405，資料只能追加', async () => {
+  const del = await A2('/api/trips/trip_a/shared/expense', { method: 'DELETE', token: sessionA });
+  assert.equal(del.status, 405, del.text);
+  const delOwn = await A2('/api/trips/trip_a/shared/item', { method: 'DELETE', token: sessionA });
+  assert.equal(delOwn.status, 405, delOwn.text);
+});
+
 child.kill();
 await new Promise((r) => setTimeout(r, 500));
 child = boot();

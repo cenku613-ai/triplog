@@ -448,6 +448,8 @@ export class Store {
     this._grantById = this.db.prepare('SELECT * FROM grants WHERE id = ?');
     this._grantRevoke = this.db.prepare('UPDATE grants SET revoked_at = ? WHERE id = ? AND owner_user_id = ? AND revoked_at IS NULL');
     this._grantFind = this.db.prepare('SELECT * FROM grants WHERE trip_id = ? AND grantee_email = ?');
+    // 受邀者「不想再幫忙」：走的是（行程, 信箱）這組鍵，不需要知道邀請人的 id
+    this._grantLeave = this.db.prepare('UPDATE grants SET revoked_at = ? WHERE trip_id = ? AND grantee_email = ? AND revoked_at IS NULL');
   }
 
   /* ------------------------------------------------------ 輪換過的主金鑰 */
@@ -612,6 +614,17 @@ export class Store {
 
   revokeGrant(id, ownerUserId) {
     return this._grantRevoke.run(new Date().toISOString(), String(id ?? ''), String(ownerUserId ?? '')).changes > 0;
+  }
+
+  /**
+   * 受邀者自己退出一趟共筆。
+   *
+   * 這只砍邀請，不動資料：那趟旅行連同對方記下的每一筆都還在邀請人那份帳本裡。
+   * 方向也要分開——邀請人撤銷用 revokeGrant（認 id），這裡認的是（行程, 信箱），
+   * 因為受邀者不該知道自己拿到的是哪一條 grant id，更不該碰得到別人的邀請。
+   */
+  leaveGrant(tripId, email) {
+    return this._grantLeave.run(new Date().toISOString(), String(tripId ?? ''), String(email ?? '').trim().toLowerCase()).changes > 0;
   }
 
   /* ------------------------------------------------------------ 配對碼 */

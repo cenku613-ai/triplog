@@ -7,6 +7,7 @@ import { useI18n } from '../../i18n';
 import type { Key } from '../../i18n';
 import type { Trip } from '../../db/types';
 import { loadSyncConfig } from '../../lib/sync';
+import { InviteSection } from './InviteSection';
 import {
   activeShares,
   copyText,
@@ -228,6 +229,8 @@ export function ShareDialog({ trip, onClose }: { trip: Trip; onClose: () => void
             </p>
           </>
         )}
+
+        <InviteSection trip={trip} />
       </div>
     </Modal>
   );
