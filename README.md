@@ -171,6 +171,15 @@ SSH_TARGET=opc@<你的IP> bash deploy/deploy.sh
 
 Agent 端（MCP）請看 [`mcp/README.md`](mcp/README.md)：打包 `npm run mcp:build`，把 `mcp/bin.mjs` 掛進 MCP 客戶端並給 `TRIPLOG_URL` ＋金鑰，就有 14 個讀寫工具；`TRIPLOG_ALLOW_WRITE=0` 是唯讀模式。
 
+**金鑰要怎麼拿出來、換掉了該怎麼辦**：金鑰只有 `.env` 裡那一份，沒有第二份副本，所以要用時從那裡讀（別把它貼進聊天、issue 或 commit）：
+
+```bash
+grep TRIPLOG_API_KEY .env     # 寫入金鑰：自己的裝置與要寫資料的 agent
+grep TRIPLOG_READ_KEY .env    # 只讀金鑰：只想看的 agent
+```
+
+想換一把就改 `.env`、重跑 `bash deploy/deploy.sh`（容器重啟後舊金鑰立刻失效），然後在每台裝置的「設定 → 跨裝置同步」貼上新金鑰、MCP 設定也要一起改。注意這三把東西的差別：主金鑰一洩是整座資料庫能被讀寫，只能靠換鑰補救；分享連結的 token 只綁一趟、只能新增，而且能在 app 裡單獨作廢。
+
 **分享給同行者**用的就是同一台伺服器，所以開了 API 就自動有這個功能，不必另設定。app 裡打開一趟旅行，按「🔗 分享」→「產生連結」，把網址（`https://你的名字.duckdns.org/#/share/<token>`）傳給同行的人；他開頁就能看，按「＋ 記一筆支出」或「＋ 加一個行程」就直接寫進伺服器的基準檔（不需要金鑰、也沒有帳號）。同一個對話框列出還在效期內的連結與「開過幾次／補了幾筆」，隨時能作廢。這一趟還沒同步過時，按「產生連結」會先自動同步一次再產生。
 
 分享路徑的邊界（`server/src/share.js` 裡都有對應檢查）：
@@ -179,7 +188,7 @@ Agent 端（MCP）請看 [`mcp/README.md`](mcp/README.md)：打包 `npm run mcp:
 - 回應裡沒有照片，`/api/share/*` 也碰不到 `/api/photos`
 - 金額的金鑰不在外頭：`baseAmount` 由伺服器依送來的匯率重算，外幣沒給匯率就 400 退回，時間戳一律用伺服器時間
 - 有期限（預設 90 天，最長 365 天，可選不設限）與即時作廢；作廢收的是「授權」，已記錄的資料不動
-- 限速獨立計算（`TRIPLOG_RATE_SHARE_READ` 預設 600/分鐘、`TRIPLOG_RATE_SHARE_WRITE` 預設 30/分鐘，以 token＋IP 為單位），避免一條連結被拿來灌基準檔
+- 限速獨立計算（`TRIPLOG_RATE_SHARE_READ` 預設 240/分鐘、`TRIPLOG_RATE_SHARE_WRITE` 預設 30/分鐘，以 token＋IP 為單位），避免一條連結被拿來灌基準檔
 - 仍然沒有刪除端點：同行者只能新增與覆寫自己那幾筆，動不到既有記錄
 
 連結清單存在同一個 SQLite 的 `shares` 表（容器啟動時自動建表，不用搬資料）；`/api/admin/clear` 刻意不清這張表，免得把別人還在用的連結一起弄丟。
