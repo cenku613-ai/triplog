@@ -4,7 +4,7 @@ import { Empty } from '../../components/Controls';
 import { useUi } from '../../app/ui';
 import { useI18n } from '../../i18n';
 import type { DayItem } from '../../db/types';
-import { categoryChar, categoryLabel, expenseLabel } from '../../lib/labels';
+import { builtinKindLabel, categoryChar, categoryLabel, expenseLabel } from '../../lib/labels';
 import { formatAmount } from '../../db/currency';
 import { dateRange, dayIndex, dayLabel, formatDuration, prettyDate } from '../../lib/dates';
 import { ExpenseForm, ItemForm } from './ShareForms';
@@ -133,7 +133,9 @@ export function SharePage({ token }: { token: string }) {
   const kindColor = (key: string) => kindRows.find((c) => c.key === key)?.color ?? 'var(--brand)';
   const kindLabel = (key: string) => {
     const c = kindRows.find((x) => x.key === key);
-    return c ? categoryLabel(c) : key;
+    // 擁有者還沒把分類推上伺服器時清單是空的，這時照介面語言翻成「景點」，
+    // 別讓同行者看到 sight 這種 key
+    return c ? categoryLabel(c) : builtinKindLabel('item', key);
   };
 
   const payees = useMemo(() => {

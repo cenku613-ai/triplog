@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import { Modal } from '../../components/Modal';
 import { Field, CategoryPicker, CurrencySelect } from '../../components/Controls';
 import { useI18n } from '../../i18n';
-import { categoryLabel } from '../../lib/labels';
+import { builtinKindLabel, categoryLabel } from '../../lib/labels';
 import { today } from '../../lib/dates';
 import {
   describeShareError,
@@ -252,7 +252,7 @@ export function ItemForm({ token, view, who, onClose, onSaved }: FormProps) {
               {kinds.length === 0
                 ? FALLBACK_KINDS.map((k) => (
                     <option key={k} value={k}>
-                      {categoryLabel({ key: k, label: k, kind: 'item', builtin: true })}
+                      {builtinKindLabel('item', k)}
                     </option>
                   ))
                 : null}

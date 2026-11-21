@@ -25,7 +25,7 @@
 ```bash
 npm install
 npm run dev         # 開發伺服器，http://localhost:5173
-npm test            # 68 個單元測試（日期、金額換算、統計、備份與還原、合併規則、照片往來、座標與地圖邊界、雙語字典、PDF 文件、分享連結）
+npm test            # 72 個單元測試（日期、金額換算、統計、備份與還原、合併規則、照片往來、座標與地圖邊界、雙語字典與分類標籤、PDF 文件、分享連結）
 npm run typecheck   # TypeScript 檢查
 npm run check:zh    # 繁中介面的字級檢查（抓簡體字，可 --fix）
 npm run server:test # 後端 API 冒煙測試（49 項，真的起一個 SQLite）

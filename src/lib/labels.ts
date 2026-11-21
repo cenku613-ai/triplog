@@ -26,6 +26,16 @@ export function categoryChar(c: CatLike | undefined): string {
   return (c ? categoryLabel(c) : t('common.expense')).slice(0, 1);
 }
 
+/**
+ * 手邊只有一個 kind key、沒有分類列時要顯示什麼（分享連結最常見：
+ * 擁有者還沒把分類推上伺服器，payload 的分類清單是空的）。
+ * 內建的照介面語言翻成「景點」，翻不到的就原樣顯示，不要瞎猜。
+ */
+export function builtinKindLabel(kind: Category['kind'], key: string): string {
+  const row = DEFAULT_CATEGORIES.find((c) => c.kind === kind && c.key === key);
+  return row ? tRaw(`cat.${key}`) : key;
+}
+
 /** 一筆支出的顯示標題：備註 > 分類 > 「支出」 */
 export function expenseLabel(e: Pick<Expense, 'note'>, c?: CatLike): string {
   return e.note?.trim() || (c ? categoryLabel(c) : '') || t('common.expense');
