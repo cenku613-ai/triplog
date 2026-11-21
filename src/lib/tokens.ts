@@ -44,6 +44,17 @@ export function isIssuedToken(key: string): boolean {
   return /^tlk_[A-Za-z0-9_-]{20,}$/.test(String(key ?? '').trim());
 }
 
+/**
+ * 本機那把是不是「Google 登入換來的 session」（tls_）。
+ *
+ * 分開認是為了介面別說錯話：金鑰模式下「不放主金鑰」等於改用可撤銷的憑證，
+ * 帳號模式下這台裝置拿的則是自己的登入憑證，它看的是自己的帳本，
+ * 也叫不到 /api/tokens 那幾個只有主金鑰能用的端點。
+ */
+export function isSessionToken(key: unknown): boolean {
+  return /^tls_[A-Za-z0-9_-]{20,}$/.test(String(key ?? '').trim());
+}
+
 /** 一把憑證是不是「這台裝置正在用的那把」：比對的是顯示用的 hint，不是雜湊，所以只是標籤用途 */
 export function hintOf(key: string): string {
   const s = String(key ?? '').trim();

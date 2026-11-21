@@ -20,6 +20,7 @@ import { useI18n, type Lang } from '../../i18n';
 import { categoryLabel } from '../../lib/labels';
 import { Field } from '../../components/Controls';
 import { SyncCard } from './SyncCard';
+import { AccountCard } from './AccountCard';
 import { KeyDeviceCard } from './KeyDeviceCard';
 
 const SWATCH = ['#0f766e', '#2f7ed8', '#7c5cd6', '#d64576', '#e07a3f', '#c9962b', '#6b7280'];
@@ -305,6 +306,8 @@ export function SettingsPage() {
           </div>
         </div>
       </section>
+
+      <AccountCard />
 
       <SyncCard />
 

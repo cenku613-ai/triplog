@@ -37,7 +37,7 @@ export type SyncReport = {
 };
 
 export class SyncError extends Error {
-  code: 'insecure' | 'auth' | 'notfound' | 'network' | 'server' | 'badpayload';
+  code: 'insecure' | 'auth' | 'login' | 'notfound' | 'network' | 'server' | 'badpayload';
   constructor(code: SyncError['code'], message: string) {
     super(message);
     this.code = code;
@@ -124,14 +124,24 @@ async function api<T>(cfg: SyncConfig, path: string, opts: ApiOpts = {}): Promis
     if ((err as Error)?.name === 'AbortError') throw err;
     throw new SyncError('network', `連不到 ${new URL(url).host}：${(err as Error).message}`);
   }
-  if (res.status === 401 || res.status === 403) throw new SyncError('auth', '金鑰不對或沒有寫入權限');
   if (res.status === 404) throw new SyncError('notfound', '後端還沒有任何資料');
   if (!res.ok) {
     let detail = '';
+    let wantsLogin = false;
     try {
-      detail = ((await res.json()) as { error?: string }).error ?? '';
+      const body = (await res.json()) as { error?: string; login?: boolean };
+      detail = body.error ?? '';
+      wantsLogin = body.login === true;
     } catch {
       /* 非 JSON 錯誤體就略過 */
+    }
+    // 帳號模式下的 401 缺的是「重新登入」，不是「換一把金鑰」：兩句話要分開講，
+    // 否則使用者會跑去設定頁貼主金鑰，而那把現在看到的是另一個分帳。
+    if (res.status === 401 || res.status === 403) {
+      throw new SyncError(
+        wantsLogin ? 'login' : 'auth',
+        wantsLogin ? '這台裝置的登入已失效，請到「設定 → 帳號」重新用 Google 登入' : '金鑰不對或沒有寫入權限',
+      );
     }
     throw new SyncError('server', `後端回 ${res.status}${detail ? `：${detail}` : ''}`);
   }

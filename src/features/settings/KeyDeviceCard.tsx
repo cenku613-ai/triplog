@@ -31,6 +31,7 @@ import {
   DEVICE_TOKEN_SOON_DAYS,
   isCurrentDevice,
   isIssuedToken,
+  isSessionToken,
   listApiTokens,
   listPairings,
   masterStatus,
@@ -367,7 +368,8 @@ export function KeyDeviceCard() {
     );
   }
 
-  const localIsMaster = !isIssuedToken(cfg.apiKey);
+  const localIsSession = isSessionToken(cfg.apiKey);
+  const localIsMaster = !isIssuedToken(cfg.apiKey) && !localIsSession;
   const noBackupCredentials = activeTokens(rows ?? []).length === 0;
 
   return (
@@ -378,7 +380,7 @@ export function KeyDeviceCard() {
       <div className="stack-s">
         <strong style={{ fontSize: 14 }}>{t('tokens.local')}</strong>
         <p className="muted" style={{ fontSize: 14, margin: 0 }}>
-          {localIsMaster ? t('tokens.localMaster') : t('tokens.localToken')}
+          {localIsSession ? t('keys.localSession') : localIsMaster ? t('tokens.localMaster') : t('tokens.localToken')}
         </p>
         {master ? (
           <p className="tiny" style={{ margin: 0 }}>
@@ -386,6 +388,8 @@ export function KeyDeviceCard() {
           </p>
         ) : null}
       </div>
+
+      {localIsSession ? <div className="notice">{t('keys.sessionNote')}</div> : null}
 
       {/* ----------------------------------------------------- 憑證與簽發 */}
       <div className="stack-s">

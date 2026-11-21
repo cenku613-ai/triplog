@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'react';
 import { HashRouter, Link, NavLink, Route, Routes, useMatch } from 'react-router-dom';
 import { UiProvider, useUi } from './ui';
 import { ToastHost, ConfirmHost } from '../components/Feedback';
@@ -13,6 +13,8 @@ import type { Trip } from '../db/types';
 import { usePwaUpdate } from './pwa';
 import { useI18n } from '../i18n';
 import { describeSyncError, loadSyncConfig, syncNow } from '../lib/sync';
+import { fetchAuthConfig, gateFor, loadAccount, rememberedMode } from '../lib/account';
+import { LoginGate } from '../features/auth/LoginGate';
 
 /**
  * 分享頁不在 Shell 裡：來按連結的人可能用別人的裝置，不該看到本機別的旅行，
@@ -224,5 +226,61 @@ function RouteGate() {
       </Suspense>
     );
   }
-  return <Shell />;
+  // 分享頁刻意排在登入閘門之前：開連結來的同行者可能用別人的手機，
+  // 那台裝置登沒登入跟他要記的這一筆支出沒有關係。
+  return (
+    <AuthGate>
+      <Shell />
+    </AuthGate>
+  );
+}
+
+/**
+ * 帳號模式的閘門：只擋「這台裝置沒有有效 session、而伺服器只認帳號」這一種情況。
+ *
+ * 判斷順序是「本機有沒有憑證 → 這台部署是不是帳號模式」。模式先問本機記過的值，
+ * 沒記過（或記的是舊的金鑰模式）而且有填過伺服器位址時，才補打一次公開的
+ * /api/auth/config。金鑰模式改成帳號模式部署時，老裝置因此不會靜靜地一直 401。
+ */
+function AuthGate({ children }: { children: ReactNode }) {
+  const { t } = useI18n();
+  const [account] = useState(() => loadAccount());
+  const [mode, setMode] = useState(() => rememberedMode());
+  const [skipped, setSkipped] = useState(false);
+  const [online, setOnline] = useState(() => navigator.onLine);
+
+  useEffect(() => {
+    const up = () => setOnline(true);
+    const down = () => setOnline(false);
+    window.addEventListener('online', up);
+    window.addEventListener('offline', down);
+    return () => {
+      window.removeEventListener('online', up);
+      window.removeEventListener('offline', down);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (account || mode === 'account' || !navigator.onLine) return;
+    const server = loadSyncConfig()?.baseUrl ?? '';
+    if (!server) return;
+    let cancelled = false;
+    fetchAuthConfig(server)
+      .then((c) => !cancelled && setMode(c.mode))
+      .catch(() => {
+        /* 問不到就当沒這回事：本機記錄照用，同步失敗自有 toast 講 */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [account, mode]);
+
+  const gate = gateFor(mode, account, online);
+  if (gate === 'none' || skipped) return <>{children}</>;
+  return (
+    <LoginGate
+      onSkip={() => setSkipped(true)}
+      skipLabel={t(gate === 'offline' ? 'auth.skipOffline' : 'auth.skip')}
+    />
+  );
 }

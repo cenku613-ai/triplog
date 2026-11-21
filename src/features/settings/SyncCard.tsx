@@ -24,6 +24,7 @@ import {
   createApiToken,
   describeTokenError,
   guessDeviceName,
+  isSessionToken,
   pairCodeProgress,
   pairWithCode,
   shouldMintDeviceToken,
@@ -254,6 +255,13 @@ export function SyncCard() {
           />
         </Field>
       )}
+      {/* 登入換來的憑證也放在同一個金鑰欄位：不提醒的話，使用者會以為這裡還得再貼一次什麼 */}
+      {saved && isSessionToken(saved.apiKey) ? (
+        <p className="tiny" style={{ margin: 0 }}>
+          {t('sync.sessionKeyNote')}
+        </p>
+      ) : null}
+
       <label className="row" style={{ gap: 8 }}>
         <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
         <span>
