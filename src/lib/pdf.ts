@@ -392,7 +392,7 @@ export function buildPrintHtml(input: PrintInput): string {
   section(t('photo.title'), 'photos', photosSection(input));
 
   const locale = lang() === 'en' ? 'en' : 'zh-Hant';
-  const hint = t('print.tip');
+  const hint = t('print.docTip');
   return `<!doctype html>
 <html lang="${locale}">
 <head>
@@ -417,15 +417,14 @@ ${parts.join('\n')}
 }
 
 /**
- * 開新視窗寫入文件。瀏覽器擋彈窗時回傳 false，讓呼叫端提示使用者，
- * 而不是默默什麼都沒發生。
+ * 把文件轉成 Blob URL：app 內的預覽（iframe）與「在新分頁開啟」共用同一個位置。
+ *
+ * 為什麼不再用 `window.open('', '_blank')` + `document.write`：新分頁需要彈窗權限，
+ * 而被擋掉的瀏覽器（或自動化環境）會直接讓 `window.open` 回 null，整個功能就靜靜失敗。
+ * 預覽放在自己的 iframe 裡不需要任何權限，要分頁時再把同一個 URL 開出去就好。
+ *
+ * 呼叫端在不用時要 `URL.revokeObjectURL`，否則這份 HTML（含照片）會一直留在記憶體。
  */
-export function openPrintView(html: string): boolean {
-  const win = window.open('', '_blank');
-  if (!win) return false;
-  win.document.open();
-  win.document.write(html);
-  win.document.close();
-  win.focus();
-  return true;
+export function printableUrl(html: string): string {
+  return URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
 }

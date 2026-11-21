@@ -6,7 +6,7 @@ import { boundsOf, centerOf, dayColor, isDegenerate, type GeoPoint } from './geo
  * 把地圖壓成一張 PNG（data URL），供列印／存 PDF 用。
  *
  * 為什麼不用 html2canvas：列印文件裡只需要底圖＋圓點，而 Leaflet 的瓦片本來
- * 就是 `<img>`，自己照 `_leaflet_pos` 貼進 canvas 就好。一個依賴都不加，
+ * 就是 `<img>`，自己照著瓦片在框裡的實際位置貼進 canvas 就好。一個依賴都不加，
  * 也不會把整個 DOM 柵格化（那會讓文字在 PDF 裡變模糊）。
  *
  * 前提：createMap() 的 tileLayer 有開 crossOrigin，否則 canvas 會被打汙，
@@ -21,7 +21,6 @@ export type MapShot = {
   points: number;
 };
 
-const TILE = 256;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export async function captureMap(
@@ -60,7 +59,9 @@ export async function captureMap(
     map.invalidateSize();
 
     const deadline = Date.now() + timeoutMs;
-    await waitSettled(map, deadline);
+    // 留 4 秒給瓦片收邊：moveend 如果沒觸發（例如視界沒變動），
+    // 把整段 timeout 花在等待上就會讓後面的貼圖來不及執行。
+    await waitSettled(map, Math.min(deadline - 4_000, Date.now() + 6_000));
     const shot = await stitch(map, width, height, deadline);
     return shot ? { ...shot, points: points.length } : null;
   } catch (err) {
@@ -95,9 +96,16 @@ async function waitSettled(map: L.Map, deadline: number): Promise<void> {
   }
 }
 
-type TileInfo = { url: string; x: number; y: number; img: HTMLImageElement };
+type TileInfo = {
+  url: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  img: HTMLImageElement;
+};
 
-/** 由 tiles pane 的偏移還原每張瓦片的容器座標，再依序貼進 canvas */
+/** 依矩形實際位置貼圖：Retina 的 tileSize、縮放動畫後都照樣對得齊 */
 async function stitch(
   map: L.Map,
   width: number,
@@ -116,16 +124,16 @@ async function stitch(
   ctx.fillRect(0, 0, width, height);
 
   for (const tile of tiles) {
-    if (tile.x > width || tile.y > height || tile.x < -TILE || tile.y < -TILE) continue;
+    if (tile.x > width || tile.y > height || tile.x + tile.w < 0 || tile.y + tile.h < 0) continue;
     try {
-      ctx.drawImage(tile.img, tile.x, tile.y, TILE, TILE);
+      ctx.drawImage(tile.img, tile.x, tile.y, tile.w, tile.h);
     } catch (err) {
       // 打汙過的圖片貼不上來：重新用 crossOrigin 抓一次（多數會命中 SW 快取）
       console.warn('[triplog] 瓦片貼不上去，改用 CORS 重抓', err);
       const img = await loadWithCors(tile.url, Math.max(600, deadline - Date.now()));
       if (!img) continue;
       try {
-        ctx.drawImage(img, tile.x, tile.y, TILE, TILE);
+        ctx.drawImage(img, tile.x, tile.y, tile.w, tile.h);
       } catch {
         /* 這張留白，整體還是能出圖 */
       }
@@ -140,19 +148,28 @@ async function stitch(
   }
 }
 
+/**
+ * 把瓦片連同它在畫面框內的偏移收集起來。
+ *
+ * 用 `getBoundingClientRect` 而不是 Leaflet 私有的 `_panes.tiles`：那個鍵名從來就不存在
+ * （實名是 `tilePane`），早先的寫法每次都拿到 undefined，於是「一張瓦片都沒有」，
+ * 地圖就靜靜地不见了。量矩形還有一個好處：pane 位移、縮放動畫、Retina 的 tileSize
+ * 都已經被算進去，不用自己還原 `_leaflet_pos`。
+ */
 function collectTiles(map: L.Map): TileInfo[] {
-  const tilePane = (map as unknown as { _panes?: { tiles?: HTMLElement } })._panes?.tiles;
-  if (!tilePane) return [];
-  const origin = map.containerPointToLayerPoint([0, 0]);
-  const panePos = L.DomUtil.getPosition(tilePane) ?? L.point(0, 0);
+  const host = map.getContainer();
+  const box = host.getBoundingClientRect();
   const out: TileInfo[] = [];
-  for (const img of [...tilePane.querySelectorAll<HTMLImageElement>('img.leaflet-tile')]) {
+  for (const img of [...host.querySelectorAll<HTMLImageElement>('img.leaflet-tile')]) {
     if (!img.complete || !img.currentSrc) continue;
-    const pos = L.DomUtil.getPosition(img) ?? L.point(0, 0);
+    const r = img.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) continue;
     out.push({
       url: img.currentSrc,
-      x: pos.x + panePos.x - origin.x,
-      y: pos.y + panePos.y - origin.y,
+      x: r.left - box.left,
+      y: r.top - box.top,
+      w: r.width,
+      h: r.height,
       img,
     });
   }
