@@ -175,7 +175,7 @@ export function SyncCard() {
             })
           }
         >
-          {busy === 'test' ? t('sync.testing') : t('sync.testing')}
+          {busy === 'test' ? t('sync.testing') : t('sync.test')}
         </button>
       </div>
 
