@@ -5,14 +5,16 @@
  * 「存最新並集 + 留歷史」，schema 就不會和 App 的欄位一起膨脹，
  * 也天生支援未來新增的欄位（JSON 直接進出）。
  *
- * 沒有帳號系統，只有一把 bearer token。因此這裡刻意不做任何刪除 API，
- * 也不把 token 存進資料庫——誤刪的風險留給本機（有備份檔）而不是伺服器。
+ * 沒有帳號系統，只有一把 bearer token（外加「分享連結」用的 trip 級 token，
+ * 見 share.js）。因此這裡刻意不做任何刪除資料的 API，也不把金鑰存進資料庫——
+ * 誤刪的風險留給本機（有備份檔）而不是伺服器。
  */
 import { mkdirSync, readFileSync, existsSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { mergeSources } from '../../src/lib/merge-core.js';
+import { newToken } from './share.js';
 
 /** 基準檔上限：60 張照片約 15 MB，留一倍餘量 */
 export const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
@@ -87,6 +89,21 @@ function stripPhotoData(p) {
   return rest;
 }
 
+/** shares 的 snake_case 欄位換成外部用的駝峰，路由層就不用記兩套名字 */
+function shareView(r) {
+  return {
+    token: r.token,
+    tripId: r.trip_id,
+    label: r.label ?? '',
+    createdAt: r.created_at,
+    expiresAt: r.expires_at ?? null,
+    revokedAt: r.revoked_at ?? null,
+    hits: Number(r.hits ?? 0),
+    writes: Number(r.writes ?? 0),
+    lastSeenAt: r.last_seen_at ?? null,
+  };
+}
+
 function jsonBytes(obj) {
   return Buffer.byteLength(JSON.stringify(obj), 'utf8');
 }
@@ -148,6 +165,20 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS snapshots_time ON snapshots(exported_at DESC);
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      /* 分享連結：token → 某一趟旅行。這是「授權」，不是資料，
+         所以 /api/admin/clear 不清它（作廢要明確按，見 revokeShare）。 */
+      CREATE TABLE IF NOT EXISTS shares (
+        token TEXT PRIMARY KEY,
+        trip_id TEXT NOT NULL,
+        label TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        expires_at TEXT,
+        revoked_at TEXT,
+        hits INTEGER NOT NULL DEFAULT 0,
+        writes INTEGER NOT NULL DEFAULT 0,
+        last_seen_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS shares_trip ON shares(trip_id);
     `);
     // 舊資料庫補上內容指紋欄位；SQLite 沒有 ADD COLUMN IF NOT EXISTS，重複執行就當它已經有了
     try {
@@ -169,6 +200,47 @@ export class Store {
     );
     this._metaGet = this.db.prepare('SELECT value FROM meta WHERE key = ?');
     this._metaSet = this.db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
+    this._shareInsert = this.db.prepare(
+      'INSERT INTO shares (token, trip_id, label, created_at, expires_at) VALUES (@token, @tripId, @label, @createdAt, @expiresAt)',
+    );
+    this._shareGet = this.db.prepare('SELECT * FROM shares WHERE token = ?');
+    this._shareList = this.db.prepare('SELECT * FROM shares WHERE trip_id = ? ORDER BY created_at DESC');
+    this._shareAll = this.db.prepare('SELECT * FROM shares ORDER BY created_at DESC LIMIT 200');
+    this._shareRevoke = this.db.prepare('UPDATE shares SET revoked_at = ? WHERE token = ? AND revoked_at IS NULL');
+    this._shareHit = this.db.prepare(
+      'UPDATE shares SET hits = hits + @read, writes = writes + @write, last_seen_at = @at WHERE token = @token',
+    );
+  }
+
+  /* ------------------------------------------------------------ 分享連結 */
+
+  /** @returns {{ token: string, tripId: string, label: string, createdAt: string, expiresAt: string|null }} */
+  createShare({ tripId, label = '', expiresAt = null }) {
+    const token = newToken();
+    const createdAt = new Date().toISOString();
+    this._shareInsert.run({ token, tripId, label: String(label ?? '').slice(0, 60), createdAt, expiresAt });
+    return { token, tripId, label: String(label ?? '').slice(0, 60), createdAt, expiresAt, revokedAt: null, hits: 0, writes: 0, lastSeenAt: null };
+  }
+
+  /** 回傳 undefined 代表這個 token 根本沒存在過 */
+  share(token) {
+    const row = this._shareGet.get(String(token ?? ''));
+    return row ? shareView(row) : undefined;
+  }
+
+  listShares(tripId = null) {
+    const rows = tripId ? this._shareList.all(String(tripId)) : this._shareAll.all();
+    return rows.map(shareView);
+  }
+
+  /** 作廢：只有 revoked_at 是 NULL 的會被打上時間戳，回傳有沒有真的改到 */
+  revokeShare(token) {
+    return this._shareRevoke.run(new Date().toISOString(), String(token ?? '')).changes > 0;
+  }
+
+  /** 開一次連結算一筆 hit，代記一筆算一筆 write；擁有者才需要知道這些數字 */
+  touchShare(token, { write = false } = {}) {
+    this._shareHit.run({ token: String(token ?? ''), read: 1, write: write ? 1 : 0, at: new Date().toISOString() });
   }
 
   get keep() {

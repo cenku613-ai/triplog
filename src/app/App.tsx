@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { HashRouter, Link, NavLink, Route, Routes } from 'react-router-dom';
+import { lazy, Suspense, useEffect, useRef, useState } from 'react';
+import { HashRouter, Link, NavLink, Route, Routes, useMatch } from 'react-router-dom';
 import { UiProvider, useUi } from './ui';
 import { ToastHost, ConfirmHost } from '../components/Feedback';
 import { TripsPage } from '../features/trips/TripsPage';
@@ -13,6 +13,13 @@ import type { Trip } from '../db/types';
 import { usePwaUpdate } from './pwa';
 import { useI18n } from '../i18n';
 import { describeSyncError, loadSyncConfig, syncNow } from '../lib/sync';
+
+/**
+ * 分享頁不在 Shell 裡：來按連結的人可能用別人的裝置，不該看到本機別的旅行，
+ * 也不該觸發這台裝置的自動同步。它有自己的標頭與語系切換，
+ * 所以整包（含表單邏輯）只有走到 /share/ 時才載。
+ */
+const SharePage = lazy(() => import('../features/share/SharePage').then((m) => ({ default: m.SharePage })));
 
 function Shell() {
   const { toast } = useUi();
@@ -198,11 +205,24 @@ function Logo() {
 }
 
 export function App() {
+  // useMatch 要在 Router 裡面跑，所以分流交給 RouteGate
   return (
     <HashRouter>
       <UiProvider>
-        <Shell />
+        <RouteGate />
       </UiProvider>
     </HashRouter>
   );
+}
+
+function RouteGate() {
+  const share = useMatch('/share/:token');
+  if (share?.params.token) {
+    return (
+      <Suspense fallback={<div className="page" />}>
+        <SharePage token={share.params.token} />
+      </Suspense>
+    );
+  }
+  return <Shell />;
 }

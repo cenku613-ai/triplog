@@ -11,6 +11,8 @@ import { StatsTab } from '../stats/StatsTab';
 const MapTab = lazy(() => import('./MapTab').then((m) => ({ default: m.MapTab })));
 /** PDF 文件會順帶拉進地圖擷取（Leaflet），所以連對話框一起延後載入 */
 const PrintDialog = lazy(() => import('./PrintDialog').then((m) => ({ default: m.PrintDialog })));
+/** 分享對話框只在按下去時才載：它帶的是網路邏輯，平常用不到 */
+const ShareDialog = lazy(() => import('../share/ShareDialog').then((m) => ({ default: m.ShareDialog })));
 import { ExpenseEditor } from '../expenses/ExpenseEditor';
 import { DayItemEditor } from '../itinerary/DayItemEditor';
 import { TripEditor } from '../trips/TripEditor';
@@ -37,6 +39,7 @@ export function TripDetailPage() {
   const [presetDate, setPresetDate] = useState<string>('');
   const [presetItemId, setPresetItemId] = useState<string | null>(null);
   const [printing, setPrinting] = useState(false);
+  const [sharing, setSharing] = useState(false);
 
   const TABS: { id: Tab; label: string }[] = [
     { id: 'plan', label: t('tab.plan') },
@@ -113,9 +116,12 @@ export function TripDetailPage() {
             </div>
           </div>
         </div>
-        <div className="row">
+        <div className="row wrap">
           <button className="btn btn-sm" onClick={() => setPrinting(true)} title={t('print.title')}>
             🖨 {t('print.menu')}
+          </button>
+          <button className="btn btn-sm" onClick={() => setSharing(true)} title={t('share.title')}>
+            🔗 {t('share.menu')}
           </button>
           <button className="btn btn-sm" onClick={() => setEditing('trip')}>
             {t('common.edit')}
@@ -312,6 +318,11 @@ export function TripDetailPage() {
             summary={summary!}
             onClose={() => setPrinting(false)}
           />
+        </Suspense>
+      ) : null}
+      {sharing ? (
+        <Suspense fallback={null}>
+          <ShareDialog trip={trip} onClose={() => setSharing(false)} />
         </Suspense>
       ) : null}
     </>

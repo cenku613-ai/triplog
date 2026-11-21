@@ -63,6 +63,12 @@
   max-width: 1320px;
 }
 
+/* 分享頁：給同行者看的一趟旅行，不值得橫向鋪到 1180px。
+   壓到 860px 之後桌機上一眼掃得完，手機上本來就比這窄，什麼都不變。 */
+.page.share-page {
+  max-width: 860px;
+}
+
 .sidenav {
   display: none;
 }
@@ -123,11 +129,60 @@
   transform: scale(0.96);
 }
 
+/* 設定頁：依裝置寬度單欄 → 兩欄 → 三欄
+ *
+ * 欄寬一律 minmax(0, 1fr)：`1fr` 的預設最小值是 min-content，所以只要卡裡有一個
+ * 撐得開的東西（下拉選單的最長選項、tab 列的按鈕串），整頁就會被頂到比視窗還寬，
+ * 手機上變成「整頁可以左右拖」。把最小值壓到 0，內容就只能在卡內設法縮：
+ * 列會換行（.settings .row）、tab 列用自己的橫向卷軸（.tabs 本來就 overflow-x:auto）。
+ */
+.settings {
+  display: grid;
+  align-items: start;
+  gap: var(--sp-4);
+  grid-template-columns: minmax(0, 1fr);
+  max-width: 1080px;
+  margin: 0 auto;
+}
+
+.settings .stack,
+.settings .stack-s {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.settings .row {
+  flex-wrap: wrap;
+}
+
+.settings select {
+  min-width: 0;
+}
+
+.settings-head,
+.settings-foot {
+  grid-column: 1 / -1;
+}
+
+/* 平板起兩欄、桌機三欄。臨界點抓 820／1180：再窄一點，「分類」那張卡的
+   「名稱＋內建＋兩個按鈕」就會被壓到換行，兩欄反而比單欄難讀。 */
+@media (min-width: 820px) {
+  .settings {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1180px) {
+  .settings {
+    gap: var(--sp-5);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 /* 手機：行程 / 支出 單欄 */
 .trip-cols {
   display: grid;
   gap: var(--sp-4);
-  grid-template-columns: 1fr;
+  grid-template-columns: minmax(0, 1fr);
 }
 
 @media (min-width: 640px) {

@@ -29,6 +29,9 @@ services:
       # 寫入限流：一台裝置同步用不完，防止別人拿到網址後狂推
       TRIPLOG_RATE_WRITE: ${TRIPLOG_RATE_WRITE:-60}
       TRIPLOG_RATE_READ: ${TRIPLOG_RATE_READ:-600}
+      # 分享連結限流（同一 token＋同一 IP 各別計），同行者一直按重新整理也用不完
+      TRIPLOG_RATE_SHARE_READ: ${TRIPLOG_RATE_SHARE_READ:-240}
+      TRIPLOG_RATE_SHARE_WRITE: ${TRIPLOG_RATE_SHARE_WRITE:-30}
     volumes:
       - triplog_data:/data
     networks:

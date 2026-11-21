@@ -289,6 +289,190 @@ await check('clear 需要確認標頭', async () => {
   assert.equal((await api('/api/base')).status, 200, '資料還在');
 });
 
+console.log('\n— 分享連結（token 授權，限一趟旅行）');
+let shareToken = '';
+let survivorToken = '';
+let madeByShare = '';
+let beforeShared = { expenses: 0, base: 0 };
+await check('沒見過的 token：404，而且不用金鑰就能問', async () => {
+  const r = await api('/api/share/abcDEF1234567890xyzXYZ--', { key: null });
+  assert.equal(r.status, 404);
+});
+await check('建立連結要金鑰，read key 不夠', async () => {
+  assert.equal((await api('/api/shares', { method: 'POST', key: null, body: { tripId: 'trip_a' } })).status, 401);
+  assert.equal((await api('/api/shares', { method: 'POST', key: READ, body: { tripId: 'trip_a' } })).status, 403);
+});
+await check('還沒同步到伺服器的旅行不能分享', async () => {
+  const r = await api('/api/shares', { method: 'POST', body: { tripId: 'trip_never_synced' } });
+  assert.equal(r.status, 409);
+  assert.equal(r.json.need, 'sync');
+});
+await check('POST /api/shares 產生 22 字 token 與期限', async () => {
+  const r = await api('/api/shares', { method: 'POST', body: { tripId: 'trip_a', expiresInDays: 30 } });
+  assert.equal(r.status, 200);
+  shareToken = r.json.share.token;
+  assert.equal(shareToken.length, 22, `token=${shareToken}`);
+  assert.equal(r.json.share.tripId, 'trip_a');
+  // 標籤預設跟旅行同名（前面的合併測試把它改名成 'Kyoto · autumn' 了）
+  const name = (await api('/api/base')).json.base.trips.find((t) => t.id === 'trip_a').name;
+  assert.equal(r.json.share.label, name);
+  assert.ok(Date.parse(r.json.share.expiresAt) > Date.now(), 'expiresAt 要在未來');
+  survivorToken = (await api('/api/shares', { method: 'POST', body: { tripId: 'trip_b', expiresInDays: 0 } })).json.share.token;
+});
+await check('GET /api/share/:token 只回這一趟，也不帶照片內容', async () => {
+  const r = await api(`/api/share/${shareToken}`, { key: null });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.trip.id, 'trip_a');
+  assert.ok(r.json.items.length >= 1 && r.json.items.every((x) => x.tripId === 'trip_a'), '只該看到 trip_a 的行程');
+  assert.ok(!r.json.items.some((x) => x.id === 'item_b1'), 'trip_b 的行程項不能漏出去');
+  assert.ok(!r.json.expenses.some((e) => e.tripId !== 'trip_a'));
+  assert.ok(r.json.categories.some((c) => c.id === 'cat-transport'), '同行者要知道分類叫什麼');
+  assert.equal(r.json.photos, undefined, '回應裡不該出現照片欄位');
+  beforeShared = { expenses: r.json.expenses.length, base: r.json.totals.baseAmount };
+});
+await check('分類清單送得完整：內建的讓同行者選得到，沒用過的自訂分類不外送', async () => {
+  const seed = await api('/api/sync', {
+    method: 'POST',
+    body: {
+      format: 'triplog-backup',
+      trips: [],
+      categories: [
+        { id: 'cat-food', kind: 'expense', key: 'food', label: '餐飲', color: '#d97706', order: 10, builtin: true },
+        { id: 'cat-kid', kind: 'expense', key: 'snack', label: '小孩零食', color: '#9333ea', order: 90, builtin: false },
+      ],
+    },
+  });
+  assert.equal(seed.status, 200, '部分文件該能被 sync 吃下');
+  const r = await api(`/api/share/${shareToken}`);
+  assert.ok(r.json.categories.some((c) => c.id === 'cat-food' && c.builtin === true), '這一趟還沒花過餐飲，但內建分類要選得到');
+  assert.ok(!r.json.categories.some((c) => c.id === 'cat-kid'), '跟這趟無關的自訂分類不必給同行者看');
+});
+await check('同行者記一筆外幣支出：換算與 tripId 都由伺服器算', async () => {
+  const r = await api(`/api/share/${shareToken}/expense`, {
+    key: null,
+    method: 'POST',
+    body: { amount: 900, currency: 'jpy', rateToBase: 0.2, date: '2026-03-02', payee: 'ana', category: 'food', note:  '  晚餐   拉麵  ' },
+  });
+  assert.equal(r.status, 200, r.text);
+  const e = r.json.expense;
+  assert.equal(e.tripId, 'trip_a', 'tripId 一律用 token 對應的那一趟');
+  assert.equal(e.currency, 'JPY');
+  assert.equal(e.baseAmount, 180, `baseAmount=${e.baseAmount}`);
+  assert.equal(e.payee, 'ana');
+  assert.ok(/^exp_/.test(e.id), e.id);
+  madeByShare = e.id;
+});
+await check('同幣別不用填匯率，主幣別金額就是原樣', async () => {
+  const r = await api(`/api/share/${shareToken}/expense`, {
+    key: null,
+    method: 'POST',
+    body: { amount: 1500, currency: 'TWD', date: '2026-03-03' },
+  });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.expense.rateToBase, 1);
+  assert.equal(r.json.expense.baseAmount, 1500);
+});
+await check('外幣沒填匯率：拒絕，不偷偷用 1:1', async () => {
+  const r = await api(`/api/share/${shareToken}/expense`, { key: null, method: 'POST', body: { amount: 500, currency: 'JPY' } });
+  assert.equal(r.status, 400);
+  assert.match(r.json.error, /rateToBase/);
+});
+await check('日期超出行程範圍（含寬容三天）：拒絕', async () => {
+  const ok = await api(`/api/share/${shareToken}/item`, { key: null, method: 'POST', body: { title: 'Early', date: '2026-02-26' } });
+  assert.equal(ok.status, 200, ok.text);
+  const bad = await api(`/api/share/${shareToken}/expense`, { key: null, method: 'POST', body: { amount: 10, date: '2026-12-01' } });
+  assert.equal(bad.status, 400);
+  assert.match(bad.json.error, /date/);
+});
+await check('行程項要標題、類型範圍外退回 other、座標不完整就整個丟掉', async () => {
+  const noTitle = await api(`/api/share/${shareToken}/item`, { key: null, method: 'POST', body: { date: '2026-03-02' } });
+  assert.equal(noTitle.status, 400);
+  const r = await api(`/api/share/${shareToken}/item`, {
+    key: null,
+    method: 'POST',
+    body: { title: 'Fushimi Inari', kind: 'shrine', date: '2026-03-02', lat: 34.9671, lng: 135.7727, order: 999 },
+  });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.item.kind, 'other');
+  assert.equal(r.json.item.lat, 34.9671);
+  const half = await api(`/api/share/${shareToken}/item`, {
+    key: null,
+    method: 'POST',
+    body: { title: 'No coords', date: '2026-03-02', lat: 12.3 },
+  });
+  assert.equal(half.json.item.lat, null);
+});
+await check('掛到別的趟的行程項：拒絕', async () => {
+  const r = await api(`/api/share/${shareToken}/expense`, {
+    key: null,
+    method: 'POST',
+    body: { amount: 100, date: '2026-03-02', dayItemId: 'item_b1' },
+  });
+  assert.equal(r.status, 400);
+  assert.match(r.json.error, /dayItemId/);
+});
+await check('用別的趟的 id 覆寫：403', async () => {
+  const r = await api(`/api/share/${shareToken}/item`, {
+    key: null,
+    method: 'POST',
+    body: { id: 'item_b1', title: 'Hijacked', date: '2026-03-02' },
+  });
+  assert.equal(r.status, 403, r.text);
+});
+await check('同行者寫的會進基準檔，擁有者下次同步讀得到', async () => {
+  const r = await api('/api/base');
+  assert.equal(r.status, 200);
+  const mine = r.json.base.expenses.find((e) => e.id === madeByShare);
+  assert.ok(mine, '基準檔裡找不到那筆支出');
+  assert.equal(mine.tripId, 'trip_a');
+  assert.equal(mine.payee, 'ana');
+  const shared = await api(`/api/share/${shareToken}`, { key: null });
+  // 這一趟在之前的合併測試裡就有支出了，所以用增量而不是絕對值來驗
+  assert.equal(shared.json.expenses.length, beforeShared.expenses + 2, `expenses=${shared.json.expenses.length}`);
+  assert.equal(shared.json.totals.expenses, beforeShared.expenses + 2);
+  assert.equal(shared.json.totals.baseAmount, Math.round((beforeShared.base + 180 + 1500) * 100) / 100);
+});
+await check('GET /api/shares 列出連結與開過/寫過的次數', async () => {
+  const r = await api('/api/shares?tripId=trip_a');
+  assert.equal(r.status, 200);
+  const row = r.json.shares.find((s) => s.token === shareToken);
+  assert.ok(row && row.hits >= 2, `hits=${row?.hits}`);
+  assert.ok(row.writes >= 4, `writes=${row?.writes}`);
+  assert.ok(r.json.shares.every((s) => s.tripId === 'trip_a'), 'tripId 過濾要準');
+});
+await check('沒金鑰不能管理連結', async () => {
+  const r = await api('/api/shares/revoke', { key: null, method: 'POST', body: { token: shareToken } });
+  assert.equal(r.status, 401);
+});
+await check('作廢後立刻讀不到（410），而且重試也不會復活', async () => {
+  assert.equal((await api('/api/shares/revoke', { method: 'POST', body: { token: shareToken } })).status, 200);
+  assert.equal((await api(`/api/share/${shareToken}`, { key: null })).status, 410);
+  assert.equal((await api(`/api/share/${shareToken}/expense`, { key: null, method: 'POST', body: { amount: 1 } })).status, 410);
+  const again = await api('/api/shares/revoke', { method: 'POST', body: { token: shareToken } });
+  assert.equal(again.status, 200);
+  assert.equal(again.json.changed, false, '第二次沒有真的改到東西');
+});
+await check('期限與生死的純函式', async () => {
+  const { shareStatus: st, expiresAtFrom, partialOf: partial } = await import(pathToFileURL(path.join(here, '..', 'src', 'share.js')).href);
+  assert.equal(st({ createdAt: iso(0) }).live, true, '沒設期限就長長久久');
+  assert.equal(st({ expiresAt: iso(-1) }).live, false);
+  assert.equal(st({ expiresAt: iso(-1), revokedAt: iso(0) }).reason, 'revoked', '作廢比過期優先講');
+  assert.equal(st({ expiresAt: iso(1), revokedAt: iso(0) }).reason, 'revoked');
+  assert.equal(expiresAtFrom(0), null);
+  assert.equal(expiresAtFrom('never'), null);
+  assert.ok(expiresAtFrom(undefined) > new Date().toISOString(), '不給值就預設 90 天');
+  assert.throws(() => expiresAtFrom(9999), /365/);
+  assert.deepEqual(Object.keys(partial('expenses', { id: 'exp_x' })), [
+    'format', 'version', 'exportedAt', 'trips', 'dayItems', 'expenses', 'categories', 'photos', 'meta',
+  ]);
+  assert.equal(partial('dayItems', { id: 'item_x' }).expenses.length, 0);
+});
+await check('沒被作廢的另一把連結還活著', async () => {
+  const r = await api(`/api/share/${survivorToken}`, { key: null });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.trip.id, 'trip_b');
+});
+
 console.log('\n— 歷史與重啟');
 await check('保留多份歷史快照', async () => {
   const r = await api('/api/history');

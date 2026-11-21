@@ -8,6 +8,15 @@
  */
 import http from 'node:http';
 import { openStore, migrateJsonSnapshots, MAX_SNAPSHOT_BYTES } from './store.js';
+import {
+  ShareError,
+  expiresAtFrom,
+  partialOf,
+  sanitizeExpense,
+  sanitizeItem,
+  sharePayload,
+  shareStatus,
+} from './share.js';
 import { send, fail, tokenEquals, bearer, readJsonBody, rateLimiter, clientIp, applyCors } from './net.js';
 
 const VERSION = '0.1.0';
@@ -17,6 +26,8 @@ const DATA_DIR = process.env.TRIPLOG_DATA_DIR ?? '/data';
 const WRITE_KEY = (process.env.TRIPLOG_API_KEY ?? '').trim();
 const READ_KEY = (process.env.TRIPLOG_READ_KEY ?? WRITE_KEY).trim();
 const MAX_BODY = Number(process.env.TRIPLOG_MAX_BODY ?? MAX_SNAPSHOT_BYTES * 2);
+/** 分享頁只送文字欄位，64 KB 已經很闊氣；卡死在體積上比較不會被拿來灌資料庫 */
+const MAX_SHARE_BODY = 64 * 1024;
 const ALLOWED_ORIGIN = (process.env.TRIPLOG_ALLOWED_ORIGIN ?? '')
   .split(',')
   .map((s) => s.trim())
@@ -40,6 +51,9 @@ if (migrated) console.log(`[triplog-api] 已把舊的 snapshot.json 搬進 SQLit
 
 const limitRead = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_READ ?? 600), windowMs: 60_000 });
 const limitWrite = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_WRITE ?? 60), windowMs: 60_000 });
+// 分享連結是「沒有金鑰也進得來」的路徑，所以另外計數：一把 token 加一個 IP 一個 key
+const limitShareRead = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_SHARE_READ ?? 240), windowMs: 60_000 });
+const limitShareWrite = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_SHARE_WRITE ?? 30), windowMs: 60_000 });
 
 /* -------------------------------------------------------------- 資料視圖 */
 
@@ -128,11 +142,39 @@ const SCHEMA_HINT = {
     createdAt: 'ISO',
     updatedAt: 'ISO',
   },
+  shareWrite: {
+    via: 'POST /api/share/<token>/expense  |  /api/share/<token>/item  (no bearer token needed)',
+    expense: {
+      id: 'exp_<uuid> (optional; send your own so retries merge)',
+      date: 'YYYY-MM-DD (trip range +/- 3 days)',
+      amount: 'number > 0',
+      currency: 'ISO code, defaults to the trip base currency',
+      rateToBase: 'required when currency differs from the base currency',
+      category: 'category id or builtin key',
+      payee: 'string (who paid)',
+      note: 'string',
+      dayItemId: 'optional, must be an item of this trip',
+    },
+    item: {
+      id: 'item_<uuid> (optional)',
+      date: 'YYYY-MM-DD',
+      kind: 'transport|stay|food|sight|activity|other',
+      title: 'string, required',
+      startTime: 'HH:MM|null',
+      endTime: 'HH:MM|null',
+      location: 'string',
+      lat: 'number|null',
+      lng: 'number|null',
+      note: 'string',
+    },
+    serverSets: 'tripId (always the shared trip), createdAt, updatedAt, baseAmount',
+  },
   notes: [
     'Write via POST /api/backup with a full triplog-backup document; the server merges by id and keeps the newest updatedAt.',
-    'Prefer POST /api/sync with a partial document {trips?,dayItems?,expenses?,categories?,photos?} so you never overwrite rows you did not read.',
+    'Prefer POST /api/sync with a partial document {trips: [], dayItems?, expenses?, categories?, photos?} so you never overwrite rows you did not read; the arrays you leave out must be [] (missing trips is treated as a malformed upload, not as an empty one).',
     'There is no delete endpoint by design. To archive a trip set archived=true.',
     'Amounts stay in the original currency; baseAmount is what statistics use.',
+    'Sharing: POST /api/shares {tripId,expiresInDays} (needs the key) mints a trip-scoped token; GET /api/share/<token> reads that trip only and POST /api/share/<token>/expense|item appends to it without any key. POST /api/shares/revoke {token} kills a link; it revokes a grant, not data.',
   ],
 };
 
@@ -156,6 +198,11 @@ async function route(req, res) {
   }
   if (resource === 'schema') {
     return send(res, 200, { ok: true, version: VERSION, schema: SCHEMA_HINT });
+  }
+
+  // 分享連結：token 本身就是授權，走不了下面的 bearer 檢查，必須先分流出去
+  if (resource === 'share' && parts[2]) {
+    return handleShare(req, res, parts[2], parts[3]);
   }
 
   const key = bearer(req);
@@ -239,6 +286,10 @@ async function route(req, res) {
         },
       );
     }
+    if (resource === 'shares') {
+      const tripId = url.searchParams.get('tripId');
+      return send(res, 200, { ok: true, shares: store.listShares(tripId || null) });
+    }
     return fail(res, 404, 'not found', {});
   }
 
@@ -280,6 +331,32 @@ async function route(req, res) {
     return send(res, 200, { ok: true, photos: pickPhotos(snapshot, { ids, tripIds, limit: 200 }) });
   }
 
+  /* ------------------------------------------------ 分享連結管理（要金鑰） */
+
+  if (resource === 'shares' && !parts[2]) {
+    const tripId = String(body?.tripId ?? '');
+    const trip = findTrip(snapshot, tripId);
+    // 還沒同步的趟在伺服器上根本不存在，連結開起來也是 404，就在這裡講清楚
+    if (!trip) return fail(res, 409, '這趟旅行還沒有同步到伺服器，先同步再分享', { need: 'sync', tripId });
+    let expiresAt = null;
+    try {
+      expiresAt = expiresAtFrom(body?.expiresInDays);
+    } catch (err) {
+      return fail(res, err.status ?? 400, String(err.message ?? err), {});
+    }
+    const label = typeof body?.label === 'string' && body.label.trim() ? body.label.trim().slice(0, 60) : trip.name;
+    return send(res, 200, { ok: true, share: store.createShare({ tripId, label, expiresAt }) });
+  }
+
+  if (resource === 'shares' && parts[2] === 'revoke') {
+    const token = String(body?.token ?? '');
+    const changed = store.revokeShare(token);
+    const row = store.share(token);
+    if (!row) return fail(res, 404, '找不到這個分享連結', {});
+    // 已經作廢過再按一次也不算錯：按下去要的就是「這個連結沒了」的狀態
+    return send(res, 200, { ok: true, revoked: true, changed, share: row });
+  }
+
   if (resource === 'admin' && parts[2] === 'clear') {
     if (req.headers['x-triplog-confirm'] !== 'wipe') {
       return fail(res, 400, 'pass header x-triplog-confirm: wipe', {});
@@ -289,6 +366,81 @@ async function route(req, res) {
   }
 
   return fail(res, 404, 'not found', {});
+}
+
+/**
+ * 分享連結的公開路徑（不需要 bearer token）。
+ *
+ * 一個 token 只認一趟旅行：讀只回那一趟，寫一律把 tripId 換成 token 對應的那一趟，
+ * 所以拿到連結的人動不到別的旅行，也沒有任何刪除的入口（要撤銷就作廢連結）。
+ * 寫進基準檔走的是 store.put 同一條合併路徑，擁有者下次同步就會看到對方補的記錄。
+ */
+async function handleShare(req, res, tokenPart, action) {
+  const token = String(tokenPart ?? '').slice(0, 64);
+  const share = store.share(token);
+  if (!share) return fail(res, 404, '找不到這個分享連結', {});
+  const { live, reason } = shareStatus(share);
+  if (!live) {
+    return fail(res, 410, reason === 'revoked' ? '這個分享連結已被擁有者作廢' : '這個分享連結已過期', { reason });
+  }
+  const ip = clientIp(req);
+  if (!limitShareRead(`${token}|${ip}`)) return fail(res, 429, 'too many requests', { retryAfterMs: 60_000 });
+
+  const { snapshot, head } = store.base();
+
+  if (req.method === 'GET' && !action) {
+    store.touchShare(token);
+    let payload;
+    try {
+      payload = sharePayload(snapshot, share.tripId, share);
+    } catch (err) {
+      return fail(res, err.status ?? 500, String(err.message ?? err), {});
+    }
+    return send(res, 200, { ok: true, scope: 'share', head, ...payload });
+  }
+
+  if (req.method === 'POST' && (action === 'expense' || action === 'item')) {
+    if (!limitShareWrite(`${token}|${ip}`)) return fail(res, 429, 'too many writes', { retryAfterMs: 60_000 });
+    let body = null;
+    try {
+      body = await readJsonBody(req, MAX_SHARE_BODY);
+    } catch (err) {
+      return fail(res, err.status ?? 400, err.message, {});
+    }
+    const trip = findTrip(snapshot, share.tripId);
+    if (!trip) return fail(res, 404, '這趟旅行已經不在伺服器上（可能被清除，或還沒同步）', {});
+    const rows = snapshotRows(snapshot, share.tripId);
+    const ctx = { trip, existing: rows.existing, itemIds: rows.itemIds, maxOrder: rows.maxOrder, now: new Date().toISOString() };
+    let row;
+    let table;
+    try {
+      row = action === 'expense' ? sanitizeExpense(body, ctx) : sanitizeItem(body, ctx);
+      table = action === 'expense' ? 'expenses' : 'dayItems';
+    } catch (err) {
+      return fail(res, err instanceof ShareError ? err.status : 400, String(err.message ?? err), {});
+    }
+    const saved = store.put(partialOf(table, row), { source: 'share' });
+    store.touchShare(token, { write: true });
+    return send(res, 200, { ok: true, [action]: row, saved: { id: saved.id, unchanged: saved.unchanged === true } });
+  }
+
+  return fail(res, 405, 'method not allowed', {});
+}
+
+/** 這一趟現有的列：拿來擋跨趟覆寫、驗證 dayItemId 歸屬，以及決定新行程項的排序 */
+function snapshotRows(snapshot, tripId) {
+  const expenses = (snapshot.expenses ?? []).filter((e) => e.tripId === tripId);
+  const items = (snapshot.dayItems ?? []).filter((i) => i.tripId === tripId);
+  return {
+    existing: {
+      // 歸屬檢查要看得到別的趟，所以這裡用全庫的 id → 列
+      expenses: new Map((snapshot.expenses ?? []).map((e) => [e.id, e])),
+      items: new Map((snapshot.dayItems ?? []).map((i) => [i.id, i])),
+    },
+    itemIds: new Set(items.map((i) => i.id)),
+    maxOrder: items.reduce((m, i) => Math.max(m, Number(i.order) || 0), 0),
+    expenses,
+  };
 }
 
 function slice(snapshot, tripId, { photos = true } = {}) {
@@ -348,6 +500,7 @@ server.listen(PORT, HOST, () => {
   console.log(`[triplog-api] listening on http://${HOST}:${PORT} · data=${DATA_DIR}`);
   console.log(`[triplog-api] snapshots=${stats.snapshots} bytes=${stats.totalBytes} head=${stats.head?.exportedAt ?? '(none)'} keep=${stats.keep}`);
   console.log('[triplog-api] 沒有 DELETE API：寫入只有新增與覆寫，刪除請在本機操作後再同步。');
+  console.log('[triplog-api] 分享連結：/api/share/<token> 只用 token 授權，限一趟旅行、只能新增。');
 });
 
 for (const sig of ['SIGTERM', 'SIGINT']) {

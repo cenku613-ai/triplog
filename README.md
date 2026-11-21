@@ -16,6 +16,7 @@
 - **列印／PDF**：把一趟旅行輸出成 A4 列印頁——封面、每日時間軸、支出明細與圖表、照片牆、含路線點的地圖截圖，各區可單獨開關；先在 app 內預覽，再按文件上的「列印／儲存 PDF」由瀏覽器另存，不裝任何套件
 - **跨裝置同步**（選裝）：自架的零依賴 API 當基準檔，手機記的錢筆電看得到；採「兩端各自推送、伺服器合併」，同一筆以 `updatedAt` 較新者勝，沒有帳號系統，只靠金鑰
 - **AI agent 寫入**（選裝）：透過 MCP 讓 agent 讀行程、記支出、建旅行；14 個工具、可切唯讀，並且刻意**沒有刪除**能力
+- **分享給同行者**（選裝）：每一趟旅行可產生一條只需要連結、不需要金鑰的分享網址。拿到網址的人看得到這一趟的行程與支出（**看不到照片，也看不到別的旅行**），也能幫你補一筆支出或加一個行程；寫進去的內容落在伺服器的基準檔，你下次同步就收得到，之後照樣能改能刪。連結可設效期（預設 90 天，最長 1 年，或不設限），隨時能作廢，作廢只收連結、不動已記錄的資料
 - **備份**：全量 JSON 匯出／匯入（合併或覆寫），照片以 base64 一起帶走，還原後 Blob 完整讀回
 - **PWA**：可安裝、完全離線可用、深色／淺色／跟隨系統主題、手機底部導覽列與桌面側欄自動切換；看過的地圖瓦片快取 30 天，離線仍能看底圖
 
@@ -24,10 +25,10 @@
 ```bash
 npm install
 npm run dev         # 開發伺服器，http://localhost:5173
-npm test            # 64 個單元測試（日期、金額換算、統計、備份與還原、合併規則、照片往來、座標與地圖邊界、雙語字典、PDF 文件）
+npm test            # 68 個單元測試（日期、金額換算、統計、備份與還原、合併規則、照片往來、座標與地圖邊界、雙語字典、PDF 文件、分享連結）
 npm run typecheck   # TypeScript 檢查
 npm run check:zh    # 繁中介面的字級檢查（抓簡體字，可 --fix）
-npm run server:test # 後端 API 冒煙測試（29 項，真的起一個 SQLite）
+npm run server:test # 後端 API 冒煙測試（49 項，真的起一個 SQLite）
 npm run mcp:test    # 打包 MCP 並用 JSON-RPC 打進去（21 項）
 npm run verify      # check:zh + typecheck + 單元測試 + 後端冒煙 + MCP 冒煙
 npm run icons       # 產生 PWA 圖示（純 Node，無外部依賴）
@@ -170,6 +171,19 @@ SSH_TARGET=opc@<你的IP> bash deploy/deploy.sh
 
 Agent 端（MCP）請看 [`mcp/README.md`](mcp/README.md)：打包 `npm run mcp:build`，把 `mcp/bin.mjs` 掛進 MCP 客戶端並給 `TRIPLOG_URL` ＋金鑰，就有 14 個讀寫工具；`TRIPLOG_ALLOW_WRITE=0` 是唯讀模式。
 
+**分享給同行者**用的就是同一台伺服器，所以開了 API 就自動有這個功能，不必另設定。app 裡打開一趟旅行，按「🔗 分享」→「產生連結」，把網址（`https://你的名字.duckdns.org/#/share/<token>`）傳給同行的人；他開頁就能看，按「＋ 記一筆支出」或「＋ 加一個行程」就直接寫進伺服器的基準檔（不需要金鑰、也沒有帳號）。同一個對話框列出還在效期內的連結與「開過幾次／補了幾筆」，隨時能作廢。這一趟還沒同步過時，按「產生連結」會先自動同步一次再產生。
+
+分享路徑的邊界（`server/src/share.js` 裡都有對應檢查）：
+
+- 一把 token 只認一趟旅行：讀只回那一趟，寫一律把 `tripId` 換成 token 對應的那一趟，別的趟的 id 拿來寫會得到 403
+- 回應裡沒有照片，`/api/share/*` 也碰不到 `/api/photos`
+- 金額的金鑰不在外頭：`baseAmount` 由伺服器依送來的匯率重算，外幣沒給匯率就 400 退回，時間戳一律用伺服器時間
+- 有期限（預設 90 天，最長 365 天，可選不設限）與即時作廢；作廢收的是「授權」，已記錄的資料不動
+- 限速獨立計算（`TRIPLOG_RATE_SHARE_READ` 預設 600/分鐘、`TRIPLOG_RATE_SHARE_WRITE` 預設 30/分鐘，以 token＋IP 為單位），避免一條連結被拿來灌基準檔
+- 仍然沒有刪除端點：同行者只能新增與覆寫自己那幾筆，動不到既有記錄
+
+連結清單存在同一個 SQLite 的 `shares` 表（容器啟動時自動建表，不用搬資料）；`/api/admin/clear` 刻意不清這張表，免得把別人還在用的連結一起弄丟。
+
 資料庫位置：`triplog_data` 這個 named volume 裡的 SQLite（基準檔保留 `TRIPLOG_KEEP` 份歷史快照，預設 20）。要備份整個雲端庫：
 
 ```bash
@@ -191,13 +205,14 @@ curl -I https://<網址>/              # Cache-Control 應為 no-cache
 curl -I https://<網址>/sw.js         # 不應有 max-age
 curl -s https://<網址>/manifest.webmanifest | head -5
 
-# 有開同步／agent API 時再多驗這兩項
+# 有開同步／agent API 時再多驗這三項
 curl -s -o /dev/null -w '%{http_code}\n' https://<網址>/api/health   # 200
 curl -s -o /dev/null -w '%{http_code}\n' https://<網址>/api/base     # 401（沒帶金鑰就讀不到資料）
+curl -s -o /dev/null -w '%{http_code}\n' https://<網址>/api/share/nope   # 404（不認識的分享 token 什麼都拿不到）
 ```
 
 ## 尚未做（第二期候補）
 
 **刪除語意（tombstone）**：目前的同步是合併並集，一端刪掉的記錄會被另一端帶回來，所以 MCP 乾脆不提供刪除。要做的是記「已刪除」標記而不是真的抹掉。
 
-其餘：帳號系統（現在只靠金鑰，一把金鑰＝整個資料庫）、同行者分帳清算（目前只記「誰付的」與各人代墊合計）、CSV 匯出、共用唯讀連結、行程項之間的路線連線與距離、照片的地點／時間 EXIF 解析、PDF 的多趟合併與直排版面。
+其餘：帳號系統（現在只靠金鑰，一把金鑰＝整個資料庫）、同行者分帳清算（目前只記「誰付的」與各人代墊合計）、CSV 匯出、行程項之間的路線連線與距離、照片的地點／時間 EXIF 解析、PDF 的多趟合併與直排版面。

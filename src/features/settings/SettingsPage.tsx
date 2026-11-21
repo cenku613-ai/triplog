@@ -96,8 +96,8 @@ export function SettingsPage() {
   }
 
   return (
-    <div className="stack" style={{ gap: 'var(--sp-5)', maxWidth: 760 }}>
-      <div>
+    <div className="settings">
+      <div className="settings-head">
         <h1>{t('settings.title')}</h1>
         <p className="muted" style={{ fontSize: 14 }}>
           {t('settings.counts', counts)}
@@ -278,7 +278,7 @@ export function SettingsPage() {
           <button className="btn btn-primary" onClick={() => void download()}>
             {t('settings.export')}
           </button>
-          <div className="row">
+          <div className="row wrap">
             <select
               value={importMode}
               onChange={(e) => setImportMode(e.target.value as 'merge' | 'replace')}
@@ -347,7 +347,7 @@ export function SettingsPage() {
         </button>
       </section>
 
-      <p className="tiny">{t('settings.footer')}</p>
+      <p className="tiny settings-foot">{t('settings.footer')}</p>
     </div>
   );
 }

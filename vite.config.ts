@@ -97,5 +97,11 @@ export default defineConfig({
   server: {
     host: true,
     port: 5173,
+    /**
+     * 分享頁打的是「跟頁面同來源」的 /api/*（正式環境由 Caddy 反代到後端），
+     * 本機開發時把同一條路徑轉給 `npm run server:start`，
+     * 否則在 5173 開分享連結只會拿到 vite 的 index.html。
+     */
+    proxy: { '/api': { target: 'http://127.0.0.1:8788', changeOrigin: false } },
   },
 });
