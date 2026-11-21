@@ -5,8 +5,12 @@ import {
   activeTokens,
   createApiToken,
   createPairingCode,
+  daysLeft,
   describeTokenError,
+  deviceTokenExpiringSoon,
+  DEVICE_TOKEN_SOON_DAYS,
   formatPairCode,
+  guessDeviceName,
   hintOf,
   isCurrentDevice,
   isIssuedToken,
@@ -18,6 +22,7 @@ import {
   pairWithCode,
   pairingState,
   rotateMasterKey,
+  shouldMintDeviceToken,
   tokenState,
   type ApiTokenRow,
   type PairingRow,
@@ -355,3 +360,56 @@ describe('主金鑰狀態與輪換', () => {
     expect(JSON.parse(String(calls[0].init!.body))).toEqual({ confirm: 'rotate-master-no-backup' });
   });
 });
+
+/**
+ * 「連線時自動幫這台裝置簽憑證」的判斷式：哪些金鑰該換、裝置名怎麼湊、效期剩多久要開始講。
+ * 按鈕的編排在 SyncCard，這裡只釘住不會變的規則。
+ */
+describe('本裝置憑證的自動簽發', () => {
+  it('只有長金鑰該被換掉：tlk_ 跳過，太短的也跳過', () => {
+    expect(shouldMintDeviceToken('a'.repeat(64))).toBe(true);
+    expect(shouldMintDeviceToken('smoke-write-key-0123456789abcdef')).toBe(true);
+    expect(shouldMintDeviceToken('tlk_Aaaaaaaaaaaaaaaaaaaaaaaaaaaa')).toBe(false);
+    expect(shouldMintDeviceToken('   tlk_Aaaaaaaaaaaaaaaaaaaaaaaaaaaa  ')).toBe(false);
+    expect(shouldMintDeviceToken('short')).toBe(false);
+    expect(shouldMintDeviceToken('')).toBe(false);
+    expect(shouldMintDeviceToken(undefined)).toBe(false);
+  });
+
+  it('裝置名只取「哪台機器＋哪顆瀏覽器」', () => {
+    expect(guessDeviceName('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1')).toBe('iOS · Safari');
+    expect(guessDeviceName('Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15')).toBe('iPad · Safari');
+    expect(guessDeviceName('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36')).toBe('macOS · Chrome');
+    expect(guessDeviceName('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36 Edg/120.0')).toBe('Windows · Edge');
+    expect(guessDeviceName('Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0')).toBe('Windows · Firefox');
+    expect(guessDeviceName('Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36')).toBe('Android · Chrome');
+    expect(guessDeviceName('Mozilla/5.0 (Linux; Android 14; SM-X710) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36')).toBe('Android 平板 · Chrome');
+    // 認不出來就留白，由呼叫方決定怎麼補（不要編一個「未知裝置」進去佔名）
+    expect(guessDeviceName('curl/8.4.0')).toBe('');
+    expect(guessDeviceName('')).toBe('');
+  });
+
+  it('daysLeft：剩多少天往上取，過期是 0，不設限期是無限', () => {
+    expect(daysLeft(new Date(NOW + 5 * 86_400_000).toISOString(), NOW)).toBe(5);
+    expect(daysLeft(new Date(NOW + 1000).toISOString(), NOW)).toBe(1);
+    expect(daysLeft(new Date(NOW - 86_400_000).toISOString(), NOW)).toBe(0);
+    expect(daysLeft(null, NOW)).toBe(Infinity);
+    expect(daysLeft(undefined, NOW)).toBe(Infinity);
+    expect(daysLeft('not-a-date', NOW)).toBe(Infinity);
+  });
+
+  it('剩不到兩週才嚇人，而且只看本機正在用的那把', () => {
+    const key = 'tlk_ABCD1234567890123XYZW';
+    const mine = (over = {}) => row({ hint: 'tlk_ABCD…XYZW', ...over });
+    expect(deviceTokenExpiringSoon([mine({ expiresAt: new Date(NOW + 3 * 86_400_000).toISOString() })], key, NOW)).toBe(true);
+    expect(deviceTokenExpiringSoon([mine({ expiresAt: new Date(NOW + DEVICE_TOKEN_SOON_DAYS * 86_400_000).toISOString() })], key, NOW)).toBe(true);
+    expect(deviceTokenExpiringSoon([mine({ expiresAt: new Date(NOW + 60 * 86_400_000).toISOString() })], key, NOW)).toBe(false);
+    expect(deviceTokenExpiringSoon([mine({ expiresAt: null })], key, NOW)).toBe(false);
+    // 已經死了的金鑰不該再提醒：那是「請重新配對」的問題，不是「剩幾天」的問題
+    expect(deviceTokenExpiringSoon([mine({ expiresAt: new Date(NOW + 86_400_000).toISOString(), revokedAt: '2026-01-01T00:00:00.000Z' })], key, NOW)).toBe(false);
+    // 本機放的是主金鑰時根本不該跳這句（它沒有效期）
+    expect(deviceTokenExpiringSoon([mine({ expiresAt: new Date(NOW + 86_400_000).toISOString() })], 'master-key', NOW)).toBe(false);
+    expect(deviceTokenExpiringSoon([], key, NOW)).toBe(false);
+  });
+});
+

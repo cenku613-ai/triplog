@@ -26,7 +26,9 @@ import {
   activeTokens,
   createApiToken,
   createPairingCode,
+  daysLeft,
   describeTokenError,
+  DEVICE_TOKEN_SOON_DAYS,
   isCurrentDevice,
   isIssuedToken,
   listApiTokens,
@@ -211,6 +213,16 @@ export function KeyDeviceCard() {
   const selfId = useMemo(() => {
     const mine = (rows ?? []).find((r) => isCurrentDevice(r, cfg?.apiKey ?? ''));
     return mine ? mine.id : '';
+  }, [rows, cfg]);
+
+  /**
+   * 本機這把還剩幾天。自動簽發給的是 90 天，到期那天同步會整個停，
+   * 所以剩下不到兩週就要在清單上講明，讓人在停掉之前重簽一張。
+   */
+  const selfDaysLeft = useMemo(() => {
+    const mine = (rows ?? []).find((r) => isCurrentDevice(r, cfg?.apiKey ?? ''));
+    if (!mine || tokenState(mine) !== 'active') return Infinity;
+    return daysLeft(mine.expiresAt);
   }, [rows, cfg]);
 
   const fail = (err: unknown) => setError(describeTokenError(err, t));
@@ -496,6 +508,11 @@ export function KeyDeviceCard() {
                 <div className="tiny">
                   {row.expiresAt ? t('tokens.expiresAt', { when: when(row.expiresAt, locale) }) : t('tokens.noExpiry')}
                 </div>
+                {mine && Number.isFinite(selfDaysLeft) && selfDaysLeft <= DEVICE_TOKEN_SOON_DAYS ? (
+                  <div className="tiny" style={{ color: 'var(--danger)' }}>
+                    {t('keys.autoSoon', { n: selfDaysLeft })}
+                  </div>
+                ) : null}
               </div>
               <div className="row" style={{ gap: 6 }}>
                 {mine ? <span className="badge">{t('tokens.thisDevice')}</span> : null}

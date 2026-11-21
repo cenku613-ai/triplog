@@ -671,6 +671,14 @@ export const en: Dict = {
   'keys.masterRotateForced': 'Rotate anyway (I know there is no backup credential)',
   'keys.masterRotateDone': 'The master key is renewed and the old one is dead. Copy the new value now.',
   'keys.masterNeedMaster': 'Rotating needs the master key itself: this device is using a credential. Do it from a device that holds the master key, or put the master key back under "Cross-device sync".',
+  'keys.autoLabel': 'This device · {name}',
+  'keys.autoLabelFallback': 'this device',
+  'keys.autoBody': 'When the key you pasted is the master key, the first successful "Test connection" or "Sync now" also mints a read-write credential valid for 90 days and switches this device to it - the master key stops living on this device.',
+  'keys.autoMinting': 'Swapping this device to its own credential…',
+  'keys.autoToast': 'Minted a credential for this device ({hint})',
+  'keys.autoDone': 'This device now uses the freshly minted credential {hint}: read-write, valid for {days} days. Revoke it any time under "Keys & devices".',
+  'keys.autoSkip': 'Connected, but no device credential was minted (that key may not be the master key, e.g. the read-only `.env` key). The current key still works; to switch to a revocable credential, paste the master key or create a pairing code on a device that is already synced.',
+  'keys.autoSoon': '{n} days left: sync stops the day it expires, so mint a new one and tap "Use this on this device".',
 
   /* -------------------------------------------------------------- pwa / sw */
   'pwa.updateReady': 'New version downloaded',

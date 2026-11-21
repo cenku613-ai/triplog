@@ -56,6 +56,81 @@ export function isCurrentDevice(row: ApiTokenRow, key: string): boolean {
   return hint !== '' && row.hint === hint;
 }
 
+/* ------------------------------------------------- 本裝置憑證（自動簽發） */
+
+/** 自動簽發用的預設值：裝置要能推檔案，所以給 write；90 天是「夠用又不會長到忘了它存在」 */
+export const DEVICE_TOKEN_SCOPE: TokenScope = 'write';
+export const DEVICE_TOKEN_DAYS = 90;
+/** 剩幾天以內要開始勸人重簽：過期那天同步會整個停，不能讓它靜靜發生 */
+export const DEVICE_TOKEN_SOON_DAYS = 14;
+
+/**
+ * 本機那把是不是「還該被換掉」的長金鑰。
+ *
+ * 貼上來的是主金鑰或 `.env` 的只讀鑰時才該自動簽一把：前綴 `tlk_` 的已經是憑證
+ * （再簽一次只是多發一把），而太短的東西（還沒填、填到一半）根本不該拿去打伺服器。
+ */
+export function shouldMintDeviceToken(key: unknown): boolean {
+  const s = String(key ?? '').trim();
+  return s.length >= 24 && !isIssuedToken(s);
+}
+
+/**
+ * 從 User-Agent 湊一個人在清單上認得出的裝置名。
+ *
+ * 只取「哪台機器＋哪顆瀏覽器」兩件事，不碰任何可識別資訊；湊不出來就留白，
+ * 由簽發時的 label 自己收（伺服器的 `tokenLabel` 有長度上限）。
+ */
+export function guessDeviceName(userAgent?: string): string {
+  const ua = String(userAgent ?? (typeof navigator !== 'undefined' ? navigator.userAgent ?? '' : ''));
+  if (!ua) return '';
+  const os = /iPhone|iPad|iPod/i.test(ua)
+    ? 'iOS'
+    : /Android/i.test(ua)
+      ? 'Android'
+      : /Windows NT/i.test(ua)
+        ? 'Windows'
+        : /Mac OS X|Macintosh/i.test(ua)
+          ? 'macOS'
+          : /CrOS/i.test(ua)
+            ? 'ChromeOS'
+            : /Linux/i.test(ua)
+              ? 'Linux'
+              : '';
+  const browser = /Edg\//i.test(ua)
+    ? 'Edge'
+    : /OPR\//i.test(ua)
+      ? 'Opera'
+      : /Firefox\//i.test(ua)
+        ? 'Firefox'
+        : /MicroMessenger/i.test(ua)
+          ? 'WeChat'
+          : /CriOS|Chrome\//i.test(ua)
+            ? 'Chrome'
+            : /Safari\//i.test(ua)
+              ? 'Safari'
+              : '';
+  if (os === 'iOS' && /iPad/i.test(ua)) return ['iPad', browser].filter(Boolean).join(' · ');
+  if (os === 'Android' && !/Mobile/i.test(ua)) return ['Android 平板', browser].filter(Boolean).join(' · ');
+  return [os, browser].filter(Boolean).join(' · ');
+}
+
+/** 還剩幾天：已過期給 0，不設限期給 Infinity（介面要分開講「無限」而不是「很多天」） */
+export function daysLeft(expiresAt: string | null | undefined, now = Date.now()): number {
+  if (!expiresAt) return Infinity;
+  const at = Date.parse(String(expiresAt));
+  if (Number.isNaN(at)) return Infinity;
+  return Math.max(0, Math.ceil((at - now) / 86_400_000));
+}
+
+/** 這台裝置現在用的憑證是不是快到期（本機放的是主金鑰時回 false——那是另一件事） */
+export function deviceTokenExpiringSoon(rows: ApiTokenRow[], key: string, now = Date.now()): boolean {
+  if (!isIssuedToken(String(key ?? ''))) return false;
+  const mine = rows.find((r) => isCurrentDevice(r, String(key ?? '')));
+  if (!mine || tokenState(mine, now) !== 'active') return false;
+  return daysLeft(mine.expiresAt, now) <= DEVICE_TOKEN_SOON_DAYS;
+}
+
 export type TokenErrorCode =
   | 'auth'
   | 'offline'

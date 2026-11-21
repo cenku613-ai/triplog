@@ -9,12 +9,25 @@
  * 連線方式有兩條：貼金鑰（原有）與「用配對碼連線」。後者是為了讓新裝置不必經手長金鑰——
  * 在擁有者的 app 裡產生一組 8 個字的一次性配對碼，這裡打完那 8 個字就換到一把屬於這台
  * 裝置的憑證（`tlk_…`），本機存的從此是可單獨撤銷的憑證，不是整座資料庫的密碼。
+ *
+ * 走第一條（貼金鑰）時也不用事後自己跑去簽：只要這次真的連上伺服器，`autoMint` 就順手
+ * 幫這台裝置簽一把可讀可寫、90 天有效的憑證並寫回本機設定，主金鑰當場不再留在裝置上。
+ * 這件事是錦上添花，簽不動（例如貼的是 `.env` 的只讀鑰）就靜靜留原狀，不擋同步。
  */
 import { useEffect, useState } from 'react';
 import { useUi } from '../../app/ui';
 import { useI18n } from '../../i18n';
 import { Field } from '../../components/Controls';
-import { describeTokenError, pairCodeProgress, pairWithCode } from '../../lib/tokens';
+import {
+  DEVICE_TOKEN_DAYS,
+  DEVICE_TOKEN_SCOPE,
+  createApiToken,
+  describeTokenError,
+  guessDeviceName,
+  pairCodeProgress,
+  pairWithCode,
+  shouldMintDeviceToken,
+} from '../../lib/tokens';
 import {
   describeSyncError,
   lastSyncAt,
@@ -52,6 +65,9 @@ export function SyncCard() {
   const [report, setReport] = useState<SyncReport | null>(null);
   const [remote, setRemote] = useState<Awaited<ReturnType<typeof listRemoteTrips>>>([]);
   const [at, setAt] = useState<string | null>(() => lastSyncAt());
+  /** 自動簽發的結果：成功講 hint 與效期，沒簽成也要講清楚為什麼（用 tiny 一行，不丟錯誤泡泡） */
+  const [note, setNote] = useState('');
+  const [minting, setMinting] = useState(false);
 
   const cfg: SyncConfig | null = baseUrl.trim() && apiKey.trim()
     ? { baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), auto }
@@ -116,6 +132,35 @@ export function SyncCard() {
       toast(describeTokenError(err, t), { kind: 'error' });
     } finally {
       setBusy(null);
+    }
+  }
+
+  /**
+   * 自動把「這台裝置」換成一把自己的憑證——呼叫時機是剛剛真的讀到伺服器之後，
+   * 因為那代表送出去的金鑰有效，才值得拿它去發照。
+   *
+   * 只在放了長金鑰（主鑰／`.env` 只讀鑰）時動手；`tlk_` 開頭的已經是憑證，再簽一次
+   * 只是多發一把、清單越來越長。失敗一律吞下來改講一句小字：連線已經成功，
+   * 不該為了這件事丟出一個錯誤 toast 讓人以為同步壞了。
+   */
+  async function autoMint() {
+    if (!cfg || !shouldMintDeviceToken(cfg.apiKey)) return;
+    setMinting(true);
+    try {
+      const name = guessDeviceName();
+      const { secret, row } = await createApiToken(cfg, {
+        label: t('keys.autoLabel', { name: name || t('keys.autoLabelFallback') }),
+        scope: DEVICE_TOKEN_SCOPE,
+        expiresInDays: DEVICE_TOKEN_DAYS,
+      });
+      saveSyncConfig({ ...cfg, apiKey: secret });
+      setApiKey(secret);
+      setNote(t('keys.autoDone', { hint: row.hint, days: DEVICE_TOKEN_DAYS }));
+      toast(t('keys.autoToast', { hint: row.hint }));
+    } catch {
+      setNote(t('keys.autoSkip'));
+    } finally {
+      setMinting(false);
     }
   }
 
@@ -221,6 +266,12 @@ export function SyncCard() {
         {t('sync.photoWarn')}
       </div>
 
+      {mode === 'key' && cfg ? (
+        <p className="tiny" style={{ margin: 0 }}>
+          {minting ? t('keys.autoMinting') : t('keys.autoBody')}
+        </p>
+      ) : null}
+
       <div className="row wrap">
         <button
           className="btn btn-primary btn-sm"
@@ -230,6 +281,7 @@ export function SyncCard() {
               const r = await syncNow(cfg!);
               showReport(r, t('sync.now'));
               setRemote(await listRemoteTrips(cfg!).catch(() => remote));
+              await autoMint();
             })
           }
         >
@@ -267,6 +319,7 @@ export function SyncCard() {
             run('test', async () => {
               const r = await testConnection(cfg!);
               toast(r.trips ? t('sync.testOk', { bytes: kb(r.bytes), trips: r.trips }) : t('sync.testOkEmpty'));
+              await autoMint();
             })
           }
         >
@@ -315,6 +368,12 @@ export function SyncCard() {
             : t('sync.never')}
         </span>
       </div>
+
+      {note ? (
+        <p className="tiny" style={{ margin: 0 }}>
+          {note}
+        </p>
+      ) : null}
 
       {report ? (
         <p className="tiny">
