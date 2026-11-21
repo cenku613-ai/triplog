@@ -20,7 +20,7 @@ import { useI18n, type Lang } from '../../i18n';
 import { categoryLabel } from '../../lib/labels';
 import { Field } from '../../components/Controls';
 import { SyncCard } from './SyncCard';
-import { ApiTokensCard } from './ApiTokensCard';
+import { KeyDeviceCard } from './KeyDeviceCard';
 
 const SWATCH = ['#0f766e', '#2f7ed8', '#7c5cd6', '#d64576', '#e07a3f', '#c9962b', '#6b7280'];
 /** 語言選單一律用母語顯示，所以名稱不進字典 */
@@ -308,7 +308,7 @@ export function SettingsPage() {
 
       <SyncCard />
 
-      <ApiTokensCard />
+      <KeyDeviceCard />
 
       <section className="card card-pad stack">
         <h3>{t('settings.demo')}</h3>

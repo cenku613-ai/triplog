@@ -5,11 +5,16 @@
  * （測試連線、雙向往返、只拉下來、整包推上去）與一趟一趟抓回來的清單。
  * 真正的合併規則在 src/lib/merge-core.js，跟後端共用同一份，所以這裡不需要
  * 也完全不該判斷「誰蓋掉誰」。
+ *
+ * 連線方式有兩條：貼金鑰（原有）與「用配對碼連線」。後者是為了讓新裝置不必經手長金鑰——
+ * 在擁有者的 app 裡產生一組 8 個字的一次性配對碼，這裡打完那 8 個字就換到一把屬於這台
+ * 裝置的憑證（`tlk_…`），本機存的從此是可單獨撤銷的憑證，不是整座資料庫的密碼。
  */
 import { useEffect, useState } from 'react';
 import { useUi } from '../../app/ui';
 import { useI18n } from '../../i18n';
 import { Field } from '../../components/Controls';
+import { describeTokenError, pairCodeProgress, pairWithCode } from '../../lib/tokens';
 import {
   describeSyncError,
   lastSyncAt,
@@ -25,7 +30,8 @@ import {
   type SyncReport,
 } from '../../lib/sync';
 
-type Action = 'test' | 'sync' | 'pull' | 'push' | 'one' | null;
+type Action = 'test' | 'sync' | 'pull' | 'push' | 'one' | 'pair' | null;
+type Mode = 'key' | 'code';
 
 /** 後端回來的位元組換成 KB，列表才不會一坨數字 */
 function kb(bytes: number): string {
@@ -36,9 +42,12 @@ export function SyncCard() {
   const { toast, ask } = useUi();
   const { t, locale } = useI18n();
   const saved = loadSyncConfig();
+  const [mode, setMode] = useState<Mode>(saved ? 'key' : 'code');
   const [baseUrl, setBaseUrl] = useState(saved?.baseUrl ?? '');
   const [apiKey, setApiKey] = useState(saved?.apiKey ?? '');
   const [auto, setAuto] = useState(saved?.auto ?? false);
+  const [code, setCode] = useState('');
+  const [device, setDevice] = useState('');
   const [busy, setBusy] = useState<Action>(null);
   const [report, setReport] = useState<SyncReport | null>(null);
   const [remote, setRemote] = useState<Awaited<ReturnType<typeof listRemoteTrips>>>([]);
@@ -47,6 +56,11 @@ export function SyncCard() {
   const cfg: SyncConfig | null = baseUrl.trim() && apiKey.trim()
     ? { baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), auto }
     : null;
+  const codeHint = (() => {
+    const { left, bad, ready } = pairCodeProgress(code);
+    if (ready || !code.trim()) return '';
+    return bad ? t('keys.codeBadChars') : t('keys.codeIncomplete', { n: left });
+  })();
 
   // 換裝置時第一次進這頁，清單是空的；有設定就自己拉一次
   useEffect(() => {
@@ -73,6 +87,38 @@ export function SyncCard() {
     }
   }
 
+  /**
+   * 配對：只需要位址與那 8 個字，這條路不帶任何金鑰（也不需要）。換到的憑證直接成為
+   * 這台裝置的同步金鑰，所以配對完就把表單上的金鑰欄位換掉——主金鑰不會進到這台裝置。
+   */
+  async function pair() {
+    const url = baseUrl.trim();
+    if (!url) {
+      toast(t('keys.errNoServer'), { kind: 'error' });
+      return;
+    }
+    if (!pairCodeProgress(code).ready) {
+      toast(t('keys.errShape'), { kind: 'error' });
+      return;
+    }
+    setBusy('pair');
+    try {
+      const res = await pairWithCode(url, code, device.trim());
+      saveSyncConfig({ baseUrl: url, apiKey: res.secret, auto });
+      setApiKey(res.secret);
+      setCode('');
+      setMode('key');
+      toast(t('keys.codeOk'));
+      const r = await pullFromServer({ baseUrl: url, apiKey: res.secret, auto });
+      showReport(r, t('sync.pull'));
+      setRemote(await listRemoteTrips({ baseUrl: url, apiKey: res.secret, auto }).catch(() => []));
+    } catch (err) {
+      toast(describeTokenError(err, t), { kind: 'error' });
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function showReport(r: SyncReport, label: string) {
     setReport(r);
     setAt(r.at);
@@ -94,7 +140,15 @@ export function SyncCard() {
         {t('sync.body')}
       </p>
 
-      <Field label={t('sync.baseUrl')}>
+      <div className="tabs" role="group" aria-label={t('keys.title')}>
+        {(['code', 'key'] as Mode[]).map((m) => (
+          <button key={m} type="button" aria-selected={mode === m} onClick={() => setMode(m)}>
+            {m === 'code' ? t('keys.connectWithCode') : t('keys.connectWithKey')}
+          </button>
+        ))}
+      </div>
+
+      <Field label={t(mode === 'code' ? 'keys.codeServer' : 'sync.baseUrl')}>
         <input
           value={baseUrl}
           onChange={(e) => setBaseUrl(e.target.value)}
@@ -104,16 +158,57 @@ export function SyncCard() {
           spellCheck={false}
         />
       </Field>
-      <Field label={t('sync.key')} hint={t('sync.keyHint')}>
-        <input
-          value={apiKey}
-          onChange={(e) => setApiKey(e.target.value)}
-          placeholder={t('sync.keyPlaceholder')}
-          type="password"
-          autoComplete="off"
-          spellCheck={false}
-        />
-      </Field>
+
+      {mode === 'code' ? (
+        <>
+          <Field label={t('keys.pairTitle')} hint={t('keys.pairHowto')}>
+            <input
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              placeholder={t('keys.codePlaceholder')}
+              maxLength={10}
+              autoComplete="off"
+              autoCapitalize="characters"
+              spellCheck={false}
+              style={{ textAlign: 'center', letterSpacing: '0.1em', textTransform: 'uppercase' }}
+            />
+          </Field>
+          {codeHint ? (
+            <p className="tiny" style={{ margin: 0, color: 'var(--danger)' }}>
+              {codeHint}
+            </p>
+          ) : null}
+          <Field label={t('keys.codeDevice')}>
+            <input
+              value={device}
+              onChange={(e) => setDevice(e.target.value)}
+              maxLength={40}
+              autoComplete="off"
+              placeholder={t('tokens.labelPlaceholder')}
+            />
+          </Field>
+          <div className="row wrap">
+            <button
+              className="btn btn-primary btn-sm"
+              disabled={busy !== null || !pairCodeProgress(code).ready || !baseUrl.trim()}
+              onClick={() => void pair()}
+            >
+              {busy === 'pair' ? t('keys.codeWorking') : t('keys.codeSubmit')}
+            </button>
+          </div>
+        </>
+      ) : (
+        <Field label={t('sync.key')} hint={t('sync.keyHint')}>
+          <input
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder={t('sync.keyPlaceholder')}
+            type="password"
+            autoComplete="off"
+            spellCheck={false}
+          />
+        </Field>
+      )}
       <label className="row" style={{ gap: 8 }}>
         <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
         <span>

@@ -67,6 +67,24 @@ async function waitUp() {
   throw new Error(`server 沒起來：\n${logs.join('')}`);
 }
 
+/** 跑救援指令列（同進程外的第二條路，走的是同一顆 SQLite），回傳 stdout＋stderr，並檢查結束碼 */
+function runCli(args, expectCode = 0) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [path.join(here, '..', 'src', 'cli.js'), ...args], {
+      env: { ...process.env, TRIPLOG_DATA_DIR: dir, TRIPLOG_API_KEY: KEY, TRIPLOG_READ_KEY: READ },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    p.stdout.on('data', (d) => (out += String(d)));
+    p.stderr.on('data', (d) => (out += String(d)));
+    p.on('error', reject);
+    p.on('close', (code) => {
+      if (code !== expectCode) reject(new Error(`cli ${args.join(' ')} 結束碼 ${code}（期望 ${expectCode}）：\n${out}`));
+      else resolve(out);
+    });
+  });
+}
+
 async function api(p, { method = 'GET', key = KEY, body, headers = {} } = {}) {
   const res = await fetch(`${BASE}${p}`, {
     method,
@@ -575,6 +593,145 @@ await check('使用狀況會被記下來', async () => {
   assert.ok(phone.lastSeenAt, '用過就要有最後使用時間');
 });
 
+console.log('\n— 配對碼（新裝置免貼長金鑰）');
+const keys = await import(pathToFileURL(path.join(here, '..', 'src', 'keys.js')).href);
+
+await check('配對碼的純函式：形狀、正規化、生死', () => {
+  const m = keys.newPairingCode();
+  assert.equal(m.code.length, 8);
+  assert.match(m.display, /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{4}-[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{4}$/);
+  assert.equal(keys.normalizeCode(m.display), m.code, '橫線要能打、可打可不打');
+  assert.equal(keys.normalizeCode(` ${m.code.toLowerCase()} `), m.code, '大小寫與空白都要吃掉');
+  assert.notEqual(m.hash, m.code, '進資料庫的是雜湊');
+  assert.equal(keys.hashSecret(m.code), m.hash, '同一組碼每次雜湊一致（查得到）');
+  assert.equal(keys.normalizeCode('ABC'), null, '太短');
+  assert.equal(keys.normalizeCode('ABCD-ILO0'), null, '字母表以外的字（I/L/O/0）不算輸入錯誤那麼便宜');
+  assert.equal(keys.normalizeCode(null), null);
+  assert.equal(keys.pairExpiresAt(10, Date.parse('2026-01-01T00:00:00Z')), '2026-01-01T00:10:00.000Z');
+  assert.equal(keys.pairExpiresAt(9999).slice(0, 10), new Date().toISOString().slice(0, 10), '超長要夾到上限，不能變成永久');
+  assert.throws(() => keys.pairExpiresAt(0), /expiresInMinutes/);
+  assert.equal(keys.pairingStatus({ usedAt: 'x', expiresAt: '2000-01-01T00:00:00Z' }).reason, 'used', '用掉要講「用過」，不是「過期」');
+  assert.equal(keys.pairingStatus({ revokedAt: 'x', expiresAt: '2999-01-01T00:00:00Z' }).reason, 'revoked');
+  assert.equal(keys.pairingStatus({ expiresAt: '2000-01-01T00:00:00Z' }).reason, 'expired');
+  assert.equal(keys.pairingStatus({ expiresAt: '2999-01-01T00:00:00Z' }).live, true);
+  assert.equal(keys.matchesHash(keys.newMasterKey().key, keys.hashSecret('nope')), false);
+});
+
+let pairCode = '';
+await check('主金鑰能產生配對碼，原字串只在產生時出現一次', async () => {
+  const r = await api('/api/tokens/pairings', { method: 'POST', body: { label: '小美的手機', scope: 'write', expiresInMinutes: 30 } });
+  assert.equal(r.status, 200, r.text);
+  pairCode = r.json.code;
+  assert.equal(r.json.pairing.label, '小美的手機');
+  assert.equal(r.json.pairing.scope, 'write');
+  assert.ok(r.json.display.includes('-'));
+  assert.ok(!JSON.stringify(r.json.pairing).includes(pairCode), '清單用的那列不能含原字串');
+  assert.ok(Date.parse(r.json.pairing.expiresAt) > Date.now() + 25 * 60_000);
+});
+
+await check('配對碼換憑證：不用 bearer，換出來的憑證能立刻用', async () => {
+  const r = await fetch(`${BASE}/api/pair`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code: pairCode.toLowerCase(), device: '小美 iPhone' }),
+  });
+  const text = await r.text();
+  assert.equal(r.status, 200, text);
+  const j = JSON.parse(text);
+  assert.ok(j.secret.startsWith('tlk_'), j.secret.slice(0, 4));
+  assert.equal(j.token.scope, 'write');
+  assert.ok(j.token.label.includes('小美的手機') && j.token.label.includes('小美 iPhone'), '清單上要看得出是哪台');
+  assert.ok(!JSON.stringify(j.token).includes(j.secret), '列內部只留 hint');
+  // 這把憑證真的能當 bearer 用
+  assert.equal((await api('/api/base', { key: j.secret })).status, 200);
+});
+
+await check('配對碼是一次性的：同一組再用得到 409', async () => {
+  const r = await fetch(`${BASE}/api/pair`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code: pairCode }),
+  });
+  assert.equal(r.status, 409);
+  assert.match((await r.json()).error, /一次性/);
+});
+
+await check('配對清單標出用過與沒用過，而且看不到任何原字串', async () => {
+  const rows = (await api('/api/tokens/pairings')).json.pairings;
+  const used = rows.find((p) => p.label === '小美的手機');
+  assert.ok(used.usedAt, '用掉要蓋時間');
+  assert.match(used.usedLabel, /小美 iPhone/);
+  assert.ok(!JSON.stringify(rows).includes(pairCode));
+  assert.ok(!JSON.stringify(rows).includes('code_hash'));
+});
+
+await check('亂碼：形狀不對 400，對但沒這組 404', async () => {
+  const bad = await fetch(`${BASE}/api/pair`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code: 'ABCD' }),
+  });
+  assert.equal(bad.status, 400);
+  const ghost = await fetch(`${BASE}/api/pair`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code: 'ZZZZZZZZ' }),
+  });
+  assert.equal(ghost.status, 404);
+});
+
+await check('作廢中的配對碼：產生→作廢→打過去 410', async () => {
+  const made = await api('/api/tokens/pairings', { method: 'POST', body: { label: '筆電' } });
+  const code = made.json.code;
+  const rev = await api('/api/tokens/pairings/revoke', { method: 'POST', body: { id: made.json.pairing.id } });
+  assert.equal(rev.status, 200, rev.text);
+  assert.equal(rev.json.changed, true);
+  const r = await fetch(`${BASE}/api/pair`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code }),
+  });
+  assert.equal(r.status, 410);
+  assert.match((await r.json()).error, /作廢/);
+});
+
+await check('過期的配對碼：410，訊息要教人重做一次', async () => {
+  const made = await api('/api/tokens/pairings', { method: 'POST', body: { label: '借來的平板', expiresInMinutes: 30 } });
+  // 過期只能靠時間，測試不等一分鐘：直接把那列的 expires_at 改到過去（同一顆 SQLite，WAL 容許第二個連線）
+  const { DatabaseSync } = await import('node:sqlite');
+  const raw = new DatabaseSync(path.join(dir, 'triplog.db'));
+  raw.prepare('UPDATE pairings SET expires_at = ? WHERE id = ?').run(new Date(Date.now() - 60_000).toISOString(), made.json.pairing.id);
+  raw.close();
+  const r = await fetch(`${BASE}/api/pair`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code: made.json.code }),
+  });
+  assert.equal(r.status, 410);
+  const j = await r.json();
+  assert.equal(j.reason, 'expired');
+  assert.match(j.error, /再產生一組/);
+});
+
+await check('配對與憑證管理只認主金鑰', async () => {
+  for (const p of ['/api/tokens/pairings', '/api/tokens/master']) {
+    assert.equal((await api(p, { key: READ })).status, 403, `${p} 不該讓只讀金鑰看`);
+    assert.equal((await api(p, { key: writeToken })).status, 403, `${p} 不該讓簽發出去的 token 看`);
+    assert.equal((await api(p, { key: null })).status, 401, `${p} 沒金鑰先 401`);
+  }
+  const mint = await api('/api/tokens/pairings', { method: 'POST', key: writeToken, body: { label: 'nope' } });
+  assert.equal(mint.status, 403, 'token 不能自己發配對碼');
+});
+
+await check('主金鑰狀態：尚未輪換時講得清清楚楚', async () => {
+  const r = await api('/api/tokens/master');
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.master.rotated, false);
+  assert.equal(r.json.master.bootstrapKeyActive, true);
+  assert.ok(r.json.master.hint.includes('…'), '只給 hint');
+  assert.equal(r.json.master.maxExpiryDays, 365);
+});
+
 console.log('\n— 歷史與重啟');
 await check('保留多份歷史快照', async () => {
   const r = await api('/api/history');
@@ -613,6 +770,92 @@ await check('清空基準（要標頭）', async () => {
   assert.equal(r.status, 200);
   assert.ok(r.json.removed >= 1);
   assert.equal((await api('/api/base')).status, 404);
+});
+
+console.log('\n— 主金鑰輪換（把 .env 那把關在門外）');
+// 基準檔剛被清掉，/api/base 是 404；這裡只問「金鑰過得去嗎」，所以打一個一定要金鑰、但回 200 的讀端點
+const probe = (key) => api('/api/trips?archived=1', key === undefined ? { key: null } : { key });
+let master2 = '';
+
+await check('沒確認不動鑰：confirm 缺失或寫錯都退回 400，舊鑰照樣能用', async () => {
+  const r = await api('/api/tokens/master/rotate', { method: 'POST', body: {} });
+  assert.equal(r.status, 400, r.text);
+  const wrong = await api('/api/tokens/master/rotate', { method: 'POST', body: { confirm: 'yes' } });
+  assert.equal(wrong.status, 400, 'confirm 要寫對字，不能隨便給一個 truthy');
+  assert.equal((await probe(KEY)).status, 200, '輪換沒成功，.env 那把必須還能用');
+});
+
+let rescue = '';
+let master1 = '';
+await check('輪換後舊主金鑰與只讀鑰立刻失效，但簽發過的憑證繼續能用', async () => {
+  const mint = await api('/api/tokens', { method: 'POST', body: { label: '救援用', scope: 'write', expiresInDays: 30 } });
+  assert.equal(mint.status, 200, mint.text);
+  rescue = mint.json.secret;
+  const r = await api('/api/tokens/master/rotate', { method: 'POST', body: { confirm: 'rotate-master' } });
+  assert.equal(r.status, 200, r.text);
+  assert.ok(r.json.master.liveTokens >= 1, '換鑰前要先數一數還有沒有活口');
+  assert.ok(r.json.secret.startsWith('tlm_'), r.json.secret.slice(0, 4));
+  assert.match(r.json.master.hint, /…/, '回應裡也要是 hint');
+  assert.equal(JSON.stringify(r.json).includes(rescue), false, '不該把別人的憑證一起帶出來');
+  master1 = r.json.secret;
+  assert.equal((await probe(KEY)).status, 401, '.env 的主金鑰要立刻擋掉');
+  assert.equal((await probe(READ)).status, 401, '只讀鑰也一起擋：輪換是整個重來');
+  assert.equal((await probe(rescue)).status, 200, 'app 簽出來的憑證不受輪換影響');
+  assert.equal((await probe(master1)).status, 200, '新主金鑰能用');
+  assert.equal((await api('/api/tokens', { key: master1 })).status, 200, '新主金鑰還是主金鑰');
+  const health = await fetch(`${BASE}/api/health`);
+  assert.equal((await health.json()).masterRotated, true, 'health 要讓人自查這一台換過沒有');
+  const st = await api('/api/tokens/master', { key: master1 });
+  assert.equal(st.json.master.rotated, true);
+  assert.equal(st.json.master.bootstrapKeyActive, false);
+  assert.equal(JSON.stringify(st.json).includes(master1), false, '狀態回應不能把金鑰帶出去');
+});
+
+await check('一把生效憑證都沒有時先擋自鎖；硬要換就送無備份確認', async () => {
+  const rows = (await api('/api/tokens', { key: master1 })).json.tokens;
+  for (const row of rows) {
+    if (!row.revokedAt && (!row.expiresAt || Date.parse(row.expiresAt) > Date.now())) {
+      const rev = await api('/api/tokens/revoke', { method: 'POST', key: master1, body: { id: row.id } });
+      assert.equal(rev.status, 200, rev.text);
+    }
+  }
+  const blocked = await api('/api/tokens/master/rotate', { method: 'POST', key: master1, body: { confirm: 'rotate-master' } });
+  assert.equal(blocked.status, 409, blocked.text);
+  assert.equal(blocked.json.liveTokens, 0);
+  assert.match(blocked.json.error, /沒有任何生效中的憑證/);
+  const again = await probe(master1);
+  assert.equal(again.status, 200, '被擋下來時鑰不能壞掉');
+  const forced = await api('/api/tokens/master/rotate', { method: 'POST', key: master1, body: { confirm: 'rotate-master-no-backup' } });
+  assert.equal(forced.status, 200, forced.text);
+  assert.equal(forced.json.master.liveTokens, 0);
+  assert.ok(forced.json.secret.startsWith('tlm_'));
+  assert.equal((await probe(master1)).status, 401, '上一把主金鑰也一起失效');
+  assert.equal((await probe(forced.json.secret)).status, 200);
+  master2 = forced.json.secret;
+});
+
+await check('重啟後輪換鎖還在（資料庫才是主金鑰的依據）', async () => {
+  child.kill();
+  await new Promise((r) => setTimeout(r, 400));
+  child = boot();
+  child.stdout.on('data', (d) => logs.push(String(d)));
+  await waitUp();
+  assert.equal((await probe(master2)).status, 200);
+  assert.equal((await probe(KEY)).status, 401, '重啟不能把 .env 那把找回來');
+});
+
+await check('SSH 救援：cli.js master-reset 讓 .env 那把重回門內', async () => {
+  const out = await runCli(['status']);
+  assert.match(out, /已輪換/, 'status 要看得出換過');
+  assert.equal(out.includes(master2), false, '指令列不能印出完整金鑰');
+  const reset = await runCli(['master-reset', '--yes']);
+  assert.match(reset, /已解掉輪換鎖/);
+  assert.equal((await probe(KEY)).status, 200, '解鎖後 .env 那把重新被接受');
+  assert.equal((await probe(master2)).status, 401, '輪換鑰就此失效');
+  assert.equal((await api('/api/tokens/master')).json.master.rotated, false);
+  assert.equal((await probe(READ)).status, 200, '只讀鑰也跟著回來');
+  const nothing = await runCli(['master-reset', '--yes'], 1);
+  assert.match(nothing, /沒有輪換鎖/, '沒鎖的時候要拒絕，不要假裝成功');
 });
 
 child.kill();

@@ -1,13 +1,19 @@
 /**
- * 「設定 → API token」用的客戶端。
+ * 「設定 → 金鑰與裝置」用的客戶端。
  *
  * 主金鑰（.env 裡的 TRIPLOG_API_KEY）等於整座資料庫的密碼，弄丟要動到伺服器與
  * 每台裝置。所以要把存取交給 agent 或一台新裝置時，用這裡簽發的 token：
  * 自帶層級（唯讀／可寫）與期限，能在 app 裡單獨撤銷，而且資料庫裡只存雜湊，
  * 備份外洩也拿不到能用的字串（代價是完整值只在簽發當下顯示一次）。
  *
- * 這組介面一律用主金鑰打 /api/tokens；拿簽發出去的 token 叫它是 403，
- * 那樣等於任何一把外流的 agent 憑證都能自己再發一把。
+ * 金鑰的整個生命週期都在這個畫面裡：
+ * - 簽發憑證（`createApiToken`）與套用到這台裝置（`saveSyncConfig`），裝置不必再放主金鑰
+ * - 產生一次性配對碼（`createPairingCode`），新裝置只打 8 個字就換到一把憑證（`pairWithCode`）
+ * - 輪換主金鑰（`rotateMasterKey`）：換完 `.env` 那把當場失效，只剩資料庫裡那把能用
+ *
+ * 這組介面一律用主金鑰打 `/api/tokens`；拿簽發出去的 token 叫它是 403，
+ * 那樣等於任何一把外流的 agent 憑證都能自己再發一把。唯一不需要金鑰的是 `/api/pair`，
+ * 它靠配對碼本身授權，而且有獨立限流。
  */
 import type { Key } from '../i18n';
 import type { SyncConfig } from './sync';
@@ -30,7 +36,39 @@ export type ApiTokenRow = {
 
 export type TokenState = 'active' | 'revoked' | 'expired';
 
-export type TokenErrorCode = 'auth' | 'offline' | 'network' | 'notfound' | 'tooMany' | 'server';
+/**
+ * 本機存的那把金鑰是不是「設定頁簽發出來的憑證」：前綴就夠了，客戶端拿不到雜湊，
+ * 也不需要——我們只想知道裝置上放的是主金鑰（整座庫的密碼）還是可以單獨撤銷的憑證。
+ */
+export function isIssuedToken(key: string): boolean {
+  return /^tlk_[A-Za-z0-9_-]{20,}$/.test(String(key ?? '').trim());
+}
+
+/** 一把憑證是不是「這台裝置正在用的那把」：比對的是顯示用的 hint，不是雜湊，所以只是標籤用途 */
+export function hintOf(key: string): string {
+  const s = String(key ?? '').trim();
+  if (!s.startsWith('tlk_')) return '';
+  return `tlk_${s.slice(4, 8)}…${s.slice(-4)}`;
+}
+
+export function isCurrentDevice(row: ApiTokenRow, key: string): boolean {
+  const hint = hintOf(key);
+  return hint !== '' && row.hint === hint;
+}
+
+export type TokenErrorCode =
+  | 'auth'
+  | 'offline'
+  | 'network'
+  | 'notfound'
+  | 'tooMany'
+  | 'server'
+  /** 配對碼：形狀不對或這組不存在 */
+  | 'badCode'
+  /** 配對碼：已被用掉（一次性） */
+  | 'used'
+  /** 配對碼：已被作廢或已過期 */
+  | 'dead';
 
 export class TokenError extends Error {
   code: TokenErrorCode;
@@ -91,6 +129,167 @@ export function revokeApiToken(cfg: SyncConfig, id: string): Promise<{ changed: 
   return request<{ changed: boolean }>(cfg, '/revoke', { id });
 }
 
+/* -------------------------------------------------------------- 配對碼 */
+
+export type PairingRow = {
+  id: string;
+  label: string;
+  scope: TokenScope;
+  createdAt: string;
+  expiresAt: string;
+  usedAt: string | null;
+  revokedAt: string | null;
+  usedLabel: string;
+};
+
+export type PairingState = 'waiting' | 'used' | 'revoked' | 'expired';
+
+/** 配對碼的字母表：拿掉 I/L/O/0/1，手打不會看錯，所以正規化時也只認這 31 個字 */
+export const PAIR_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+export const PAIR_CHARS = 8;
+
+/**
+ * 顯示用：每 4 個字加一條橫線。輸入端不必照格式打，`normalizePairCode` 會把橫線吃掉。
+ */
+export function formatPairCode(code: string): string {
+  const s = normalizePairCode(code) ?? String(code ?? '').trim();
+  return s.length > 4 ? `${s.slice(0, 4)}-${s.slice(4)}` : s;
+}
+
+/** 大寫、去空白與橫線；形狀不對回 null（讓介面能即時講「還差幾個字」） */
+export function normalizePairCode(input: unknown): string | null {
+  const raw = typeof input === 'string' ? input.toUpperCase().replace(/[\s-]/g, '') : '';
+  if (raw.length !== PAIR_CHARS) return null;
+  for (const ch of raw) if (!PAIR_ALPHABET.includes(ch)) return null;
+  return raw;
+}
+
+/** 還沒打完時也別立刻報錯：只判斷「目前這樣有沒有可能變成一組碼」 */
+export function pairCodeIsPlausible(input: unknown): boolean {
+  const raw = typeof input === 'string' ? input.toUpperCase().replace(/[\s-]/g, '') : '';
+  if (!raw.length || raw.length > PAIR_CHARS) return false;
+  for (const ch of raw) if (!PAIR_ALPHABET.includes(ch)) return false;
+  return true;
+}
+
+/**
+ * 輸入框旁邊那句即時提示用的：`left` 是還差幾個字、`bad` 是打到了不該出現的字、
+ * `ready` 才是真的可以送出去。三個都算在同一個正規化結果上，介面上才不會自相矛盾。
+ */
+export function pairCodeProgress(input: unknown): { left: number; bad: boolean; ready: boolean } {
+  const normalized = normalizePairCode(input);
+  if (normalized) return { left: 0, bad: false, ready: true };
+  const raw = typeof input === 'string' ? input.toUpperCase().replace(/[\s-]/g, '') : '';
+  const bad = [...raw].some((ch) => !PAIR_ALPHABET.includes(ch));
+  return { left: Math.max(0, PAIR_CHARS - raw.length), bad, ready: false };
+}
+
+export function pairingState(row: PairingRow, now = Date.now()): PairingState {
+  if (row.usedAt) return 'used';
+  if (row.revokedAt) return 'revoked';
+  if (Date.parse(row.expiresAt) <= now) return 'expired';
+  return 'waiting';
+}
+
+/** 清單上只有「還在等人來配對」的值得留著，其他都算歷史 */
+export function waitingPairings(rows: PairingRow[], now = Date.now()): PairingRow[] {
+  return rows.filter((r) => pairingState(r, now) === 'waiting');
+}
+
+export function createPairingCode(
+  cfg: SyncConfig,
+  input: { label: string; scope: TokenScope; expiresInMinutes?: number },
+): Promise<{ code: string; display: string; expiresInMinutes: number; row: PairingRow }> {
+  return request<{ code: string; display: string; expiresInMinutes: number; pairing: PairingRow }>(cfg, '/pairings', {
+    label: input.label,
+    scope: input.scope,
+    ...(input.expiresInMinutes ? { expiresInMinutes: input.expiresInMinutes } : {}),
+  }).then((r) => ({ code: r.code, display: r.display, expiresInMinutes: r.expiresInMinutes, row: r.pairing }));
+}
+
+export function listPairings(cfg: SyncConfig): Promise<PairingRow[]> {
+  return request<{ pairings: PairingRow[] }>(cfg, '/pairings').then((r) => r.pairings ?? []);
+}
+
+export function revokePairing(cfg: SyncConfig, id: string): Promise<{ changed: boolean }> {
+  return request<{ changed: boolean }>(cfg, '/pairings/revoke', { id });
+}
+
+/**
+ * 新裝置那一側：只打一組配對碼，換回一把普通憑證（之後的權限、撤銷都跟憑證一樣）。
+ * 這條路不需要 bearer，所以它自己組 URL，也不走 `request()`。
+ */
+export async function pairWithCode(
+  baseUrl: string,
+  code: string,
+  device = '',
+): Promise<{ secret: string; row: ApiTokenRow; expiresInDays: number }> {
+  const normalized = normalizePairCode(code);
+  if (!normalized) throw new TokenError('badCode');
+  const url = `${String(baseUrl ?? '').replace(/\/+$/, '')}/api/pair`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code: normalized, ...(device.trim() ? { device: device.trim() } : {}) }),
+    });
+  } catch (err) {
+    const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
+    throw new TokenError(offline ? 'offline' : 'network', (err as Error).message);
+  }
+  let json: Record<string, unknown> = {};
+  try {
+    json = (await res.json()) as Record<string, unknown>;
+  } catch {
+    /* 反代的純文字錯誤頁 */
+  }
+  const msg = typeof json.error === 'string' ? json.error : '';
+  if (res.status === 400) throw new TokenError('badCode', msg);
+  if (res.status === 404) throw new TokenError('badCode', msg);
+  if (res.status === 409) throw new TokenError('used', msg);
+  if (res.status === 410) throw new TokenError('dead', msg);
+  if (res.status === 429) throw new TokenError('tooMany', msg);
+  if (!res.ok) throw new TokenError('server', msg || `HTTP ${res.status}`);
+  const secret = String(json.secret ?? '');
+  if (!secret) throw new TokenError('server', 'HTTP 200 卻沒有憑證');
+  return { secret, row: json.token as ApiTokenRow, expiresInDays: Number(json.expiresInDays ?? 0) };
+}
+
+/* ---------------------------------------------------------- 主金鑰輪換 */
+
+export type MasterStatus = {
+  /** true＝資料庫裡那把才是主金鑰，`.env` 的已經不被接受 */
+  rotated: boolean;
+  hint: string;
+  setAt: string | null;
+  bootstrapKeyActive: boolean;
+  envReadKeyActive: boolean;
+  maxExpiryDays: number;
+};
+
+export function masterStatus(cfg: SyncConfig): Promise<MasterStatus> {
+  return request<{ master: MasterStatus }>(cfg, '/master').then((r) => r.master);
+}
+
+/** 完整值只在這一次回應裡出現，拿到就要立刻讓使用者複製走 */
+export function rotateMasterKey(
+  cfg: SyncConfig,
+  confirm: 'rotate-master' | 'rotate-master-no-backup',
+): Promise<{ secret: string; hint: string; setAt: string; liveTokens: number; warning: string }> {
+  return request<{ secret: string; master: { hint: string; setAt: string; liveTokens: number }; warning: string }>(
+    cfg,
+    '/master/rotate',
+    { confirm },
+  ).then((r) => ({
+    secret: r.secret,
+    hint: r.master.hint,
+    setAt: r.master.setAt,
+    liveTokens: r.master.liveTokens,
+    warning: r.warning,
+  }));
+}
+
 /** 清單上的狀態：作廢比過期優先講，那是擁有者主動做的事 */
 export function tokenState(row: ApiTokenRow, now = Date.now()): TokenState {
   if (row.revokedAt) return 'revoked';
@@ -109,15 +308,19 @@ const ERR_KEYS: Record<TokenErrorCode, Key> = {
   notfound: 'tokens.errNotFound',
   tooMany: 'share.errTooMany',
   server: 'share.errServer',
+  badCode: 'keys.errShape',
+  used: 'keys.errUsed',
+  dead: 'keys.errDead',
 };
 
-type Translate = (key: Key, vars?: Record<string, string | number | undefined | null>) => string;
+export type Translate = (key: Key, vars?: Record<string, string | number | undefined | null>) => string;
 
 /**
- * 這兩種情況一律講我們自己的話：後端的 401/403 訊息是狀態說明（「missing or wrong bearer
- * token」），繁體介面上出現它對使用者毫無幫助；本地文案直接點名「要換主金鑰」。
+ * 這幾種情況一律講我們自己的話：後端的 401/403 訊息是狀態說明（「missing or wrong bearer
+ * token」），繁中介面上出現它對使用者毫無幫助；本地文案直接點名「要換主金鑰」。
+ * 配對碼的三種失敗也一樣——英文介面不該看到後端的中文說明，反之亦然。
  */
-const LOCAL_FIRST: TokenErrorCode[] = ['auth', 'notfound'];
+const LOCAL_FIRST: TokenErrorCode[] = ['auth', 'notfound', 'badCode', 'used', 'dead'];
 
 /** 後端打得清楚時就用它的話（例如「expiresInDays 不能超過 365」），否則用我們的語系字串 */
 export function describeTokenError(err: unknown, t: Translate): string {

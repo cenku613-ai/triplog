@@ -10,6 +10,7 @@ import http from 'node:http';
 import { openStore, migrateJsonSnapshots, MAX_SNAPSHOT_BYTES } from './store.js';
 import {
   ShareError,
+  MAX_SHARE_DAYS,
   expiresAtFrom,
   partialOf,
   sanitizeExpense,
@@ -18,6 +19,19 @@ import {
   shareStatus,
 } from './share.js';
 import { TOKEN_SCOPES, hashToken, looksLikeApiToken, newApiToken, scopeAllows, tokenLabel, tokenStatus } from './tokens.js';
+import {
+  DEFAULT_PAIR_MINUTES,
+  MAX_PAIR_MINUTES,
+  PAIR_CHARS,
+  hashSecret,
+  masterHint,
+  matchesHash,
+  newMasterKey,
+  newPairingCode,
+  normalizeCode,
+  pairExpiresAt,
+  pairingStatus,
+} from './keys.js';
 import { send, fail, tokenEquals, bearer, readJsonBody, rateLimiter, clientIp, applyCors } from './net.js';
 
 const VERSION = '0.1.0';
@@ -55,6 +69,8 @@ const limitWrite = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_WRITE ?? 6
 // 分享連結是「沒有金鑰也進得來」的路徑，所以另外計數：一把 token 加一個 IP 一個 key
 const limitShareRead = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_SHARE_READ ?? 240), windowMs: 60_000 });
 const limitShareWrite = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_SHARE_WRITE ?? 30), windowMs: 60_000 });
+// 配對碼是 8 個字（約 40 位熵）的一次性憑證，要靠限流撐住猜的攻擊：一台一分鐘 8 次
+const limitPair = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_PAIR ?? 8), windowMs: 60_000 });
 
 /* -------------------------------------------------------------- 資料視圖 */
 
@@ -177,6 +193,8 @@ const SCHEMA_HINT = {
     'Amounts stay in the original currency; baseAmount is what statistics use.',
     'Sharing: POST /api/shares {tripId,expiresInDays} (needs the key) mints a trip-scoped token; GET /api/share/<token> reads that trip only and POST /api/share/<token>/expense|item appends to it without any key. POST /api/shares/revoke {token} kills a link; it revokes a grant, not data.',
     'API tokens: POST /api/tokens {label,scope:read|write,expiresInDays} mints a revocable bearer (shown once, stored hashed); GET /api/tokens lists them and POST /api/tokens/revoke {id} retires one. Minting, listing, revoking and POST /api/admin/clear all require the master TRIPLOG_API_KEY — an issued token can never mint or wipe.',
+    'Pairing (no long key on the new device): POST /api/tokens/pairings {label,scope,expiresInMinutes<=120} (master only) returns an 8-char code shown once; the new device posts it to POST /api/pair {code,device} without any bearer and receives a fresh token (365 days). Codes are single-use, expire, and can be voided with POST /api/tokens/pairings/revoke {id}; GET /api/tokens/pairings lists them.',
+    'Master key lifecycle: GET /api/tokens/master reports whether the key was rotated (once rotated, the .env TRIPLOG_API_KEY and TRIPLOG_READ_KEY stop being accepted). POST /api/tokens/master/rotate {confirm:"rotate-master"} returns the new key once; it refuses unless at least one live token exists (or confirm:"rotate-master-no-backup") so you cannot lock yourself out. Rolling back needs SSH: node server/src/cli.js master-reset.',
   ],
 };
 
@@ -196,7 +214,8 @@ async function route(req, res) {
 
   if (resource === 'health') {
     const s = store.stats();
-    return send(res, 200, { ok: true, version: VERSION, hasData: !!s.head, ...s });
+    // masterRotated 只是個布林：讓部署完的自查能看出「現在吃的是資料庫裡那把，不是 .env」
+    return send(res, 200, { ok: true, version: VERSION, hasData: !!s.head, masterRotated: !!store.masterHash(), ...s });
   }
   if (resource === 'schema') {
     return send(res, 200, { ok: true, version: VERSION, schema: SCHEMA_HINT });
@@ -206,11 +225,23 @@ async function route(req, res) {
   if (resource === 'share' && parts[2]) {
     return handleShare(req, res, parts[2], parts[3]);
   }
+  // 配對碼同理：那 8 個字就是授權，換回來的是憑證，所以也走在 bearer 之前
+  if (resource === 'pair') {
+    return handlePair(req, res, clientIp(req));
+  }
 
   const key = bearer(req);
-  const isMaster = tokenEquals(key, WRITE_KEY);
-  const isMasterReadable = isMaster || tokenEquals(key, READ_KEY);
-  /** 從 app「設定 → API token」簽發出來的那種：自帶層級與期限，能單獨作廢 */
+  /**
+   * 主金鑰的定義權在資料庫：輪換過一次，就以存進去的雜湊為準，`.env` 那把（連同只讀鑰）
+   * 當場失效。這樣「換鑰」才真的能把外流的舊鑰擋在門外；要退回 .env 只能從 SSH
+   * （`node server/src/cli.js master-reset`），刻意不給 HTTP 路徑——否則拿到舊鑰的人
+   * 也能把輪換取消。
+   */
+  const storedMaster = store.masterHash();
+  const isMaster = storedMaster ? matchesHash(key, storedMaster) : tokenEquals(key, WRITE_KEY);
+  const isBootstrapReadable = !storedMaster && tokenEquals(key, READ_KEY);
+  const isMasterReadable = isMaster || isBootstrapReadable;
+  /** 從 app「設定 → 金鑰與裝置」簽發出來的那種：自帶層級與期限，能單獨作廢 */
   let issued = null;
   if (!isMasterReadable && looksLikeApiToken(key)) {
     const row = store.apiTokenByHash(hashToken(key));
@@ -219,7 +250,10 @@ async function route(req, res) {
   const canRead = isMasterReadable || issued !== null;
   const canWrite = isMaster || (issued !== null && scopeAllows(issued.scope, 'write'));
   if (!canRead) {
-    return fail(res, 401, 'missing or wrong bearer token', { need: 'TRIPLOG_READ_KEY or TRIPLOG_API_KEY' });
+    return fail(res, 401, 'missing or wrong bearer token', {
+      need: 'TRIPLOG_API_KEY（主金鑰）、TRIPLOG_READ_KEY（只讀）或一把 tlk_ 開頭的憑證',
+      rotated: !!storedMaster,
+    });
   }
 
   const ip = clientIp(req);
@@ -301,6 +335,31 @@ async function route(req, res) {
     if (resource === 'shares') {
       const tripId = url.searchParams.get('tripId');
       return send(res, 200, { ok: true, shares: store.listShares(tripId || null) });
+    }
+    if (resource === 'tokens' && parts[2] === 'pairings') {
+      // 配對碼清單等于「誰還能換到憑證」的名單，同樣只給主金鑰看
+      if (!isMaster) return fail(res, 403, '只有主金鑰看得到配對碼清單', {});
+      return send(res, 200, { ok: true, pairings: store.listPairings() });
+    }
+    if (resource === 'tokens' && parts[2] === 'master') {
+      if (!isMaster) return fail(res, 403, '只有主金鑰看得到主金鑰狀態', {});
+      const info = store.masterInfo();
+      return send(
+        res,
+        200,
+        {
+          ok: true,
+          master: {
+            // rotated:false 代表現在吃的還是 .env 裡那把（尚未輪換）
+            rotated: !!info,
+            hint: info?.hint ?? masterHint(WRITE_KEY),
+            setAt: info?.setAt ?? null,
+            bootstrapKeyActive: !info,
+            envReadKeyActive: !info && !!READ_KEY && READ_KEY !== WRITE_KEY,
+            maxExpiryDays: MAX_SHARE_DAYS,
+          },
+        },
+      );
     }
     if (resource === 'tokens') {
       // 清單本身就是「誰還能進來」的名單，簽發出去的 token 不能看到它
@@ -385,6 +444,62 @@ async function route(req, res) {
     return send(res, 200, { ok: true, revoked: true, changed, token: row });
   }
 
+  /* ---------------------------------------- 配對碼（讓新裝置免貼長金鑰） */
+
+  if (resource === 'tokens' && parts[2] === 'pairings' && !parts[3]) {
+    if (!isMaster) return fail(res, 403, '產生配對碼要用主金鑰（TRIPLOG_API_KEY）', {});
+    const scope = TOKEN_SCOPES.includes(body?.scope) ? body.scope : 'write';
+    let expiresAt = null;
+    try {
+      expiresAt = pairExpiresAt(body?.expiresInMinutes ?? DEFAULT_PAIR_MINUTES);
+    } catch (err) {
+      return fail(res, err.status ?? 400, String(err.message ?? err), {});
+    }
+    const minted = newPairingCode();
+    const pairing = store.createPairing({
+      id: minted.id,
+      hash: minted.hash,
+      label: tokenLabel(body?.label, '新裝置'),
+      scope,
+      expiresAt,
+    });
+    // 原字串只在這一次回應出現；之後清單上只有狀態與用沒用掉
+    return send(res, 200, { ok: true, pairing, code: minted.code, display: minted.display, expiresInMinutes: Math.min(Math.trunc(Number(body?.expiresInMinutes ?? DEFAULT_PAIR_MINUTES)), MAX_PAIR_MINUTES) });
+  }
+
+  if (resource === 'tokens' && parts[2] === 'pairings' && parts[3] === 'revoke') {
+    if (!isMaster) return fail(res, 403, '作廢配對碼要用主金鑰（TRIPLOG_API_KEY）', {});
+    const id = String(body?.id ?? '');
+    const changed = store.revokePairing(id);
+    const row = store.pairing(id);
+    if (!row) return fail(res, 404, '找不到這組配對碼', {});
+    return send(res, 200, { ok: true, revoked: true, changed, pairing: row });
+  }
+
+  /* ------------------------------------------------ 輪換主金鑰（不可逆） */
+
+  if (resource === 'tokens' && parts[2] === 'master' && parts[3] === 'rotate') {
+    if (!isMaster) return fail(res, 403, '輪換主金鑰要用現在的主金鑰', {});
+    const ok = body?.confirm === 'rotate-master' || body?.confirm === 'rotate-master-no-backup';
+    if (!ok) {
+      return fail(res, 400, '要把話講明：重送一次並帶 confirm:"rotate-master"', {});
+    }
+    // 防自鎖：一把生效中的憑證都沒有就換鑰，換完連自己也進不來（只能 SSH 救）
+    const liveTokens = store.listApiTokens().filter((r) => tokenStatus(r).live).length;
+    if (!liveTokens && body?.confirm !== 'rotate-master-no-backup') {
+      return fail(res, 409, '目前沒有任何生效中的憑證：先幫一台裝置簽一把並套用，再輪換；確定要直接換就送 confirm:"rotate-master-no-backup"', { liveTokens: 0 });
+    }
+    const minted = newMasterKey();
+    store.setMasterHash(minted.hash, minted.hint);
+    // 舊鑰（含 .env 那把與只讀鑰）從這一刻起不再被接受，所以只剩這一次機會
+    return send(res, 200, {
+      ok: true,
+      master: { rotated: true, hint: minted.hint, setAt: new Date().toISOString(), liveTokens },
+      secret: minted.key,
+      warning: '舊的主金鑰與只讀金鑰已失效；還在用舊鑰的裝置要重新配對或貼上新主金鑰',
+    });
+  }
+
   /* ------------------------------------------------ 分享連結管理（要金鑰） */
 
   if (resource === 'shares' && !parts[2]) {
@@ -422,6 +537,54 @@ async function route(req, res) {
   }
 
   return fail(res, 404, 'not found', {});
+}
+
+/**
+ * 配對：新裝置在設定裡打 8 個字的配對碼，換回一把帶層級與期限的憑證。
+ *
+ * 這條路徑不需要 bearer（碼本身就是授權），所以要有自己的限流（每台 IP 一分鐘 8 次）。
+ * 碼只存雜湊、一次性（`consumePairing` 用 UPDATE ... WHERE used_at IS NULL 搶先贏，
+ * 兩台同時用同一組只會有一台拿到憑證），而且過期就作廢——留著不用也是攻擊面。
+ */
+async function handlePair(req, res, ip) {
+  if (req.method !== 'POST') return fail(res, 405, 'method not allowed', {});
+  if (!limitPair(ip)) return fail(res, 429, '配對嘗試太多，請一分鐘後再試', { retryAfterMs: 60_000 });
+  let body = null;
+  try {
+    body = await readJsonBody(req, MAX_SHARE_BODY);
+  } catch (err) {
+    return fail(res, err.status ?? 400, err.message, {});
+  }
+  const code = normalizeCode(body?.code);
+  if (!code) return fail(res, 400, `配對碼是 ${PAIR_CHARS} 個字（字母與數字，橫線打不打都可以）`, {});
+  const row = store.pairingByHash(hashSecret(code));
+  const st = pairingStatus(row);
+  if (!row) return fail(res, 404, '這組配對碼不存在（或已被用掉）', {});
+  if (!st.live) {
+    const msg =
+      st.reason === 'used'
+        ? '這組配對碼已經用過了——它是一次性的，請在原來的裝置上再產生一組'
+        : st.reason === 'revoked'
+          ? '這組配對碼已被作廢'
+          : '這組配對碼已過期，請在原來的裝置上再產生一組';
+    return fail(res, st.reason === 'used' ? 409 : 410, msg, { reason: st.reason });
+  }
+  const device = tokenLabel(body?.device, '', 40);
+  if (!store.consumePairing(row.id, device)) {
+    return fail(res, 409, '這組配對碼剛剛已被用掉', { reason: 'used' });
+  }
+  const minted = newApiToken();
+  const label = tokenLabel(device ? `${row.label} · ${device}` : row.label, '配對裝置');
+  const token = store.createApiToken({
+    id: minted.id,
+    hash: minted.hash,
+    hint: minted.hint,
+    label,
+    scope: row.scope,
+    expiresAt: expiresAtFrom(MAX_SHARE_DAYS) ?? null,
+  });
+  // 這台裝置拿到的是普通憑證：之後在擁有者的清單裡看得到、能單獨撤銷
+  return send(res, 200, { ok: true, secret: minted.token, token, scope: row.scope, expiresInDays: MAX_SHARE_DAYS });
 }
 
 /**

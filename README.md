@@ -14,8 +14,8 @@
 - **支出記錄**：一鍵記支出、可關聯到某個行程項、多幣別手動匯率、付款人與備註
 - **統計**：預算進度、每日長條圖、分類占比環形圖、原始幣別合計、金額最大的幾筆
 - **列印／PDF**：把一趟旅行輸出成 A4 列印頁——封面、每日時間軸、支出明細與圖表、照片牆、含路線點的地圖截圖，各區可單獨開關；先在 app 內預覽，再按文件上的「列印／儲存 PDF」由瀏覽器另存，不裝任何套件
-- **跨裝置同步**（選裝）：自架的零依賴 API 當基準檔，手機記的錢筆電看得到；採「兩端各自推送、伺服器合併」，同一筆以 `updatedAt` 較新者勝，沒有帳號系統，只靠金鑰
-- **AI agent 寫入**（選裝）：透過 MCP 讓 agent 讀行程、記支出、建旅行；14 個工具、可切唯讀，並且刻意**沒有刪除**能力。要交給 agent 的金鑰可以在 app 裡簽發（見「選裝：開啟同步與 AI agent API」末段），不必把主金鑰交出去
+- **跨裝置同步**（選裝）：自架的零依賴 API 當基準檔，手機記的錢筆電看得到；採「兩端各自推送、伺服器合併」，同一筆以 `updatedAt` 較新者勝，沒有帳號系統，只靠金鑰——但新裝置不必抄長金鑰：在已同步好的裝置上產生一組 8 個字的一次性配對碼，這邊打進去就換到屬於自己的憑證
+- **AI agent 寫入**（選裝）：透過 MCP 讓 agent 讀行程、記支出、建旅行；14 個工具、可切唯讀，並且刻意**沒有刪除**能力。要交給 agent 的金鑰可以在 app 裡簽發，還能從 app 輪換主金鑰、用 8 個字的配對碼讓新裝置免貼長金鑰（見「選裝：開啟同步與 AI agent API」末段），不必把主金鑰交出去
 - **分享給同行者**（選裝）：每一趟旅行可產生一條只需要連結、不需要金鑰的分享網址。拿到網址的人看得到這一趟的行程與支出（**看不到照片，也看不到別的旅行**），也能幫你補一筆支出或加一個行程；寫進去的內容落在伺服器的基準檔，你下次同步就收得到，之後照樣能改能刪。連結可設效期（預設 90 天，最長 1 年，或不設限），隨時能作廢，作廢只收連結、不動已記錄的資料
 - **備份**：全量 JSON 匯出／匯入（合併或覆寫），照片以 base64 一起帶走，還原後 Blob 完整讀回
 - **PWA**：可安裝、完全離線可用、深色／淺色／跟隨系統主題、手機底部導覽列與桌面側欄自動切換；看過的地圖瓦片快取 30 天，離線仍能看底圖
@@ -25,10 +25,10 @@
 ```bash
 npm install
 npm run dev         # 開發伺服器，http://localhost:5173
-npm test            # 85 個單元測試（日期、金額換算、統計、備份與還原、合併規則、照片往來、座標與地圖邊界、雙語字典與分類標籤、PDF 文件、分享連結、API token）
+npm test            # 101 個單元測試（日期、金額換算、統計、備份與還原、合併規則、照片往來、座標與地圖邊界、雙語字典與分類標籤、PDF 文件、分享連結、API token 與配對碼）
 npm run typecheck   # TypeScript 檢查
 npm run check:zh    # 繁中介面的字級檢查（抓簡體字，可 --fix）
-npm run server:test # 後端 API 冒煙測試（49 項，真的起一個 SQLite）
+npm run server:test # 後端 API 冒煙測試（75 項，真的起一個 SQLite）
 npm run mcp:test    # 打包 MCP 並用 JSON-RPC 打進去（21 項）
 npm run verify      # check:zh + typecheck + 單元測試 + 後端冒煙 + MCP 冒煙
 npm run icons       # 產生 PWA 圖示（純 Node，無外部依賴）
@@ -82,7 +82,8 @@ npm run preview     # 以本地靜態伺服器預覽 dist/，PWA 與離線行為
 | `deploy/Caddyfile` | 有網域時自動簽發並續期 Let's Encrypt 憑證 |
 | `deploy/Caddyfile.selfsigned`、`deploy/make-selfsigned.sh` | 只有裸 IP 時的自簽 HTTPS |
 | `deploy/compose.duckdns.yml` | 用 DuckDNS 免費子域名取得正式憑證 |
-| `server/`、`server/Dockerfile` | 選裝的同步／agent API：零依賴（`node:http` ＋內建 `node:sqlite`），映像只 COPY 三個檔 |
+| `server/`、`server/Dockerfile` | 選裝的同步／agent API：零依賴（`node:http` ＋內建 `node:sqlite`），映像只放 `server/src` 與共用的 `merge-core.js` |
+| `server/src/keys.js`、`server/src/cli.js` | 配對碼與主金鑰輪換的純邏輯（形狀／雜湊／生死），以及 SSH 用的救援指令（`status`／`master-reset`／`master-set`） |
 | `deploy/compose.api.yml`、`deploy/Caddyfile.api` | 選裝 API 的 compose 覆寫與反代：容器不綁 port，公網仍只有 443 |
 | `mcp/` | 選裝的 MCP server，讓 AI agent 打上面的 API（見 `mcp/README.md`） |
 | `deploy/deploy.sh` | 一鍵推送＋建置＋啟動；`.env` 有金鑰時自動多掛 API |
@@ -167,7 +168,7 @@ SSH_TARGET=opc@<你的IP> bash deploy/deploy.sh
 
 公網入口仍然只有 443：API 容器用 `expose` 只在 Docker 網路內可見，沒有綁任何 host port，防火牆不需要動靜。金鑰只放 `.env` 與 MCP 客戶端設定，不會透過指令列送到遠端（那樣會被同機其他使用者用 `ps` 看到）。
 
-裝置端打開 app：**設定 → 跨裝置同步**，貼入位址（`https://你的名字.duckdns.org`）與金鑰，按「測試連線」確認讀得到基準檔，再按「立即同步」。之後可以打開自動開關，之後每次啟動 app 且線上時會自己拉一次同步並顯示結果。同一個卡片會列出伺服器上的旅行，可以只拉某一趟。
+裝置端打開 app：**設定 → 跨裝置同步**，有兩條路——「用配對碼連線」（在已同步好的那台裝置的「金鑰與裝置」裡產生一組 8 個字的碼，這邊打進去就換到屬於這台裝置的憑證，長金鑰不必經手），或照原本「貼金鑰連線」貼入位址（`https://你的名字.duckdns.org`）與金鑰。選前者時按「配對」就會自己拉一次基準檔；選後者請按「測試連線」確認讀得到基準檔，再按「立即同步」。之後可以打開自動開關，之後每次啟動 app 且線上時會自己拉一次同步並顯示結果。同一個卡片會列出伺服器上的旅行，可以只拉某一趟。
 
 Agent 端（MCP）請看 [`mcp/README.md`](mcp/README.md)：打包 `npm run mcp:build`，把 `mcp/bin.mjs` 掛進 MCP 客戶端並給 `TRIPLOG_URL` ＋金鑰，就有 14 個讀寫工具；`TRIPLOG_ALLOW_WRITE=0` 是唯讀模式。
 
@@ -180,18 +181,37 @@ grep TRIPLOG_READ_KEY .env    # 只讀金鑰：只想看的 agent
 
 想換一把就改 `.env`、重跑 `bash deploy/deploy.sh`（容器重啟後舊金鑰立刻失效），然後在每台裝置的「設定 → 跨裝置同步」貼上新金鑰、MCP 設定也要一起改。注意這幾把東西的差別：主金鑰一洩是整座資料庫能被讀寫，只能靠換鑰補救；在 app 裡簽發的 token 能設唯讀或可寫、能設效期、能單獨撤銷；分享連結的 token 只綁一趟、只能新增，而且能在 app 裡單獨作廢。
 
-**不想交出主金鑰：在 app 裡簽發 token**。`.env` 那把 `TRIPLOG_API_KEY` 等於整座資料庫的密碼，要給 AI agent 或再添一台裝置時，不必把它貼過去——裝置端打開 **設定 → API token**（要先在上方「跨裝置同步」填好位址與主金鑰，這張卡才動得了），選「唯讀／可讀可寫」與效期（30／90／1 年／不設限期），按「產生 token」。完整值（`tlk_…`）**只在那一刻顯示一次**，複製走之後資料庫裡只剩雜湊，忘了只能重發一把。同一張卡列出每把的名稱、狀態（生效中／已過期／已撤銷）、讀過幾次、寫進幾筆、最後使用的時間，並能單獨「撤銷」它——主金鑰與別把 token 都不受影響，已記錄的資料也不會動。
+**不想交出主金鑰：設定 → 金鑰與裝置**。`.env` 那把 `TRIPLOG_API_KEY` 等於整座資料庫的密碼，要給 AI agent、再添一台裝置、或把它換掉，都在這一張卡處理，不必再手動抄長金鑰（前提：上方「跨裝置同步」已填好位址與主金鑰，這張卡才動得了）：
 
-簽發出來的 token 直接填進 MCP 客戶端就能用（可寫的填 `TRIPLOG_API_KEY`，唯讀的另加 `TRIPLOG_ALLOW_WRITE=0`）；拿它打 `/api/sync` 寫資料，如果簽發時選的是唯讀，會得到 403。
+- **簽發憑證**（`tlk_…`）：選「唯讀／可讀可寫」與效期（30／90／1 年／不設限期），按「產生 token」。完整值**只在那一刻顯示一次**，複製走之後資料庫裡只剩雜湊，忘了只能重發一把。按「讓這台裝置改用這把」就把它寫進本機同步設定——這台裝置之後拿的是能單獨撤銷的憑證，不再留主金鑰。清單列出每把的名稱、狀態（生效中／已過期／已撤銷）、讀過幾次、寫進幾筆、最後使用的時間，能單獨撤銷，也能「撤銷其他所有」（自己這把留著，不會把自己關在門外）。
+- **產生配對碼**（8 個字，例：`KQ7T-M3XZ`）：新裝置打開「設定 → 跨裝置同步 → 用配對碼連線」，打這 8 個字（橫線打不打、大小寫都可）就換到一把屬於它的憑證，全程不經手任何長金鑰。配對碼**只用得了一次**，預設 10 分鐘有效（可選 30 分鐘／2 小時），用沒用都列在卡上，隨時能單獨作廢；已配好的裝置不受影響。
+- **輪換主金鑰**：`.env` 那把外流時唯一真正的補救。按下去之後資料庫裡只存新鑰的雜湊，舊主金鑰與 `.env` 的只讀鑰**當場不再被接受**，app 簽發過的憑證則全部繼續可用（所以輪換前務必先幫至少一台裝置簽一把並套用，卡才會讓你按）。新值 `tlm_…` 也只顯示一次。
 
-邊界都在 `server/src/tokens.js` 與 `server/src/index.js`：
+簽發出來的憑證直接填進 MCP 客戶端就能用（可寫的填 `TRIPLOG_API_KEY`，唯讀的另加 `TRIPLOG_ALLOW_WRITE=0`）；拿它打 `/api/sync` 寫資料，如果簽發時選的是唯讀，會得到 403。
 
-- 只有**主金鑰**能叫 `/api/tokens`（簽發、列清單、撤銷）與 `/api/admin/clear`。拿簽發出去的 token 叫它再發一把會是 403，否則任何一把外流的 agent 憑證都能自己擴權或把整個庫清掉
-- 資料庫存的是 `sha256(token)`，不是原文；`hint` 只留頭尾幾字讓人認得出，反推不回去
+邊界都在 `server/src/tokens.js`、`server/src/keys.js` 與 `server/src/index.js`：
+
+- 只有**主金鑰**能叫 `/api/tokens`（簽發、列清單、撤銷）、`/api/tokens/pairings`（發配對碼）與 `/api/tokens/master`（狀態與輪換），以及 `/api/admin/clear`。拿簽發出去的 token 叫它再發一把會是 403，否則任何一把外流的 agent 憑證都能自己擴權或把整個庫清掉
+- 資料庫存的都是 `sha256(...)`（憑證、配對碼、輪換後的主金鑰都一樣），不是原文；`hint` 只留頭尾幾字讓人認得出，反推不回去
 - 層級只有兩檔：`read` 與 `write`，`write` 包含 `read`。沒有「只能動某一趟」這種細度——那由分享連結負責
 - 撤銷與過期都是即時生效（`revokedAt` 比 `expiresAt` 優先判斷）；使用統計只在真的通過限流後才累加，被擋掉的洪水不進清單，寫入另記 `writes`
 - 完整值只顯示一次、庫裡只有雜湊：代價是忘記就只能重發，好處是備份檔外洩也帶不走能用的憑證
 - 期限最長 365 天（與分享連結同一條上限），要更久就重新簽一把
+- `/api/pair` 是唯一不需要 bearer 的寫入路徑（跟分享連結一樣），獨立限流 `TRIPLOG_RATE_PAIR`（預設每 IP 每分鐘 8 次）；领取用「先抢先改 `used_at`」的方式，同一組碼同時打兩次只會成功一次，重複用得到 409、過期或被作廢得到 410
+- 換好的裝置拿的是普通憑證，清單上標成「配對裝置 · 裝置名」，因此輪換主金鑰不會把已配好的裝置一起擋在門外
+
+**萬一新鑰沒抄到**：只能從機器本身走 HTTP 之外的路（拿到 HTTP 端點就等于拿到發照權）。SSH 上伺服器後：
+
+```bash
+docker compose -f docker-compose.yml -f deploy/compose.api.yml exec triplog-api \
+  node server/src/cli.js status                 # 只印 hint 與數量，不會印出完整金鑰
+# 解掉輪換鎖，讓 .env 裡那把重新被接受：
+docker compose -f docker-compose.yml -f deploy/compose.api.yml exec triplog-api \
+  node server/src/cli.js master-reset --yes
+# 或自己指定一把（用 "-" 從標準輸入讀，才不會留在 shell 歷史裡）：
+docker compose -f docker-compose.yml -f deploy/compose.api.yml exec triplog-api \
+  node server/src/cli.js master-set - --yes
+```
 
 **分享給同行者**用的就是同一台伺服器，所以開了 API 就自動有這個功能，不必另設定。app 裡打開一趟旅行，按「🔗 分享」→「產生連結」，把網址（`https://你的名字.duckdns.org/#/share/<token>`）傳給同行的人；他開頁就能看，按「＋ 記一筆支出」或「＋ 加一個行程」就直接寫進伺服器的基準檔（不需要金鑰、也沒有帳號）。同一個對話框列出還在效期內的連結與「開過幾次／補了幾筆」，隨時能作廢。這一趟還沒同步過時，按「產生連結」會先自動同步一次再產生。
 

@@ -124,6 +124,23 @@ function tokenView(r) {
   };
 }
 
+/**
+ * pairings 的對外視圖：同樣不回傳 code_hash。原字串只在產生的那次回應裡出現，
+ * 之後清單上只剩「誰要的、能幹嘛、幾點失效、有沒有被用掉」。
+ */
+function pairingView(r) {
+  return {
+    id: r.id,
+    label: r.label ?? '',
+    scope: r.scope === 'read' ? 'read' : 'write',
+    createdAt: r.created_at,
+    expiresAt: r.expires_at ?? null,
+    usedAt: r.used_at ?? null,
+    revokedAt: r.revoked_at ?? null,
+    usedLabel: r.used_label ?? '',
+  };
+}
+
 function jsonBytes(obj) {
   return Buffer.byteLength(JSON.stringify(obj), 'utf8');
 }
@@ -215,6 +232,25 @@ export class Store {
         last_seen_at TEXT
       );
       CREATE INDEX IF NOT EXISTS api_tokens_hash ON api_tokens(token_hash);
+      /* 配對碼：新裝置打這 8 個字就換到一把憑證，長金鑰不必經過任何人的手。
+         跟 api_tokens 一樣只存雜湊，而且一次性（used_at 一填就作廢）。 */
+      CREATE TABLE IF NOT EXISTS pairings (
+        id TEXT PRIMARY KEY,
+        code_hash TEXT NOT NULL UNIQUE,
+        label TEXT NOT NULL DEFAULT '',
+        scope TEXT NOT NULL DEFAULT 'write',
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        revoked_at TEXT,
+        used_label TEXT
+      );
+      /* 輪換過的主金鑰只存雜湊與 hint：存進去之後 .env 那把就不再接受，
+         輪換才真的能把外流的舊鑰擋在門外。要回退只能從 SSH（server/src/cli.js）。 */
+      CREATE TABLE IF NOT EXISTS server_keys (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
     `);
     // 舊資料庫補上內容指紋欄位；SQLite 沒有 ADD COLUMN IF NOT EXISTS，重複執行就當它已經有了
     try {
@@ -256,11 +292,84 @@ export class Store {
     this._tokHit = this.db.prepare(
       'UPDATE api_tokens SET hits = hits + @read, writes = writes + @write, last_seen_at = @at WHERE id = @id',
     );
+    this._pairInsert = this.db.prepare(
+      'INSERT INTO pairings (id, code_hash, label, scope, created_at, expires_at) VALUES (@id, @hash, @label, @scope, @createdAt, @expiresAt)',
+    );
+    this._pairByHash = this.db.prepare('SELECT * FROM pairings WHERE code_hash = ?');
+    this._pairById = this.db.prepare('SELECT * FROM pairings WHERE id = ?');
+    this._pairList = this.db.prepare('SELECT * FROM pairings ORDER BY created_at DESC LIMIT 100');
+    this._pairUse = this.db.prepare('UPDATE pairings SET used_at = ?, used_label = ? WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL');
+    this._pairRevoke = this.db.prepare('UPDATE pairings SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL AND used_at IS NULL');
+    this._keyGet = this.db.prepare('SELECT value FROM server_keys WHERE key = ?');
+    this._keySet = this.db.prepare('INSERT INTO server_keys (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
+    this._keyDel = this.db.prepare('DELETE FROM server_keys WHERE key = ?');
+  }
+
+  /* ------------------------------------------------------ 輪換過的主金鑰 */
+
+  /** @returns {string | null} 存過就回 sha256（hex），沒輪換過回 null（這時以 .env 為準） */
+  masterHash() {
+    const row = this._keyGet.get('master_hash');
+    return row ? String(row.value) : null;
+  }
+
+  /** 一次寫入雜湊與顯示用的 hint，兩邊同生同滅才不會出現「有 hint 卻查不到雜湊」 */
+  setMasterHash(hash, hint) {
+    this._keySet.run('master_hash', String(hash));
+    this._keySet.run('master_hint', String(hint ?? ''));
+    this._keySet.run('master_set_at', new Date().toISOString());
+  }
+
+  /** 只給 SSH 救援用（cli.js）：刪掉之後 .env 那把重新被接受 */
+  clearMasterHash() {
+    this._keyDel.run('master_hash');
+    this._keyDel.run('master_hint');
+    this._keyDel.run('master_set_at');
+  }
+
+  masterInfo() {
+    const hash = this._keyGet.get('master_hash');
+    if (!hash) return null;
+    const hint = this._keyGet.get('master_hint');
+    const at = this._keyGet.get('master_set_at');
+    return { rotated: true, hint: hint ? String(hint.value) : '', setAt: at ? String(at.value) : null };
+  }
+
+  /* ------------------------------------------------------------ 配對碼 */
+
+  createPairing({ id, hash, label, scope, expiresAt }) {
+    const createdAt = new Date().toISOString();
+    this._pairInsert.run({ id, hash, label, scope, createdAt, expiresAt });
+    return pairingView(this._pairById.get(id));
+  }
+
+  /** 只給路由層判斷「這組碼存不存在」；比對雜湊本身在呼叫端做（要常數時間） */
+  pairingByHash(hash) {
+    const row = this._pairByHash.get(String(hash ?? ''));
+    return row ? pairingView(row) : undefined;
+  }
+
+  pairing(id) {
+    const row = this._pairById.get(String(id ?? ''));
+    return row ? pairingView(row) : undefined;
+  }
+
+  listPairings() {
+    return this._pairList.all().map(pairingView);
+  }
+
+  /** 用掉就蓋時間戳；回 false 代表已經被用過或已被作廢（防重放） */
+  consumePairing(id, usedLabel = '') {
+    return this._pairUse.run(new Date().toISOString(), String(usedLabel ?? '').slice(0, 60), String(id ?? '')).changes > 0;
+  }
+
+  revokePairing(id) {
+    return this._pairRevoke.run(new Date().toISOString(), String(id ?? '')).changes > 0;
   }
 
   /* -------------------------------------------------- 簽發出去的 API token */
 
-  /** 原字串不在這裡出現，传進來的已經是雜湊 */
+  /** 原字串不在這裡出現，傳進來的已經是雜湊 */
   createApiToken({ id, hash, hint, label, scope, expiresAt = null }) {
     const createdAt = new Date().toISOString();
     this._tokInsert.run({ id, hash, hint, label, scope, createdAt, expiresAt });

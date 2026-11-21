@@ -1,6 +1,7 @@
 # 後端映像：零依賴，只要 Node 24（用內建的 node:http + node:sqlite）。
 # 合併邏輯和前端共用同一份 src/lib/merge-core.js，所以 build context 是整個 repo，
-# 但只 COPY 需要的三個檔——不進 image 的就不會被讀到，也減小攻擊面。
+# 但只 COPY 需要的兩個檔與 server/src 那一個目錄（index/store/tokens/share/keys/cli）
+# ——不進 image 的就不會被讀到，也減小攻擊面。
 FROM node:24-alpine
 
 WORKDIR /app
