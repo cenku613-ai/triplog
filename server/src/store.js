@@ -5,9 +5,10 @@
  * 「存最新並集 + 留歷史」，schema 就不會和 App 的欄位一起膨脹，
  * 也天生支援未來新增的欄位（JSON 直接進出）。
  *
- * 沒有帳號系統，只有一把 bearer token（外加「分享連結」用的 trip 級 token，
- * 見 share.js）。因此這裡刻意不做任何刪除資料的 API，也不把金鑰存進資料庫——
- * 誤刪的風險留給本機（有備份檔）而不是伺服器。
+ * 沒有帳號系統：bearer 比對 .env 裡的主金鑰（見 index.js），另外可以比對「簽發出去
+ * 的 API token」的雜湊（見 tokens.js；資料庫裡只有雜湊，主金鑰本身永遠不落庫），
+ * 以及「分享連結」用的 trip 級 token（見 share.js）。因此這裡刻意不做任何刪除資料的
+ * API，誤刪的風險留給本機（有備份檔）而不是伺服器。
  */
 import { mkdirSync, readFileSync, existsSync, renameSync } from 'node:fs';
 import path from 'node:path';
@@ -104,6 +105,25 @@ function shareView(r) {
   };
 }
 
+/**
+ * api_tokens 的對外視圖。注意：不回傳 token_hash——清單與作廢都用 id，
+ * 沒有理由讓雜湊出現在任何回應裡。
+ */
+function tokenView(r) {
+  return {
+    id: r.id,
+    hint: r.hint ?? '',
+    label: r.label ?? '',
+    scope: r.scope === 'write' ? 'write' : 'read',
+    createdAt: r.created_at,
+    expiresAt: r.expires_at ?? null,
+    revokedAt: r.revoked_at ?? null,
+    hits: Number(r.hits ?? 0),
+    writes: Number(r.writes ?? 0),
+    lastSeenAt: r.last_seen_at ?? null,
+  };
+}
+
 function jsonBytes(obj) {
   return Buffer.byteLength(JSON.stringify(obj), 'utf8');
 }
@@ -179,6 +199,22 @@ export class Store {
         last_seen_at TEXT
       );
       CREATE INDEX IF NOT EXISTS shares_trip ON shares(trip_id);
+      /* 簽發出去的 API token（給 agent 或某台裝置）。這裡刻意只存雜湊：
+         備份檔外洩時拿到的是一堆用不了的 hex。撤銷與清單都靠 id，不需要原字串。 */
+      CREATE TABLE IF NOT EXISTS api_tokens (
+        id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        hint TEXT NOT NULL DEFAULT '',
+        label TEXT NOT NULL DEFAULT '',
+        scope TEXT NOT NULL DEFAULT 'read',
+        created_at TEXT NOT NULL,
+        expires_at TEXT,
+        revoked_at TEXT,
+        hits INTEGER NOT NULL DEFAULT 0,
+        writes INTEGER NOT NULL DEFAULT 0,
+        last_seen_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS api_tokens_hash ON api_tokens(token_hash);
     `);
     // 舊資料庫補上內容指紋欄位；SQLite 沒有 ADD COLUMN IF NOT EXISTS，重複執行就當它已經有了
     try {
@@ -210,6 +246,49 @@ export class Store {
     this._shareHit = this.db.prepare(
       'UPDATE shares SET hits = hits + @read, writes = writes + @write, last_seen_at = @at WHERE token = @token',
     );
+    this._tokInsert = this.db.prepare(
+      'INSERT INTO api_tokens (id, token_hash, hint, label, scope, created_at, expires_at) VALUES (@id, @hash, @hint, @label, @scope, @createdAt, @expiresAt)',
+    );
+    this._tokByHash = this.db.prepare('SELECT * FROM api_tokens WHERE token_hash = ?');
+    this._tokById = this.db.prepare('SELECT * FROM api_tokens WHERE id = ?');
+    this._tokList = this.db.prepare('SELECT * FROM api_tokens ORDER BY created_at DESC LIMIT 200');
+    this._tokRevoke = this.db.prepare('UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL');
+    this._tokHit = this.db.prepare(
+      'UPDATE api_tokens SET hits = hits + @read, writes = writes + @write, last_seen_at = @at WHERE id = @id',
+    );
+  }
+
+  /* -------------------------------------------------- 簽發出去的 API token */
+
+  /** 原字串不在這裡出現，传進來的已經是雜湊 */
+  createApiToken({ id, hash, hint, label, scope, expiresAt = null }) {
+    const createdAt = new Date().toISOString();
+    this._tokInsert.run({ id, hash, hint, label, scope, createdAt, expiresAt });
+    return tokenView(this._tokById.get(id));
+  }
+
+  /** 拿 bearer 的雜湊查：查不到就是沒這回事（回 undefined，讓路由層回到 401） */
+  apiTokenByHash(hash) {
+    const row = this._tokByHash.get(String(hash ?? ''));
+    return row ? tokenView(row) : undefined;
+  }
+
+  apiToken(id) {
+    const row = this._tokById.get(String(id ?? ''));
+    return row ? tokenView(row) : undefined;
+  }
+
+  listApiTokens() {
+    return this._tokList.all().map(tokenView);
+  }
+
+  revokeApiToken(id) {
+    return this._tokRevoke.run(new Date().toISOString(), String(id ?? '')).changes > 0;
+  }
+
+  /** 用一次算一筆，擁有者才需要知道哪把還在被使用 */
+  touchApiToken(id, { write = false } = {}) {
+    this._tokHit.run({ id: String(id ?? ''), read: 1, write: write ? 1 : 0, at: new Date().toISOString() });
   }
 
   /* ------------------------------------------------------------ 分享連結 */

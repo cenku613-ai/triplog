@@ -467,10 +467,112 @@ await check('期限與生死的純函式', async () => {
   ]);
   assert.equal(partial('dayItems', { id: 'item_x' }).expenses.length, 0);
 });
+await check('API token 的純函式：形勢判斷、層級、生死', async () => {
+  const { newApiToken, hashToken, looksLikeApiToken, scopeAllows, tokenStatus: ts, tokenLabel } = await import(
+    pathToFileURL(path.join(here, '..', 'src', 'tokens.js')).href
+  );
+  const a = newApiToken();
+  const b = newApiToken();
+  assert.ok(a.token.startsWith('tlk_') && a.token !== b.token, '每枚都要不一樣');
+  assert.ok(a.hint.startsWith('tlk_') && a.hint.length < a.token.length, 'hint 要比原字串短');
+  assert.ok(a.hint !== a.token && !a.hint.includes(a.token.slice(8, 20)), 'hint 不能拼回原字串');
+  assert.equal(hashToken(a.token), a.hash);
+  assert.notEqual(hashToken(b.token), a.hash);
+  // 主金鑰與其他來源的字串不該去查資料庫
+  assert.equal(looksLikeApiToken('smoke-write-key-0123456789abcdef'), false);
+  assert.equal(looksLikeApiToken(''), false);
+  assert.equal(looksLikeApiToken(a.token), true);
+  assert.equal(scopeAllows('write', 'write'), true);
+  assert.equal(scopeAllows('read', 'write'), false);
+  assert.equal(scopeAllows('read', 'read'), true);
+  assert.equal(ts({ createdAt: iso(0) }).live, true);
+  assert.equal(ts({ expiresAt: iso(-1) }).live, false);
+  assert.equal(ts({ expiresAt: iso(-1), revokedAt: iso(0) }).reason, 'revoked');
+  assert.equal(tokenLabel('  agent\ncurl ', '未命名'), 'agent curl', '標籤要清掉控制字元');
+  assert.equal(tokenLabel('   '), '未命名');
+  assert.equal(tokenLabel('x'.repeat(200)).length, 60);
+});
 await check('沒被作廢的另一把連結還活著', async () => {
   const r = await api(`/api/share/${survivorToken}`, { key: null });
   assert.equal(r.status, 200);
   assert.equal(r.json.trip.id, 'trip_b');
+});
+
+console.log('\n— API token 簽發（可撤銷的 bearer）');
+let readToken = '';
+let writeToken = '';
+let readRow = null;
+await check('主金鑰能簽一枚唯讀 token，原字串只出現在簽發回應裡', async () => {
+  const r = await api('/api/tokens', { method: 'POST', body: { label: '唯讀 agent', scope: 'read', expiresInDays: 30 } });
+  assert.equal(r.status, 200, r.text);
+  readToken = String(r.json.secret ?? '');
+  readRow = r.json.token;
+  assert.ok(readToken.startsWith('tlk_') && readToken.length >= 30, `secret=${readToken.slice(0, 8)}`);
+  assert.equal(readRow.scope, 'read');
+  assert.equal(readRow.label, '唯讀 agent');
+  assert.ok(readRow.expiresAt && Date.parse(readRow.expiresAt) > Date.now());
+  assert.ok(!JSON.stringify(readRow).includes(readToken), '除了 secret 那一個欄位，清單結構不該再帶原字串');
+});
+await check('清單顯示 hint 而不是可用的憑證', async () => {
+  const r = await api('/api/tokens');
+  assert.equal(r.status, 200);
+  const row = r.json.tokens.find((x) => x.id === readRow.id);
+  assert.ok(row.hint.includes('tlk_') && row.hint.includes('…'), `hint=${row.hint}`);
+  assert.ok(!('tokenHash' in row) && !('token_hash' in row), '雜湊不該出現在回應裡');
+});
+await check('唯讀 token 讀得到基準檔', async () => {
+  const r = await api('/api/base', { key: readToken });
+  assert.equal(r.status, 200, r.text);
+  assert.ok(r.json.base.trips.some((t) => t.id === 'trip_a'));
+});
+await check('唯讀 token 寫不進去（403，而且要講清楚要主金鑰）', async () => {
+  const r = await api('/api/sync', { method: 'POST', key: readToken, body: { ...fixture(), trips: [], expenses: [] } });
+  assert.equal(r.status, 403, r.text);
+  assert.match(String(r.json.error), /TRIPLOG_API_KEY/);
+});
+await check('可寫 token 推得動部分文件', async () => {
+  const mint = await api('/api/tokens', { method: 'POST', body: { label: '手機', scope: 'write', expiresInDays: 'never' } });
+  assert.equal(mint.status, 200, mint.text);
+  writeToken = String(mint.json.secret);
+  assert.equal(mint.json.token.expiresAt, null, 'never 應該是不設限期');
+  const push = await api('/api/sync', {
+    method: 'POST',
+    key: writeToken,
+    body: { format: 'triplog-backup', version: 1, trips: [], dayItems: [{ id: 'item_tok1', tripId: 'trip_a', date: '2026-03-02', kind: 'sight', title: 'By token', order: 20, createdAt: iso(2), updatedAt: iso(2) }], expenses: [], categories: [], photos: [] },
+  });
+  assert.equal(push.status, 200, push.text);
+  assert.ok((await api('/api/base')).json.base.dayItems.some((i) => i.id === 'item_tok1'));
+});
+await check('簽發出去的 token 不能發照，也不能清空伺服器', async () => {
+  const mint = await api('/api/tokens', { method: 'POST', key: writeToken, body: { scope: 'write' } });
+  assert.equal(mint.status, 403, mint.text);
+  const list = await api('/api/tokens', { key: writeToken });
+  assert.equal(list.status, 403, '唯讀清單也要擋：名單本身是情報');
+  const wipe = await api('/api/admin/clear', { method: 'POST', key: writeToken, body: {}, headers: { 'x-triplog-confirm': 'wipe' } });
+  assert.equal(wipe.status, 403, wipe.text);
+});
+await check('期限參數亂給會被擋', async () => {
+  const r = await api('/api/tokens', { method: 'POST', body: { expiresInDays: 9999 } });
+  assert.equal(r.status, 400, r.text);
+});
+await check('作廢某一把只壞那一把', async () => {
+  const rev = await api('/api/tokens/revoke', { method: 'POST', body: { id: readRow.id } });
+  assert.equal(rev.status, 200, rev.text);
+  assert.equal(rev.json.changed, true);
+  assert.ok(rev.json.token.revokedAt);
+  assert.equal((await api('/api/base', { key: readToken })).status, 401, '作廢後應該立刻進不去');
+  assert.equal((await api('/api/base', { key: writeToken })).status, 200, '別把另一個也弄壞了');
+  assert.equal((await api('/api/base', { key: KEY })).status, 200, '主金鑰不受影響');
+  const again = await api('/api/tokens/revoke', { method: 'POST', body: { id: readRow.id } });
+  assert.equal(again.json.changed, false, '重複作廢不該報錯，也不能假稱改動過');
+});
+await check('使用狀況會被記下來', async () => {
+  const rows = (await api('/api/tokens')).json.tokens;
+  const revoked = rows.find((x) => x.id === readRow.id);
+  const phone = rows.find((x) => x.label === '手機');
+  assert.ok(revoked.hits >= 1, `hits=${revoked.hits}`);
+  assert.ok(phone.writes >= 1, `writes=${phone.writes}`);
+  assert.ok(phone.lastSeenAt, '用過就要有最後使用時間');
 });
 
 console.log('\n— 歷史與重啟');
@@ -488,6 +590,11 @@ await check('重啟後資料還在', async () => {
   const r = await api('/api/base');
   assert.equal(r.status, 200);
   assert.ok(r.json.base.trips.some((t) => t.id === 'trip_a'));
+});
+await check('重啟後簽發過的 token 還能用（授權與資料一起存在 SQLite）', async () => {
+  const r = await api('/api/base', { key: writeToken });
+  assert.equal(r.status, 200, r.text);
+  assert.equal((await api('/api/base', { key: readToken })).status, 401, '作廢的還是作廢');
 });
 await check('舊版 snapshot.json 開機搬遷', async () => {
   const legacy = { ...fixture(), trips: [{ id: 'trip_legacy', name: 'Legacy', startDate: '2026-01-01', endDate: '2026-01-02', baseCurrency: 'TWD', archived: false, createdAt: iso(0), updatedAt: iso(0) }], dayItems: [], expenses: [], photos: [], meta: [] };

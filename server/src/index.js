@@ -17,6 +17,7 @@ import {
   sharePayload,
   shareStatus,
 } from './share.js';
+import { TOKEN_SCOPES, hashToken, looksLikeApiToken, newApiToken, scopeAllows, tokenLabel, tokenStatus } from './tokens.js';
 import { send, fail, tokenEquals, bearer, readJsonBody, rateLimiter, clientIp, applyCors } from './net.js';
 
 const VERSION = '0.1.0';
@@ -175,6 +176,7 @@ const SCHEMA_HINT = {
     'There is no delete endpoint by design. To archive a trip set archived=true.',
     'Amounts stay in the original currency; baseAmount is what statistics use.',
     'Sharing: POST /api/shares {tripId,expiresInDays} (needs the key) mints a trip-scoped token; GET /api/share/<token> reads that trip only and POST /api/share/<token>/expense|item appends to it without any key. POST /api/shares/revoke {token} kills a link; it revokes a grant, not data.',
+    'API tokens: POST /api/tokens {label,scope:read|write,expiresInDays} mints a revocable bearer (shown once, stored hashed); GET /api/tokens lists them and POST /api/tokens/revoke {id} retires one. Minting, listing, revoking and POST /api/admin/clear all require the master TRIPLOG_API_KEY — an issued token can never mint or wipe.',
   ],
 };
 
@@ -206,14 +208,24 @@ async function route(req, res) {
   }
 
   const key = bearer(req);
-  const canRead = tokenEquals(key, READ_KEY) || tokenEquals(key, WRITE_KEY);
-  const canWrite = tokenEquals(key, WRITE_KEY);
+  const isMaster = tokenEquals(key, WRITE_KEY);
+  const isMasterReadable = isMaster || tokenEquals(key, READ_KEY);
+  /** 從 app「設定 → API token」簽發出來的那種：自帶層級與期限，能單獨作廢 */
+  let issued = null;
+  if (!isMasterReadable && looksLikeApiToken(key)) {
+    const row = store.apiTokenByHash(hashToken(key));
+    if (row && tokenStatus(row).live) issued = row;
+  }
+  const canRead = isMasterReadable || issued !== null;
+  const canWrite = isMaster || (issued !== null && scopeAllows(issued.scope, 'write'));
   if (!canRead) {
     return fail(res, 401, 'missing or wrong bearer token', { need: 'TRIPLOG_READ_KEY or TRIPLOG_API_KEY' });
   }
 
   const ip = clientIp(req);
   if (!limitRead(ip)) return fail(res, 429, 'too many requests', { retryAfterMs: 60_000 });
+  // 通過限流才算一次真實使用，被擋掉的洪水不進統計；寫入在下面另外記一筆（含 writes）
+  if (issued && req.method === 'GET') store.touchApiToken(issued.id);
 
   const { snapshot } = store.base();
 
@@ -290,6 +302,11 @@ async function route(req, res) {
       const tripId = url.searchParams.get('tripId');
       return send(res, 200, { ok: true, shares: store.listShares(tripId || null) });
     }
+    if (resource === 'tokens') {
+      // 清單本身就是「誰還能進來」的名單，簽發出去的 token 不能看到它
+      if (!isMaster) return fail(res, 403, '只有主金鑰（TRIPLOG_API_KEY）看得到 token 清單', {});
+      return send(res, 200, { ok: true, tokens: store.listApiTokens() });
+    }
     return fail(res, 404, 'not found', {});
   }
 
@@ -297,6 +314,7 @@ async function route(req, res) {
   if (req.method !== 'POST') return fail(res, 405, 'method not allowed', {});
   if (!canWrite) return fail(res, 403, 'read-only token: writes need TRIPLOG_API_KEY', {});
   if (!limitWrite(ip)) return fail(res, 429, 'too many writes', { retryAfterMs: 60_000 });
+  if (issued) store.touchApiToken(issued.id, { write: true });
 
   let body = null;
   try {
@@ -331,6 +349,42 @@ async function route(req, res) {
     return send(res, 200, { ok: true, photos: pickPhotos(snapshot, { ids, tripIds, limit: 200 }) });
   }
 
+  /* ------------------------------------------- API token 簽發（只認主金鑰） */
+
+  if (resource === 'tokens' && !parts[2]) {
+    // 這一段不用 canWrite：拿簽發出去的 write token 也能寫資料，
+    // 但它不能再生一枚 token，否則洩一把就等於拿到整台伺服器的發照權
+    if (!isMaster) return fail(res, 403, '簽發 token 要用主金鑰（.env 裡的 TRIPLOG_API_KEY）', {});
+    const scope = TOKEN_SCOPES.includes(body?.scope) ? body.scope : 'read';
+    let expiresAt = null;
+    try {
+      expiresAt = expiresAtFrom(body?.expiresInDays ?? 90);
+    } catch (err) {
+      return fail(res, err.status ?? 400, String(err.message ?? err), {});
+    }
+    const minted = newApiToken();
+    const row = store.createApiToken({
+      id: minted.id,
+      hash: minted.hash,
+      hint: minted.hint,
+      label: tokenLabel(body?.label),
+      scope,
+      expiresAt,
+    });
+    // 原字串只在這次回應裡出現一次，之後清單上只有 hint
+    return send(res, 200, { ok: true, token: row, secret: minted.token });
+  }
+
+  if (resource === 'tokens' && parts[2] === 'revoke') {
+    if (!isMaster) return fail(res, 403, '撤銷 token 要用主金鑰（.env 裡的 TRIPLOG_API_KEY）', {});
+    const id = String(body?.id ?? '');
+    const changed = store.revokeApiToken(id);
+    const row = store.apiToken(id);
+    if (!row) return fail(res, 404, '找不到這個 token', {});
+    // 已經撤過再按一次不算錯：按下去要的就是「這把沒了」的狀態
+    return send(res, 200, { ok: true, revoked: true, changed, token: row });
+  }
+
   /* ------------------------------------------------ 分享連結管理（要金鑰） */
 
   if (resource === 'shares' && !parts[2]) {
@@ -358,6 +412,8 @@ async function route(req, res) {
   }
 
   if (resource === 'admin' && parts[2] === 'clear') {
+    // 清空是整台等級的動作：分享連結的 token 與簽發出去的 agent token 都碰不到它
+    if (!isMaster) return fail(res, 403, '只有主金鑰（TRIPLOG_API_KEY）能清空伺服器', {});
     if (req.headers['x-triplog-confirm'] !== 'wipe') {
       return fail(res, 400, 'pass header x-triplog-confirm: wipe', {});
     }
