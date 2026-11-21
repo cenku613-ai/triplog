@@ -679,4 +679,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error(`[triplog-mcp] ready · ${BASE_URL} · ${ALLOW_WRITE ? 'read+write' : 'read-only'} · ${visibleTools().length} tools`);
+// 金鑰層級跟工具註冊是兩件事：只給讀取金鑰時就算沒設 ALLOW_WRITE=0，寫入也會被後端 403。
+// 這行是佈署時唯一看得到狀態的地方，就別只報「寫得進去」的假象
+const MODE = !ALLOW_WRITE ? 'read-only' : KEY === (process.env.TRIPLOG_READ_KEY ?? '').trim() ? 'read-only（只給了讀取金鑰）' : 'read+write';
+console.error(`[triplog-mcp] ready · ${BASE_URL} · ${MODE} · ${visibleTools().length} tools`);
