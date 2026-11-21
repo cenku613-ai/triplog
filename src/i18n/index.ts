@@ -84,7 +84,7 @@ export function t(key: Key, vars?: Vars): string {
   return interpolate(lookup(key) ?? key, vars);
 }
 
-/** 動態組出来的鍵（weekday.3、cat.food…）走這裡，找不到就退回鍵名本身 */
+/** 動態組出來的鍵（weekday.3、cat.food…）走這裡，找不到就退回鍵名本身 */
 export function tRaw(key: string, vars?: Vars): string {
   return interpolate(lookup(key) ?? key, vars);
 }
@@ -94,7 +94,7 @@ export function intlLocale(): string {
   return current === 'en' ? 'en-US' : 'zh-TW';
 }
 
-/** 文件層級的東西（<html lang>、標題、描述）跟着語言換 */
+/** 文件層級的東西（<html lang>、標題、描述）跟著語言換 */
 export function applyDocument(): void {
   if (typeof document === 'undefined') return;
   document.documentElement.lang = current;

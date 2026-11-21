@@ -12,6 +12,7 @@ import { db } from '../db/db';
 import type { Trip } from '../db/types';
 import { usePwaUpdate } from './pwa';
 import { useI18n } from '../i18n';
+import { describeSyncError, loadSyncConfig, syncNow } from '../lib/sync';
 
 function Shell() {
   const { toast } = useUi();
@@ -31,6 +32,29 @@ function Shell() {
       window.removeEventListener('offline', down);
     };
   }, []);
+
+  // 啟動自動同步：一個 session 只跑一次，失敗只輕輕說一聲，不打斷本機記錄
+  const autoSynced = useRef(false);
+  useEffect(() => {
+    const cfg = loadSyncConfig();
+    if (!cfg?.auto || autoSynced.current || !navigator.onLine) return;
+    autoSynced.current = true;
+    syncNow(cfg)
+      .then((r) =>
+        toast(
+          r.pulled.trips || r.pulled.dayItems || r.photosDownloaded
+            ? `${t('sync.autoDone')} · ${t('sync.report', {
+                pTrips: r.pulled.trips,
+                pItems: r.pulled.dayItems,
+                pExp: r.pulled.expenses,
+                nTrips: r.pushed.trips,
+                photos: r.photosDownloaded,
+              })}`
+            : t('sync.autoDone'),
+        ),
+      )
+      .catch((err) => toast(t('sync.autoFailed', { msg: describeSyncError(err) }), { kind: 'error' }));
+  }, [toast, t]);
 
   const told = useRef({ refresh: false, ready: false });
   useEffect(() => {

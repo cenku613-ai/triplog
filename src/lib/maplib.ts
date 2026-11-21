@@ -6,7 +6,7 @@ import { isValidLatLng } from './places';
  * Leaflet 的進入點集中在這裡：兩個地圖元件共用同一套底圖與圖釘樣式。
  *
  * 圖釘用 circleMarker 而不是內設 icon —— Leaflet 的 premake 圖示走相對 URL，
- * 打进 bundle 後一定 404，圓點既能著色又不需要額外圖檔。
+ * 打進 bundle 後一定 404，圓點既能著色又不需要額外圖檔。
  */
 
 export const TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';

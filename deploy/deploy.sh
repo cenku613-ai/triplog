@@ -12,6 +12,14 @@
 #   TRIPLOG_DOMAIN    有值時啟動 Caddy（HTTPS）
 #   DUCKDNS_SUBDOMAIN 與 TRIPLOG_DOMAIN 一起設定時，連 DuckDNS IP 更新容器一起啟動
 #   DUCKDNS_TOKEN     DuckDNS 的 token
+#
+# 同步／agent API（選裝，要開就把金鑰寫進專案根的 .env，它會跟著同步過去）：
+#   TRIPLOG_API_KEY   有值時才啟動 api 容器與 /api 反代；寫入金鑰，等於整個資料庫的密碼
+#   TRIPLOG_READ_KEY  只讀金鑰，給只想看資料的 agent 用
+#   TRIPLOG_KEEP      基準檔保留幾份歷史快照（預設 20）
+#   TRIPLOG_ALLOWED_ORIGIN  只讓這個來源跨網讀 API（一般填 app 自己的網域）
+#
+# 金鑰一律走 .env，不透過指令列傳到遠端——寫在 ssh 參數裡會讓同機其他使用者用 ps 就看到。
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -47,6 +55,15 @@ compose_args() {
       args="$args -f deploy/compose.duckdns.yml"
     fi
   fi
+  # 同步／agent API 是選裝的：沒有寫入金鑰就完全不啟動，靜態站跟以前一模一樣
+  if [[ -n "${TRIPLOG_API_KEY:-}" ]]; then
+    if [[ -z "${TRIPLOG_DOMAIN:-}" ]]; then
+      # API 容器不綁 port，公網只能經 Caddy 的 443 進來；沒有 Caddy 時開了也沒人連得到
+      echo "提醒：設了 TRIPLOG_API_KEY 但沒有 TRIPLOG_DOMAIN，這次不啟動同步 API（它只掛在 Caddy 後面）" >&2
+    else
+      args="$args -f deploy/compose.api.yml"
+    fi
+  fi
   printf '%s' "$args"
 }
 
@@ -71,6 +88,19 @@ if [[ "$LOCAL" == "1" ]]; then
     echo "完成：https://${TRIPLOG_DOMAIN}"
     echo "憑證檢查： curl -sI https://${TRIPLOG_DOMAIN}/ | head -5"
     echo "Caddy 簽憑證需要幾秒到幾分鐘，失敗會自動重試；看日誌： $COMPOSE $ARGS logs --tail=50 caddy"
+    if [[ "${ARGS}" == *compose.api.yml* ]]; then
+      # 只驗兩件事：API 活著（200）與沒金鑰真的進不去（401）。金鑰本身不進任何指令或日誌
+      echo "==> 檢查同步 API"
+      sleep 5
+      if command -v curl >/dev/null 2>&1; then
+        health="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://${TRIPLOG_DOMAIN}/api/health" || echo 000)"
+        anon="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://${TRIPLOG_DOMAIN}/api/base" || echo 000)"
+        [[ "$health" == "200" ]] && echo "   /api/health → 200（agent 與跨裝置同步可用）" || echo "   /api/health → ${health}：憑證可能還在簽，稍後再 curl 一次；查日誌 $COMPOSE logs --tail=50 triplog-api"
+        [[ "$anon" == "401" ]] && echo "   未帶金鑰 /api/base → 401（外部讀不到資料）" || echo "   未帶金鑰 /api/base → ${anon}，預期 401，請檢查 TRIPLOG_API_KEY 設定"
+      else
+        echo "   這台機器沒有 curl，跳過檢查：改從工作機跑 curl https://${TRIPLOG_DOMAIN}/api/health"
+      fi
+    fi
   else
     echo "完成：http://${TRIPLOG_BIND:-0.0.0.0}:${TRIPLOG_PORT:-8080}（TRIPLOG_BIND=127.0.0.1 代表只有本機可達，需搭配 Caddy）"
     echo "注意：HTTP 之下 Service Worker 不會註冊、PWA 也裝不了。要完整 PWA 請設 TRIPLOG_DOMAIN。"
@@ -128,8 +158,9 @@ if [[ -n "${TRIPLOG_DOMAIN:-}" ]]; then
     echo "   且 VPS 能對外連線。Caddy 仍會啟動並在背後重試簽憑證。" >&2
   else
     echo "   $TRIPLOG_DOMAIN → $RESOLVED"
-    echo "   請確認這個 IP 就是你的 VPS 公網 IP；HTTP-01 驗證需要公網能連到 80 port"
-    echo "   （Oracle 要在 VCN 安全清單開放 80/443，不是只在作業系統開防火牆）"
+    echo "   請確認這個 IP 就是你的 VPS 公網 IP"
+    echo "   Caddy 用 TLS-ALPN-01 簽憑證：驗證走 443 本身，不需要開 80 port"
+    echo "   （Oracle 要在 VCN 安全清單開放 443，不是只在作業系統開防火牆；80 保持關閉）"
   fi
 fi
 

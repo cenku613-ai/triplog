@@ -3,7 +3,7 @@ import { setLang } from '../i18n';
 import { addDays, dateRange, dayIndex, daysBetween, isValidDate, prettyDate } from './dates';
 
 describe('日期', () => {
-  // 介面語言會影響日期文字，測試綁在繁中，才不会隨跑測試的主機語系變動
+  // 介面語言會影響日期文字，測試綁在繁中，才不會隨跑測試的主機語系變動
   beforeAll(() => setLang('zh-Hant'));
 
   it('跨月與跨年加減天數不位移', () => {

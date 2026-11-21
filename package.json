@@ -10,9 +10,17 @@
     "build": "npm run icons && tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "check:zh": "node tools/check-zh.mjs",
+    "server:start": "node server/src/index.js",
+    "server:test": "node server/test/smoke.mjs",
+    "mcp:build": "vite build --config vite.mcp.config.ts",
+    "mcp:test": "npm run mcp:build && node server/test/mcp-smoke.mjs",
+    "mcp": "node mcp/bin.mjs",
+    "verify": "npm run check:zh && tsc --noEmit && vitest run && node server/test/smoke.mjs && npm run mcp:test"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "dexie": "^4.0.8",
     "leaflet": "^1.9.4",
     "react": "^18.3.1",

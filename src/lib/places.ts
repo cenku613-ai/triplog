@@ -3,7 +3,7 @@ import { lang as uiLang, type Lang } from '../i18n';
 /**
  * OpenStreetMap Nominatim 查詢。
  *
- * 这是 App 唯一會外連的地方：只把「搜尋字串」送出去，查到的結果存進本機 IndexedDB，
+ * 這是 App 唯一會外連的地方：只把「搜尋字串」送出去，查到的結果存進本機 IndexedDB，
  * 旅程與支出本身仍然不會離開裝置。
  *
  * Nominatim 使用規範要求每來源每秒不超過 1 個請求，所以這裡用一條 promise 鏈排隊，
@@ -75,7 +75,7 @@ function toPlace(r: Raw): Place | null {
   };
 }
 
-/* --------------------------------------------------------------- 节流 + 快取 */
+/* --------------------------------------------------------------- 節流 + 快取 */
 
 let lastAt = 0;
 let queue: Promise<unknown> = Promise.resolve();
@@ -116,7 +116,7 @@ function cacheSet(key: string, hits: Place[]): void {
   }
 }
 
-/** 測試或換語言时可以清掉，避免拿到另一種語言的地址 */
+/** 測試或換語言時可以清掉，避免拿到另一種語言的地址 */
 export function clearPlaceCache(): void {
   cache.clear();
 }

@@ -20,7 +20,7 @@ function item(over: Partial<DayItem> = {}): DayItem {
 }
 
 describe('地圖資料整理', () => {
-  it('只有座標合法的行程項会上圖，並依天数與排序排出', () => {
+  it('只有座標合法的行程項會上圖，並依天數與排序排出', () => {
     const points = geoPoints(
       [
         item({ id: 'a', date: '2026-11-03', lat: 35.01, lng: 135.77, order: 20 }),

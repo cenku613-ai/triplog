@@ -1,0 +1,28 @@
+# 和 deploy/Caddyfile 相同的 443-only 設定，多了一條 /api 反代。
+# 啟用方式：docker compose -f docker-compose.yml -f deploy/compose.api.yml --profile tls up -d
+# （compose.api.yml 會把這個檔案蓋進 caddy 容器的 /etc/caddy/Caddyfile）
+{
+	auto_https disable_redirects
+	grace_period 3s
+}
+
+{$TRIPLOG_DOMAIN} {
+	encode zstd gzip
+
+	# PWA 的安裝橫幅與 SW 註冊需要 HTTPS
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+	handle /api/* {
+		# 同步與 MCP 用的 API，走同一個 443；後端自己回 no-store
+		reverse_proxy triplog-api:8788
+	}
+
+	handle {
+		reverse_proxy triplog:8080
+	}
+
+	log {
+		output file /data/access.log
+		format console
+	}
+}

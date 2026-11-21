@@ -7,7 +7,7 @@ const DEBOUNCE = 550;
 
 /**
  * Wikimedia Commons 選圖：先搜、勾選，再一次加入。
- * 这里只回傳 hit，下載與壓縮由呼叫端做，因為要存進 IndexedDB 的是 Blob 而不是 URL。
+ * 這裡只回傳 hit，下載與壓縮由呼叫端做，因為要存進 IndexedDB 的是 Blob 而不是 URL。
  */
 export function CommonsPicker({
   onPick,

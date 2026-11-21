@@ -25,7 +25,7 @@ export function usePwaUpdate() {
   };
 }
 
-/** iOS / Android 安裝引导 */
+/** iOS / Android 安裝引導 */
 export function useInstallPrompt() {
   const [deferred, setDeferred] = useState<BIPEvent | null>(null);
   const [installed, setInstalled] = useState(

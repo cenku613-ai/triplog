@@ -1,18 +1,21 @@
 # TripLog 旅行記錄
 
-離線優先的旅行行程與支出記錄 PWA。手機、平板、電腦都能安裝使用，所有資料保存在裝置本機（IndexedDB），不會上傳到任何伺服器。
+離線優先的旅行行程與支出記錄 PWA。手機、平板、電腦都能安裝使用，所有資料存在裝置本機（IndexedDB）；雲端預設只負責送靜態檔案，要不要讓資料離開裝置由你決定（見「選裝：同步與 AI agent API」）。
 
 ## 功能
 
 - **旅行管理**：建立、編輯、歸檔、刪除；起訖日期、主幣別、預算、代表色
 - **雙語介面**：繁中／英文全介面切換，跟隨瀏覽器語系為預設，設定裡可手動鎖定；安裝後的應用程式名稱與說明也隨語言本地化
 - **行程記錄**：依天數排時間軸，可設定類型（交通／住宿／餐飲／景點／活動）、起訖時間、地點、備註與手動排序
-- **地點搜尋**：打關鍵字即時查 OpenStreetMap Nominatim，選了就回填座標與地名；離線時明確告知不可用，不假装成功
+- **地點搜尋**：打關鍵字即時查 OpenStreetMap Nominatim，選了就回填座標與地名；離線時明確告知不可用，不假裝成功
 - **地圖**：Leaflet + OSM 瓦片，行程項的座標依「第幾天」著色；右側按天分組的地點清單可跳點與直接編輯，表單裡另有點擊選點與「用我的位置」
 - **行程照片**：裝置相機／選檔與 Wikimedia Commons 兩種來源，自動縮到 1600px 主圖＋400px 縮圖存進 IndexedDB，每趟上限 60 張；Commons 來源會一併保存作者與授權，時間軸上直接顯示縮圖與大圖檢視
 - **隨行人員**：旅行可記多名同行者，支出標記「誰付的」，統計頁看得到各人代墊合計（不做分帳清算）
 - **支出記錄**：一鍵記支出、可關聯到某個行程項、多幣別手動匯率、付款人與備註
 - **統計**：預算進度、每日長條圖、分類占比環形圖、原始幣別合計、金額最大的幾筆
+- **列印／PDF**：把一趟旅行輸出成 A4 列印頁——封面、每日時間軸、支出明細與圖表、照片牆、含路線點的地圖截圖，各區可單獨開關；走瀏覽器列印對話框另存 PDF，不裝任何套件
+- **跨裝置同步**（選裝）：自架的零依賴 API 當基準檔，手機記的錢筆電看得到；採「兩端各自推送、伺服器合併」，同一筆以 `updatedAt` 較新者勝，沒有帳號系統，只靠金鑰
+- **AI agent 寫入**（選裝）：透過 MCP 讓 agent 讀行程、記支出、建旅行；14 個工具、可切唯讀，並且刻意**沒有刪除**能力
 - **備份**：全量 JSON 匯出／匯入（合併或覆寫），照片以 base64 一起帶走，還原後 Blob 完整讀回
 - **PWA**：可安裝、完全離線可用、深色／淺色／跟隨系統主題、手機底部導覽列與桌面側欄自動切換；看過的地圖瓦片快取 30 天，離線仍能看底圖
 
@@ -20,12 +23,16 @@
 
 ```bash
 npm install
-npm run dev        # 開發伺服器，http://localhost:5173
-npm test           # 44 個單元測試（日期、金額換算、統計、備份與還原、照片往來、座標與地圖邊界、雙語字典）
-npm run typecheck  # TypeScript 檢查
-npm run icons      # 產生 PWA 圖示（純 Node，無外部依賴）
-npm run build      # icons → typecheck → vite build，輸出 dist/
-npm run preview    # 以本地靜態伺服器預覽 dist/，PWA 與離線行為要在這裡測
+npm run dev         # 開發伺服器，http://localhost:5173
+npm test            # 64 個單元測試（日期、金額換算、統計、備份與還原、合併規則、照片往來、座標與地圖邊界、雙語字典、PDF 文件）
+npm run typecheck   # TypeScript 檢查
+npm run check:zh    # 繁中介面的字級檢查（抓簡體字，可 --fix）
+npm run server:test # 後端 API 冒煙測試（29 項，真的起一個 SQLite）
+npm run mcp:test    # 打包 MCP 並用 JSON-RPC 打進去（21 項）
+npm run verify      # check:zh + typecheck + 單元測試 + 後端冒煙 + MCP 冒煙
+npm run icons       # 產生 PWA 圖示（純 Node，無外部依賴）
+npm run build       # icons → typecheck → vite build，輸出 dist/
+npm run preview     # 以本地靜態伺服器預覽 dist/，PWA 與離線行為要在這裡測
 ```
 
 ## 安裝與離線驗證
@@ -45,7 +52,8 @@ npm run preview    # 以本地靜態伺服器預覽 dist/，PWA 與離線行為�
 | 旅行、行程、支出、分類、匯率 | IndexedDB，資料庫名稱 `triplog` |
 | 行程照片（主圖與縮圖 Blob） | 同一個 IndexedDB 的 `photos` store（v2 起） |
 | 主題偏好、語言、最後使用的旅行／分類／主幣別 | localStorage（`triplog:*`） |
-| 看过的地圖瓦片 | Cache Storage `osm-tiles`（500 筆／30 天） |
+| 看過的地圖瓦片 | Cache Storage `osm-tiles`（500 筆／30 天） |
+| 同步位址與金鑰（有開同步時） | localStorage `triplog:sync`，只在本機，不會寫進備份檔 |
 
 清除瀏覽器網站資料或「設定 → 清除所有資料」會不可逆地移除記錄，請先匯出備份。
 
@@ -53,14 +61,15 @@ npm run preview    # 以本地靜態伺服器預覽 dist/，PWA 與離線行為�
 
 - **行程與支出共用同一條時間軸**：支出可掛在某個行程項下，刪行程項時支出只解除關聯、不會被連帶刪除（錢是重要資料）
 - **金額永遠以記錄當下的原始幣別保存**，另存 `rateToBase` 與算好的 `baseAmount`；統計一律用主幣別，避免事後匯率變動影響歷史數字
-- **資料一律留本機，但對外請求有三處**：地點搜尋打 Nominatim、底圖打 OSM 瓦片、Commons 選圖打 Wikimedia。三者都只送查詢字串，不帶任何旅行資料、名稱或座標紀錄；離線或擋掉時功能降級但 app 仍可用，匯率則完全由使用者輸入並記憶（無記憶值就留白強制輸入，避免偷偷用 1:1 記錯錢）
+- **資料一律留本機，但對外請求有四處**：地點搜尋打 Nominatim、底圖打 OSM 瓦片、Commons 選圖打 Wikimedia，這三個只送查詢字串，不帶任何旅行資料、名稱或座標紀錄；第四處是自己開通的同步 API——沒填金鑰時它完全不存在，填了也只有「同步、列印、agent 寫入」會用到。離線或擋掉時功能降級但 app 仍可用，匯率則完全由使用者輸入並記憶（無記憶值就留白強制輸入，避免偷偷用 1:1 記錯錢）
 - **Nominatim 用得克制**：同一時間只讓一個請求出去、間隔 1.2 秒、結果快取 24 小時，並帶 `accept-language`，符合其使用政策
-- **地圖用 circleMarker 而非預設圖示**：Leaflet 預設圖示的圖片路徑在打包後常斷掉，圓點自帶顏色还能順帶表達「第幾天」
-- **不含帳密與後端**：跨裝置同步靠匯出／匯入 JSON，之後要接後端時 `updatedAt` 欄位已預留
+- **地圖用 circleMarker 而非預設圖示**：Leaflet 預設圖示的圖片路徑在打包後常斷掉，圓點自帶顏色還能順帶表達「第幾天」
+- **PDF 用列印而不是 PDF 函式庫**：`src/lib/pdf.ts` 把一趟組成一頁自包含的 A4 HTML（含 inline SVG 圖表與縮圖），叫出瀏覽器列印對話框由使用者「另存為 PDF」。好處是零依賴、字型與分頁交給瀏覽器、預覽所見即所得；代價是要裝印表機驅動（各平台都已有）
+- **同步合併的逻輯前後端共用一份**：`src/lib/merge-core.js` 是純 JS＋手寫 `.d.ts`，瀏覽器推送時算、後端落庫時也算同一套規則，不會出現兩端對「誰贏」認知不同的情形。已知取捨：沒有刪除語意，一端刪掉的記錄另一端下次同步會帶回來，要真刪得記 tombstone
 
 ## 部署（Docker）
 
-部署出去的只有靜態檔案（HTML／JS／CSS／圖示／Service Worker），**沒有資料庫、沒有帳密、沒有 API**；旅行與支出仍然只存在每台裝置自己的 IndexedDB 裡。換句話說：雲端只是讓大家用同一個網址開啟 app，手機記的錢不會自動出現在筆電上——要跨裝置請用「設定 → 匯出備份」。
+預設部署出去的只有靜態檔案（HTML／JS／CSS／圖示／Service Worker），**沒有資料庫、沒有帳密、沒有 API**；旅行與支出仍然只存在每台裝置自己的 IndexedDB 裡。換句話說：雲端只是讓大家用同一個網址開啟 app，手機記的錢不會自動出現在筆電上——要跨裝置可以用「設定 → 匯出備份」，或把下面「選裝」的同步 API 開起來。
 
 相關檔案：
 
@@ -72,7 +81,10 @@ npm run preview    # 以本地靜態伺服器預覽 dist/，PWA 與離線行為�
 | `deploy/Caddyfile` | 有網域時自動簽發並續期 Let's Encrypt 憑證 |
 | `deploy/Caddyfile.selfsigned`、`deploy/make-selfsigned.sh` | 只有裸 IP 時的自簽 HTTPS |
 | `deploy/compose.duckdns.yml` | 用 DuckDNS 免費子域名取得正式憑證 |
-| `deploy/deploy.sh` | 一鍵推送＋建置＋啟動 |
+| `server/`、`server/Dockerfile` | 選裝的同步／agent API：零依賴（`node:http` ＋內建 `node:sqlite`），映像只 COPY 三個檔 |
+| `deploy/compose.api.yml`、`deploy/Caddyfile.api` | 選裝 API 的 compose 覆寫與反代：容器不綁 port，公網仍只有 443 |
+| `mcp/` | 選裝的 MCP server，讓 AI agent 打上面的 API（見 `mcp/README.md`） |
+| `deploy/deploy.sh` | 一鍵推送＋建置＋啟動；`.env` 有金鑰時自動多掛 API |
 
 ### VPS 前置作業（Oracle Cloud 常見坑）
 
@@ -81,7 +93,7 @@ Oracle 的連線會被擋兩次，兩邊都要開：
 1. **雲端層 VCN 安全清單**（只能在控制台改，SSH 進去改沒用）：Ingress Rules 加 `0.0.0.0/0 : 443 (TCP)`。
    只需要 443——Caddy 用 ACME 的 **TLS-ALPN-01** 挑戰簽憑證，不需要 80（`deploy/Caddyfile` 已設 `http_port -1`，完全不監聽 80）。想順便保留 `http://` 自動轉位址才另外開 80。
 2. **OS 層防火牆**：Oracle 的映像會自己鎖 port，實測兩種狀況：
-   - **Ubuntu 24.04 映像**：`iptables INPUT` 預設只放行 22，其餘 `REJECT`。要这样開：
+   - **Ubuntu 24.04 映像**：`iptables INPUT` 預設只放行 22，其餘 `REJECT`。要這樣開：
      ```bash
      for p in 443 80; do sudo iptables -I INPUT -p tcp --dport $p -m state --state NEW -j ACCEPT; done
      sudo netfilter-persistent save      # 不存檔重開機會整個消失
@@ -91,7 +103,7 @@ Oracle 的連線會被擋兩次，兩邊都要開：
      sudo firewall-cmd --permanent --add-service=https && sudo firewall-cmd --reload
      ```
 3. **Docker**：Oracle 的 Platform Commander 映像已內建；Ubuntu 映像沒有，跑 `curl -fsSL https://get.docker.com | sudo sh`，再把使用者加入群組 `sudo usermod -aG docker $USER`（之後要重新登入）。驗證：`docker compose version`。
-4. **公網 IP 建議轉為 Reserved**：免費層的 ephemeral public IP 在实例停止超過 65 天後會被回收，網址會失效。控制台 → Networking → Public IPs → 轉成 reserved。
+4. **公網 IP 建議轉為 Reserved**：免費層的 ephemeral public IP 在實例停止超過 65 天後會被回收，網址會失效。控制台 → Networking → Public IPs → 轉成 reserved。
 
 ### 部署方式一：已有網域（推薦，PWA 完整可用）
 
@@ -135,6 +147,35 @@ docker compose -f docker-compose.yml -f deploy/compose.selfsigned.yml --profile 
 
 瀏覽器會先擋「連線不是私人連線」，選擇繼續後才會有 Service Worker；iOS 需要把 `deploy/certs/triplog.crt` 傳到手機並安裝描述檔、再到「設定 → 一般 → 關於本機 → 證書信任設定」開啟完全信任，否則 Safari 不給用。要長期在多台裝置安裝 PWA，請改用方式一或二。
 
+### 選裝：開啟同步與 AI agent API
+
+要跨裝置同步（或讓 agent 寫資料）時，在 `.env` 多加一把金鑰，其他什麼都不用改：
+
+```bash
+# .env
+TRIPLOG_DOMAIN=你的名字.duckdns.org
+TRIPLOG_API_KEY=<openssl rand -hex 32 的輸出>     # 至少 24 字元，太短容器會拒絕啟動
+TRIPLOG_READ_KEY=<另一把，至少 16 字元>            # 選填：只讀金鑰，給不想給寫入權的場合
+SSH_TARGET=opc@<你的IP> bash deploy/deploy.sh
+```
+
+`deploy.sh` 看到 `TRIPLOG_API_KEY` 就會多掛 `deploy/compose.api.yml`（啟動 `triplog-api` 容器與 SQLite volume，並把 Caddy 的設定換成多一條 `/api/*` 反代的 `deploy/Caddyfile.api`），佈署完會自己 curl 兩項檢查：
+
+- `GET /api/health` 應為 200
+- 不帶金鑰的 `GET /api/base` 應為 401
+
+公網入口仍然只有 443：API 容器用 `expose` 只在 Docker 網路內可見，沒有綁任何 host port，防火牆不需要動靜。金鑰只放 `.env` 與 MCP 客戶端設定，不會透過指令列送到遠端（那樣會被同機其他使用者用 `ps` 看到）。
+
+裝置端打開 app：**設定 → 跨裝置同步**，貼入位址（`https://你的名字.duckdns.org`）與金鑰，按「測試連線」確認讀得到基準檔，再按「立即同步」。之後可以打開自動開關，之後每次啟動 app 且線上時會自己拉一次同步並顯示結果。同一個卡片會列出伺服器上的旅行，可以只拉某一趟。
+
+Agent 端（MCP）請看 [`mcp/README.md`](mcp/README.md)：打包 `npm run mcp:build`，把 `mcp/bin.mjs` 掛進 MCP 客戶端並給 `TRIPLOG_URL` ＋金鑰，就有 14 個讀寫工具；`TRIPLOG_ALLOW_WRITE=0` 是唯讀模式。
+
+資料庫位置：`triplog_data` 這個 named volume 裡的 SQLite（基準檔保留 `TRIPLOG_KEEP` 份歷史快照，預設 20）。要備份整個雲端庫：
+
+```bash
+ssh opc@<你的IP> 'docker run --rm -v triplog_triplog_data:/d -v $PWD:/out alpine tar czf /out/triplog-data.tgz -C /d .'
+```
+
 ### 更新與日常操作
 
 ```bash
@@ -149,8 +190,14 @@ ssh opc@<你的IP> 'cd ~/triplog && sudo docker compose ps'
 curl -I https://<網址>/              # Cache-Control 應為 no-cache
 curl -I https://<網址>/sw.js         # 不應有 max-age
 curl -s https://<網址>/manifest.webmanifest | head -5
+
+# 有開同步／agent API 時再多驗這兩項
+curl -s -o /dev/null -w '%{http_code}\n' https://<網址>/api/health   # 200
+curl -s -o /dev/null -w '%{http_code}\n' https://<網址>/api/base     # 401（沒帶金鑰就讀不到資料）
 ```
 
 ## 尚未做（第二期候補）
 
-跨裝置同步與帳號、同行者分帳清算（目前只記「誰付的」與各人代墊合計）、CSV 匯出、共用唯讀連結、行程項之間的路線連線與距離、照片的地點／時間 EXIF 解析。
+**刪除語意（tombstone）**：目前的同步是合併並集，一端刪掉的記錄會被另一端帶回來，所以 MCP 乾脆不提供刪除。要做的是記「已刪除」標記而不是真的抹掉。
+
+其餘：帳號系統（現在只靠金鑰，一把金鑰＝整個資料庫）、同行者分帳清算（目前只記「誰付的」與各人代墊合計）、CSV 匯出、共用唯讀連結、行程項之間的路線連線與距離、照片的地點／時間 EXIF 解析、PDF 的多趟合併與直排版面。

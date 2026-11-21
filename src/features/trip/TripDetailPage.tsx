@@ -9,6 +9,8 @@ import { ExpensesTab } from '../expenses/ExpensesTab';
 import { StatsTab } from '../stats/StatsTab';
 /** Leaflet 約 40 KB gzip，沒開地圖頁就不必跟著首頻一起載 */
 const MapTab = lazy(() => import('./MapTab').then((m) => ({ default: m.MapTab })));
+/** PDF 文件會順帶拉進地圖擷取（Leaflet），所以連對話框一起延後載入 */
+const PrintDialog = lazy(() => import('./PrintDialog').then((m) => ({ default: m.PrintDialog })));
 import { ExpenseEditor } from '../expenses/ExpenseEditor';
 import { DayItemEditor } from '../itinerary/DayItemEditor';
 import { TripEditor } from '../trips/TripEditor';
@@ -34,6 +36,7 @@ export function TripDetailPage() {
   const [targetExpense, setTargetExpense] = useState<Expense | null>(null);
   const [presetDate, setPresetDate] = useState<string>('');
   const [presetItemId, setPresetItemId] = useState<string | null>(null);
+  const [printing, setPrinting] = useState(false);
 
   const TABS: { id: Tab; label: string }[] = [
     { id: 'plan', label: t('tab.plan') },
@@ -111,6 +114,9 @@ export function TripDetailPage() {
           </div>
         </div>
         <div className="row">
+          <button className="btn btn-sm" onClick={() => setPrinting(true)} title={t('print.title')}>
+            🖨 {t('print.menu')}
+          </button>
           <button className="btn btn-sm" onClick={() => setEditing('trip')}>
             {t('common.edit')}
           </button>
@@ -295,6 +301,18 @@ export function TripDetailPage() {
       ) : null}
       {editing === 'trip' ? (
         <TripEditor trip={trip} onClose={() => setEditing(null)} />
+      ) : null}
+      {printing ? (
+        <Suspense fallback={null}>
+          <PrintDialog
+            trip={trip}
+            items={items}
+            expenses={expenses}
+            categories={categories}
+            summary={summary!}
+            onClose={() => setPrinting(false)}
+          />
+        </Suspense>
       ) : null}
     </>
   );

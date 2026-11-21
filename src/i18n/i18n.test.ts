@@ -11,7 +11,7 @@ const enKeys = Object.keys(en);
 afterEach(() => setLang('zh-Hant'));
 
 describe('字典', () => {
-  it('英文與繁中鍵名完全對應，沒有漏譯也没有多出來的鍵', () => {
+  it('英文與繁中鍵名完全對應，沒有漏譯也沒有多出來的鍵', () => {
     const missing = zhKeys.filter((k) => !(k in en));
     const extra = enKeys.filter((k) => !(k in zh));
     expect(missing).toEqual([]);
@@ -28,7 +28,11 @@ describe('字典', () => {
   });
 
   it('繁中字典不該混入英文單詞佔位（抓還沒翻的中文鍵）', () => {
-    const untranslated = zhKeys.filter((k) => /^[a-z0-9 .,:;/?()&%#-]+$/.test(zh[k]) && !/\d/.test(zh[k]));
+    // 範例網址（sync.baseUrlPlaceholder 那種）本來就是拉丁字，不算漏譯
+    const isUrlLike = (v: string) => /^[a-z][a-z0-9+.-]*:\/\//i.test(v);
+    const untranslated = zhKeys.filter(
+      (k) => /^[a-z0-9 .,:;/?()&%#-]+$/.test(zh[k]) && !/\d/.test(zh[k]) && !isUrlLike(zh[k]),
+    );
     expect(untranslated).toEqual([]);
   });
 });

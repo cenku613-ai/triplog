@@ -311,14 +311,19 @@ export async function setMeta<T>(key: string, value: T): Promise<void> {
 
 /* ------------------------------------------------------- backup / restore */
 
-export async function exportBackup(): Promise<BackupFile> {
+/**
+ * 匯出備份。
+ * `excludePhotos` 給同步用：基準檔每次都要整個送出去，60 張照片的 base64
+ * 會讓請求膨到幾 MB，所以照片改由 `/api/photos` 單獨按需下載。
+ */
+export async function exportBackup(opts: { excludePhotos?: boolean } = {}): Promise<BackupFile> {
   const [trips, dayItems, expenses, categories, metaRows, photoRows] = await Promise.all([
     db.trips.toArray(),
     db.dayItems.toArray(),
     db.expenses.toArray(),
     db.categories.toArray(),
     db.meta.toArray(),
-    db.photos.toArray(),
+    opts.excludePhotos ? Promise.resolve([] as Photo[]) : db.photos.toArray(),
   ]);
   // Blob 進不了 JSON，逐張轉 base64。照片多時會慢幾秒，但只在按匯出時跑一次。
   const photos: BackupPhoto[] = [];

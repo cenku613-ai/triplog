@@ -1,0 +1,52 @@
+name: triplog
+
+# 加上「同步 + MCP」後端的 compose 覆寫檔。用法（在本機跑 deploy/deploy.sh 會自動這樣組）：
+#   docker compose -f docker-compose.yml -f deploy/compose.api.yml [--profile tls] up -d --build
+#
+# 重點：
+# - triplog-api 不對外綁 port，只有 Caddy 透過 container 網路打得進去 → 公網仍然只有 443
+# - caddy 的 Caddyfile 換成 deploy/Caddyfile.api（多一條 /api 反代）
+# - 資料放 named volume triplog_data，重啟容器不會不見
+services:
+  triplog-api:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: triplog-api:latest
+    container_name: triplog-api
+    restart: unless-stopped
+    expose:
+      - "8788"
+    environment:
+      PORT: "8788"
+      TRIPLOG_DATA_DIR: /data
+      # 沒給金鑰時容器會直接 exit，compose 會把它顯示成 restarting
+      TRIPLOG_API_KEY: ${TRIPLOG_API_KEY:-}
+      TRIPLOG_READ_KEY: ${TRIPLOG_READ_KEY:-}
+      TRIPLOG_KEEP: ${TRIPLOG_KEEP:-20}
+      # 只有從別的來源（例如本機 vite）打 API 才需要；同網域走反代時用不到
+      TRIPLOG_ALLOWED_ORIGIN: ${TRIPLOG_ALLOWED_ORIGIN:-}
+      # 寫入限流：一台裝置同步用不完，防止別人拿到網址後狂推
+      TRIPLOG_RATE_WRITE: ${TRIPLOG_RATE_WRITE:-60}
+      TRIPLOG_RATE_READ: ${TRIPLOG_RATE_READ:-600}
+    volumes:
+      - triplog_data:/data
+    networks:
+      - triplog
+
+  caddy:
+    depends_on:
+      - triplog
+      - triplog-api
+    volumes:
+      # 同目標路徑的掛載會被這份蓋掉（compose 以 container path 合併）
+      - ./deploy/Caddyfile.api:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+networks:
+  triplog:
+    driver: bridge
+
+volumes:
+  triplog_data:

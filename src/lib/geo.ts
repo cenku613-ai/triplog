@@ -3,7 +3,7 @@ import { dayIndex } from './dates';
 import { isValidLatLng } from './places';
 
 /**
- * 地圖用的純函數：把「有座標的行程項」整理成畫圖要的形状。
+ * 地圖用的純函數：把「有座標的行程項」整理成畫圖要的形狀。
  * 抽出來是因為 Leaflet 本體在 node 測試裡跑不起來，這層卻需要被驗證。
  */
 
@@ -32,7 +32,7 @@ export interface GeoPoint {
   day: number;
 }
 
-/** 只有 lat/lng 都合法的行程項会上圖 */
+/** 只有 lat/lng 都合法的行程項會上圖 */
 export function geoPoints(items: DayItem[], tripStart: ISODate): GeoPoint[] {
   const out: GeoPoint[] = [];
   for (const item of items) {

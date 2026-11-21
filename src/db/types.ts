@@ -76,7 +76,7 @@ export interface Expense {
 
 /**
  * 行程照片。原圖與縮圖都以 Blob 存在 IndexedDB，不經過伺服器。
- * source='commons' 時一定要留 credit（作者／授權），否則图上看不到出处。
+ * source='commons' 時一定要留 credit（作者／授權），否則圖上看不到出處。
  */
 export interface Photo {
   id: ID;
@@ -104,7 +104,9 @@ export interface BackupPhoto extends Omit<Photo, 'blob' | 'thumb'> {
   thumbData: string;
 }
 
-export type CategoryKind = 'expense' | 'item';export interface Category {
+export type CategoryKind = 'expense' | 'item';
+
+export interface Category {
   id: ID;
   kind: CategoryKind;
   key: string;
@@ -119,14 +121,14 @@ export interface MetaEntry<T = unknown> {
   value: T;
 }
 
-/** 汇率記憶：`${baseCurrency}>${currency}` */
+/** 匯率記憶：`${baseCurrency}>${currency}` */
 export type RateMap = Record<string, number>;
 
 export interface CurrencyDef {
   code: CurrencyCode;
   label: string;
   symbol: string;
-  /** 小數位數，VND/JPy 之类常為 0 */
+  /** 小數位數，VND/JPy 之類常為 0 */
   decimals: number;
 }
 

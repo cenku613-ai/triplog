@@ -1,0 +1,14 @@
+{
+  "name": "triplog-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TripLog 同步後端：PWA 跨裝置同步，同時給 MCP server 讀寫用。零依賴（走 Node 內建 node:sqlite）。",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "smoke": "node test/smoke.mjs"
+  }
+}
