@@ -146,6 +146,14 @@ await check('POST /api/backup 存整份備份', async () => {
   assert.equal(r.json.trimmedPhotos, 0);
   assert.ok(r.json.bytes > 1000);
 });
+await check('內容相同的推送不再佔用一格歷史（只有寫檔時間不同）', async () => {
+  const before = (await api('/api/history')).json.snapshots.length;
+  const r = await api('/api/backup', { method: 'POST', body: { ...fixture(), exportedAt: iso(2) } });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.unchanged, true, `unchanged=${r.json.unchanged}`);
+  const after = (await api('/api/history')).json.snapshots.length;
+  assert.equal(after, before, `歷史從 ${before} 變成 ${after}`);
+});
 await check('GET /api/base 回基準（照片無 base64）', async () => {
   const r = await api('/api/base');
   assert.equal(r.status, 200);

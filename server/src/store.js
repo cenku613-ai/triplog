@@ -91,6 +91,15 @@ function jsonBytes(obj) {
   return Buffer.byteLength(JSON.stringify(obj), 'utf8');
 }
 
+/**
+ * 內容指紋：先抹掉寫檔時間再雜湊，所以「同一份資料、不同時間推」會得到同一個值，
+ * 而任何一列資料的變動（含照片的 base64 有無）都會讓它變。
+ */
+function fingerprint(backup) {
+  const { exportedAt, ...rest } = backup;
+  return crypto.createHash('sha256').update(JSON.stringify(rest), 'utf8').digest('hex');
+}
+
 const emptySnapshot = () => ({
   format: 'triplog-backup',
   version: 1,
@@ -140,8 +149,14 @@ export class Store {
       CREATE INDEX IF NOT EXISTS snapshots_time ON snapshots(exported_at DESC);
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     `);
+    // 舊資料庫補上內容指紋欄位；SQLite 沒有 ADD COLUMN IF NOT EXISTS，重複執行就當它已經有了
+    try {
+      this.db.exec('ALTER TABLE snapshots ADD COLUMN fp TEXT');
+    } catch {
+      /* 欄位已存在 */
+    }
     this._insert = this.db.prepare(
-      'INSERT INTO snapshots (id, exported_at, created_at, source, bytes, payload) VALUES (@id, @exportedAt, @createdAt, @source, @bytes, @payload)',
+      'INSERT INTO snapshots (id, exported_at, created_at, source, bytes, fp, payload) VALUES (@id, @exportedAt, @createdAt, @source, @bytes, @fp, @payload)',
     );
     this._latest = this.db.prepare('SELECT * FROM snapshots ORDER BY exported_at DESC, created_at DESC LIMIT 1');
     this._byId = this.db.prepare('SELECT * FROM snapshots WHERE id = ?');
@@ -166,13 +181,27 @@ export class Store {
     this._metaSet.run('keep', String(n));
   }
 
-  /** @returns {{ id: string, exportedAt: string, bytes: number }} */
+  /**
+   * 寫一筆快照，回傳它的位置與大小。
+   *
+   * 內容和基準一模一樣時（只有寫檔時間不同）直接回傳既有那筆：「立即同步」與開機
+   * 自動同步每次都會推，不擋的話 keep 那 20 格一下就被同一份資料塞滿，真的要回頭
+   * 找舊版本時反而找不到。
+   *
+   * @returns {{ id: string, exportedAt: string, bytes: number, trimmedPhotos: number, unchanged?: boolean }}
+   */
   put(body, { source = 'push' } = {}) {
     const { backup, bytes, trimmedPhotos } = normalizeSnapshot(body);
+    const fp = fingerprint(backup);
+    const head = this._latest.get();
+    // 舊資料列還沒有 fp（補欄位之前的快照），退回用 payload 算一次
+    if (head && (head.fp ?? fingerprint(JSON.parse(head.payload))) === fp) {
+      return { id: head.id, exportedAt: head.exported_at, bytes: head.bytes, unchanged: true, trimmedPhotos };
+    }
     const createdAt = new Date().toISOString();
     let id = backup.exportedAt;
     if (this._byId.get(id)) id = `${backup.exportedAt}#${crypto.randomBytes(3).toString('hex')}`;
-    this._insert.run({ id, exportedAt: backup.exportedAt, createdAt, source, bytes, payload: JSON.stringify(backup) });
+    this._insert.run({ id, exportedAt: backup.exportedAt, createdAt, source, bytes, fp, payload: JSON.stringify(backup) });
     this._prune.run(this.keep);
     return { id, exportedAt: backup.exportedAt, bytes, trimmedPhotos };
   }
