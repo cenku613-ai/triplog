@@ -5,6 +5,8 @@
  * 跑法：TRIPLOG_API_KEY=... node server/test/smoke.mjs（自己長一個臨時資料夾與隨機 port）
  */
 import { spawn } from 'node:child_process';
+import http from 'node:http';
+import crypto from 'node:crypto';
 import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -858,10 +860,338 @@ await check('SSH 救援：cli.js master-reset 讓 .env 那把重回門內', asyn
   assert.match(nothing, /沒有輪換鎖/, '沒鎖的時候要拒絕，不要假裝成功');
 });
 
+/* ============================================================ 帳號模式
+ * 上面跑的都是「金鑰＝單一基準」的既有行為；這一段把同一顆 SQLite 換成
+ * TRIPLOG_AUTH=1 重新開機，驗證 Google 登入、每人一份帳本，以及登入不過時
+ * 各種壞 token 都要被擋在門外。
+ *
+ * Google 的公開金鑰在這裡是本地假的金鑰（自己生 RSA、自己開一個 JWKS 端點），
+ * 但走的是同一條程式碼路徑：只是用 TRIPLOG_GOOGLE_JWKS_URL 把網址換掉，
+ * 產線用的網址與驗簽邏輯一行都沒改。
+ * ====================================================================== */
+
+const AUTH_PORT = PORT + 100;
+const AUTH_BASE = `http://127.0.0.1:${AUTH_PORT}`;
+const JWKS_PORT = PORT + 200;
+const CLIENT_ID = 'smoke-client.apps.googleusercontent.com';
+
+/** 兩把 RSA 私鑰：第二把用來模擬 Google 輪換 kid（快取裡沒有時要重抓） */
+const jwtKeys = [0, 1].map(() => {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  return { privateKey, jwk: publicKey.export({ format: 'jwk' }) };
+});
+const KID = (i) => `smoke-key-${i}`;
+let servedKeys = [0];
+
+const jwksServer = http.createServer((req, res) => {
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ keys: servedKeys.map((i) => ({ kid: KID(i), use: 'sig', alg: 'RS256', ...jwtKeys[i].jwk })) }));
+});
+await new Promise((r) => jwksServer.listen(JWKS_PORT, '127.0.0.1', r));
+
+function idToken(claims, { kid = KID(0), keyIndex = 0, aud = CLIENT_ID, iss = 'https://accounts.google.com' } = {}) {
+  const b64 = (o) => Buffer.from(JSON.stringify(o), 'utf8').toString('base64url');
+  const head = b64({ alg: 'RS256', typ: 'JWT', kid });
+  const now = Math.floor(Date.now() / 1000);
+  const body = b64({ iss, aud, iat: now - 60, exp: now + 3600, email_verified: true, locale: 'zh-Hant', ...claims });
+  const sig = crypto.sign('sha256', Buffer.from(`${head}.${body}`, 'ascii'), jwtKeys[keyIndex].privateKey).toString('base64url');
+  return `${head}.${body}.${sig}`;
+}
+
+function authBoot({ port = AUTH_PORT, rate = '500' } = {}) {
+  const p = spawn(process.execPath, [entry], {
+    env: {
+      ...process.env,
+      TRIPLOG_API_KEY: KEY,
+      TRIPLOG_READ_KEY: READ,
+      TRIPLOG_DATA_DIR: dir,
+      PORT: String(port),
+      TRIPLOG_AUTH: '1',
+      // 這一段每個檢查都要登入一兩次，用預設的 12/分鐘會先打到限流而不是測到功能
+      TRIPLOG_RATE_AUTH: rate,
+      TRIPLOG_GOOGLE_CLIENT_ID: CLIENT_ID,
+      TRIPLOG_GOOGLE_JWKS_URL: `http://127.0.0.1:${JWKS_PORT}/certs`,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  p.stdout.on('data', (d) => logs.push(String(d)));
+  p.stderr.on('data', (d) => logs.push(String(d)));
+  return p;
+}
+
+/** 等某一個 port 起來（既有 waitUp 只認 BASE） */
+async function waitUpAt(base) {
+  for (let i = 0; i < 60; i++) {
+    try {
+      if ((await fetch(`${base}/api/health`)).ok) return;
+    } catch {
+      /* yet */
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error(`server 沒起來：${base}\n${logs.join('')}`);
+}
+
+async function hit(base, p, { method = 'GET', token, body, headers = {} } = {}) {
+  const res = await fetch(`${base}${p}`, {
+    method,
+    headers: {
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...(body ? { 'content-type': 'application/json' } : {}),
+      ...headers,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    /* 空體 */
+  }
+  return { status: res.status, json, text };
+}
+
+/** 登入並回 session；測試裡每個帳號都真的走一次 Google 驗簽，不是塞假 id */
+async function login(claims, opts) {
+  const r = await hit(AUTH_BASE, '/api/auth/google', { method: 'POST', body: { idToken: idToken(claims, opts), device: '冒煙測試' } });
+  assert.equal(r.status, 200, `${r.status} ${r.text}`);
+  return r.json;
+}
+
+// 先在舊的那份基準裡留一趟旅行，才看得到「認領」有沒有發生
+const legacy = await api('/api/backup', { method: 'POST', body: { ...fixture(), exportedAt: iso(30) } });
+assert.equal(legacy.status, 200, legacy.text);
+
+child.kill();
+await new Promise((r) => setTimeout(r, 500));
+child = authBoot();
+await waitUpAt(AUTH_BASE);
+const A2 = (...a) => hit(AUTH_BASE, ...a);
+/** 後面好幾個檢查都要用同一組 session，所以放在外層 */
+let sessionA = '';
+let sessionB = '';
+
+console.log('\n— 帳號模式（Google 登入＋每人一份帳本）');
+
+await check('沒帶任何憑證時直接講「請先用 Google 登入」，不講金鑰那套話', async () => {
+  const cfg = await A2('/api/auth/config');
+  assert.equal(cfg.status, 200, cfg.text);
+  assert.equal(cfg.json.mode, 'account');
+  assert.equal(cfg.json.clientId, CLIENT_ID, '前端要知道該拿哪個 Client ID 叫 Google 的腳本');
+  assert.equal(cfg.json.sessionDays, 30);
+  const denied = await A2('/api/base');
+  assert.equal(denied.status, 401, denied.text);
+  assert.equal(denied.json.login, true);
+  assert.equal(denied.json.reason, 'no-credential');
+  assert.match(denied.json.error, /Google/);
+  const me = await A2('/api/me');
+  assert.equal(me.status, 401, me.text);
+});
+
+await check('Google ID token 換到 session，第一次登入把舊基準認領過來', async () => {
+  const r = await login({ sub: '112233445566778899001', email: 'Ana@Example.com', name: '安娜', picture: 'https://example.com/a.png' });
+  assert.match(r.token, /^tls_/, `session 前綴不對：${r.token}`);
+  assert.equal(r.created, true);
+  assert.equal(r.user.email, 'ana@example.com', '信箱一律洗成小寫，邀請才對得上');
+  assert.equal(r.user.name, '安娜');
+  assert.equal(r.user.id.startsWith('u_'), true);
+  assert.equal(r.user.googleSub, undefined, '回應不要把 Google 的 sub 傳出去');
+  sessionA = r.token;
+  const base = await A2('/api/base', { token: r.token });
+  assert.equal(base.status, 200, base.text);
+  assert.ok(base.json.base.trips.some((t) => t.id === 'trip_a'), '舊資料要跟著人走，不能一登入就變空帳本');
+  const me = await A2('/api/me', { token: r.token });
+  assert.equal(me.json.user.id, r.user.id, me.text);
+});
+
+await check('認領之後，金鑰那條路不再看得到這個人的帳本', async () => {
+  const gone = await A2('/api/base', { token: KEY });
+  assert.equal(gone.status, 404, `基準已被認領，金鑰不該還看得到：${gone.status} ${gone.text}`);
+  const admin = await A2('/api/tokens', { token: KEY });
+  assert.equal(admin.status, 200, admin.text);
+  assert.ok(Array.isArray(admin.json.tokens), '主金鑰仍保有管理端點（救援用）');
+});
+
+await check('第二個帳號有自己的空帳本，寫進去的東西不會出現別人的清單上', async () => {
+  const b = await login({ sub: '998877665544332211009', email: 'bo@example.com', name: 'Bo' });
+  sessionB = b.token;
+  const empty = await A2('/api/base', { token: b.token });
+  assert.equal(empty.status, 404, '新帳號不該看到 Ana 的資料');
+  const push = await A2('/api/backup', { method: 'POST', token: b.token, body: { format: 'triplog-backup', exportedAt: iso(31), trips: [{ id: 'trip_z', name: 'Bo 的祕密行程', startDate: '2026-06-01', endDate: '2026-06-02', updatedAt: iso(31), createdAt: iso(31) }], dayItems: [], expenses: [], categories: [], photos: [], meta: [] } });
+  assert.equal(push.status, 200, push.text);
+  const mineB = await A2('/api/trips', { token: b.token });
+  assert.deepEqual(mineB.json.trips.map((t) => t.id), ['trip_z'], mineB.text);
+  const mineA = await A2('/api/trips', { token: sessionA });
+  assert.equal(mineA.json.trips.some((t) => t.id === 'trip_z'), false, '跨帳號看到了別人的行程');
+  assert.ok(mineA.json.trips.some((t) => t.id === 'trip_a'), mineA.text);
+});
+
+await check('同一個 Google 帳號再登入不會生出第二個帳本，也不會多一個 people 列', async () => {
+  const again = await login({ sub: '112233445566778899001', email: 'ana@example.com', name: '安娜改的名' });
+  assert.equal(again.created, false);
+  assert.equal(again.user.id, (await A2('/api/me', { token: sessionA })).json.user.id, '同一個 sub 必須落在同一個帳號 id');
+  assert.equal(again.user.name, '安娜改的名', '顯示名要跟著 Google 更新');
+  const trips = await A2('/api/trips', { token: again.token });
+  assert.ok(trips.json.trips.some((t) => t.id === 'trip_a'), '重新登入後還是要看得到自己的資料');
+  const health = await A2('/api/health');
+  assert.equal(health.json.auth.mode, 'account');
+  assert.equal(health.json.users, 2, `不該多出第三個帳號：${JSON.stringify(health.json.users)}`);
+});
+
+await check('壞掉的 ID token 一律進不來：簽章、aud、iss、過期、alg none、亂塞', async () => {
+  const good = { sub: '556677889900112233445', email: 'eve@example.com' };
+  const tampered = (() => {
+    const t = idToken(good);
+    const [h, b, s] = t.split('.');
+    const flipped = s.slice(0, -2) + (s.endsWith('A') ? 'BB' : 'AA');
+    return `${h}.${b}.${flipped}`;
+  })();
+  const cases = [
+    [tampered, 401, /簽章/],
+    [idToken(good, { aud: 'someone-else.example' }), 401, /不是發給這個應用/],
+    [idToken(good, { iss: 'https://evil.example.com' }), 401, /不是 Google 簽發/],
+    [idToken({ ...good, exp: Math.floor(Date.now() / 1000) - 3600 }), 401, /已過期/],
+    [idToken({ ...good, email_verified: false }), 403, /尚未驗證/],
+    [idToken({ ...good, sub: '短' }), 401, /識別碼/],
+    ['not-a-jwt', 400, /ID token|JWT|格式/],
+    [`${Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT', kid: KID(0) })).toString('base64url')}.${Buffer.from(JSON.stringify({ ...good, iss: 'https://accounts.google.com', aud: CLIENT_ID, exp: Math.floor(Date.now() / 1000) + 600 })).toString('base64url')}.`, 401, /RS256/],
+  ];
+  for (const [token, status, re] of cases) {
+    const r = await A2('/api/auth/google', { method: 'POST', body: { idToken: token } });
+    assert.equal(r.status, status, `${String(token).slice(0, 24)}… → ${r.status} ${r.text}`);
+    assert.match(r.json.error, re, r.text);
+    assert.equal(r.json.login, true, '登入失敗要帶著 login 旗號，前端才知道要顯示登入鈕');
+  }
+  const noClient = await A2('/api/auth/google', { method: 'POST', body: {} });
+  assert.equal(noClient.status, 400, noClient.text);
+  const noEmail = await A2('/api/auth/google', { method: 'POST', body: { idToken: idToken({ sub: '112233445566778899007' }) } });
+  assert.equal(noEmail.status, 400, noEmail.text);
+  assert.match(noEmail.json.error, /信箱/);
+});
+
+await check('Google 輪換 kid：快取裡沒有這把時重抓一次，登入照樣過', async () => {
+  servedKeys = [0, 1];
+  const r = await login({ sub: '334455667788990011223', email: 'kid@example.com' }, { kid: KID(1), keyIndex: 1 });
+  assert.match(r.token, /^tls_/);
+  const gone = await A2('/api/auth/google', { method: 'POST', body: { idToken: idToken({ sub: '334455667788990011224', email: 'ghost@example.com' }, { kid: 'unknown-kid', keyIndex: 1 }) } });
+  assert.equal(gone.status, 401, gone.text);
+  assert.match(gone.json.error, /公鑰/, '查無公鑰要講得跟簽章錯不一樣');
+});
+
+await check('登出只斷這一條 session，其他裝置照常用', async () => {
+  // 同一個帳號在「另一台裝置」上再登一次，才能看出登出是不是只斷手上這條
+  await login({ sub: '998877665544332211009', email: 'bo@example.com', name: 'Bo' });
+  const list = await A2('/api/auth/sessions', { token: sessionB });
+  assert.equal(list.status, 200, list.text);
+  assert.ok(list.json.sessions.length >= 2, `B 應該有兩條登入紀錄：${list.text}`);
+  assert.equal(list.json.sessions[0].sessionHash, undefined, '清單不能出現雜湊');
+  assert.equal(JSON.stringify(list.json).includes('tls_'), false, '回應裡不能出現任何完整 token');
+  const mine = list.json.sessions[0];
+  const out = await A2('/api/auth/logout', { method: 'POST', token: sessionB });
+  assert.equal(out.status, 200, out.text);
+  assert.equal(out.json.revoked, true);
+  const dead = await A2('/api/base', { token: sessionB });
+  assert.equal(dead.status, 401, dead.text);
+  assert.equal(dead.json.reason, 'revoked-session');
+  const other = await login({ sub: '998877665544332211009', email: 'bo@example.com', name: 'Bo' });
+  const stillWorks = await A2('/api/trips', { token: other.token });
+  assert.equal(stillWorks.status, 200, stillWorks.text);
+  assert.deepEqual(stillWorks.json.trips.map((t) => t.id), ['trip_z'], '新 login 的 session 要看得到 B 自己的帳本');
+  const revokeOther = await A2('/api/auth/sessions/revoke', { method: 'POST', token: other.token, body: { allExceptThis: true } });
+  assert.equal(revokeOther.status, 200, revokeOther.text);
+  assert.ok(revokeOther.json.removed >= 1);
+  const after = await A2('/api/auth/sessions', { token: other.token });
+  assert.equal(after.json.sessions.filter((s) => !s.revokedAt).length, 1, '退出其他裝置後只剩手上這條');
+  const gone2 = await A2('/api/base', { token: sessionB });
+  assert.equal(gone2.status, 401, '已登出的那條不能因為別人重新登入就活回來');
+  const stolen = await A2('/api/auth/sessions/revoke', { method: 'POST', token: sessionA, body: { id: after.json.sessions[0].id } });
+  assert.equal(stolen.status, 404, '不能撤銷別人的 session');
+});
+
+await check('Google 的公鑰抓不到時是 502，絕不當成登入成功', async () => {
+  servedKeys = [0, 1];
+  const before = await login({ sub: '445566778899001122334', email: 'up@example.com' });
+  assert.match(before.token, /^tls_/);
+  jwksServer.close();
+  await new Promise((r) => setTimeout(r, 200));
+  const down = await A2('/api/auth/google', {
+    method: 'POST',
+    // 快取裡沒這個 kid，一定要出門抓公鑰才會知道伺服器掛了
+    body: { idToken: idToken({ sub: '445566778899001122335', email: 'down@example.com' }, { kid: 'brand-new-kid' }) },
+  });
+  assert.equal(down.status, 502, down.text);
+  assert.match(down.json.error, /公鑰/);
+  const stillIn = await A2('/api/trips', { token: sessionA });
+  assert.equal(stillIn.status, 200, 'Google 掛了不該把已登入的裝置一起擋在門外');
+  const h = await A2('/api/health');
+  assert.equal(h.status, 200, '抓不到公鑰不能把整個服務拖下水');
+});
+
+await check('登入限流：打爆就 429，而且發不出 token，已登入的裝置不受影響', async () => {
+  // 另開一台（獨立的空資料夾）專測限流：預設那台給了 500/分鐘，功能檢查才不會先被擋
+  const tightDir = mkdtempSync(path.join(os.tmpdir(), 'triplog-smoke-rate-'));
+  const tightBase = `http://127.0.0.1:${AUTH_PORT + 50}`;
+  const tight = spawn(process.execPath, [entry], {
+    env: {
+      ...process.env,
+      TRIPLOG_API_KEY: KEY,
+      TRIPLOG_READ_KEY: READ,
+      TRIPLOG_DATA_DIR: tightDir,
+      PORT: String(AUTH_PORT + 50),
+      TRIPLOG_AUTH: '1',
+      TRIPLOG_RATE_AUTH: '3',
+      TRIPLOG_GOOGLE_CLIENT_ID: CLIENT_ID,
+      TRIPLOG_GOOGLE_JWKS_URL: `http://127.0.0.1:${JWKS_PORT}/certs`,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  tight.stdout.on('data', (d) => logs.push(String(d)));
+  tight.stderr.on('data', (d) => logs.push(String(d)));
+  try {
+    await waitUpAt(tightBase);
+    const tries = [];
+    for (let i = 0; i < 4; i++) {
+      // JWKS 已在上一個檢查關掉，這裡要斷的是「有沒有被限流」，不是登入成不成功
+      tries.push(await hit(tightBase, '/api/auth/google', { method: 'POST', body: { idToken: idToken({ sub: `ratelimit${i}sub`, email: `r${i}@example.com` }) } }));
+    }
+    assert.equal(tries[3].status, 429, `第四次就該被擋：${tries[3].status} ${tries[3].text}`);
+    assert.equal(tries[3].json.login, true, tries[3].text);
+    assert.ok(!tries[3].json.token, '被限流時絕對不能發出 token');
+    assert.match(tries[3].json.error, /一分鐘/);
+    const data = await hit(tightBase, '/api/base', { token: sessionA });
+    assert.notEqual(data.status, 429, '登入端點被洪水打，不該讓已登入的裝置連資料都讀不到');
+  } finally {
+    tight.kill();
+    await new Promise((r) => setTimeout(r, 400));
+    try {
+      rmSync(tightDir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      /* Windows 的 WAL 鎖而已 */
+    }
+  }
+});
+
+child.kill();
+await new Promise((r) => setTimeout(r, 500));
+child = boot();
+child.stdout.on('data', (d) => logs.push(String(d)));
+for (let i = 0; i < 60; i++) {
+  try {
+    if ((await fetch(`${BASE}/api/health`)).ok) break;
+  } catch {
+    /* yet */
+  }
+  await new Promise((r) => setTimeout(r, 200));
+}
+await check('切回金鑰模式後，帳號寫進去的那份資料不會變相公開', async () => {
+  const r = await api('/api/base');
+  assert.equal(r.status, 404, `金鑰看到的是空的 '' 分帳，不該撿到帳號的資料：${r.status} ${r.text}`);
+});
+
 child.kill();
 // Windows 上 WAL 檔會多鎖一下，清不掉不影響測試結果
-await new Promise((r) => setTimeout(r, 800));
-try {
+await new Promise((r) => setTimeout(r, 800));try {
   rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
 } catch (err) {
   console.log(`(cleanup skipped: ${err.code})`);

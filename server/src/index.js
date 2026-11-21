@@ -33,6 +33,15 @@ import {
   pairingStatus,
 } from './keys.js';
 import { send, fail, tokenEquals, bearer, readJsonBody, rateLimiter, clientIp, applyCors } from './net.js';
+import {
+  AuthError,
+  SESSION_TTL_DAYS,
+  looksLikeSession,
+  newSession,
+  sessionExpiresAt,
+  sessionStatus,
+  verifyIdToken,
+} from './auth.js';
 
 const VERSION = '0.1.0';
 const PORT = Number(process.env.PORT ?? process.env.TRIPLOG_API_PORT ?? 8788);
@@ -47,6 +56,18 @@ const ALLOWED_ORIGIN = (process.env.TRIPLOG_ALLOWED_ORIGIN ?? '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
+/**
+ * 帳號模式：登入成為唯一入口，每個 Google 帳號一份自己的基準檔。
+ * 預設關——還沒配好 OAuth 的部署（以及現在的生產伺服器）行為跟以前一模一樣，
+ * 所有資料都落在 '' 那個「單一基準」分帳。開啟時要有 Client ID，否則啟動就中止，
+ * 所以我寧可在開機時就把話講清楚。
+ */
+const AUTH_MODE = ['1', 'true', 'yes', 'on'].includes(String(process.env.TRIPLOG_AUTH ?? '').trim().toLowerCase());
+const GOOGLE_CLIENT_ID = (process.env.TRIPLOG_GOOGLE_CLIENT_ID ?? '').trim();
+/** 帳號模式下是否還讓主金鑰／tlk_ 憑證進得來（預設留著當救援與 agent 通道） */
+const KEYS_ALLOWED = !['0', 'false', 'no', 'off'].includes(String(process.env.TRIPLOG_AUTH_ALLOW_KEYS ?? '').trim().toLowerCase());
+/** 一條 session 的有效期（天）：常用裝置會滑動續期，所以它其實是「多久沒上線就要重新登入」 */
+const SESSION_DAYS = Math.min(Math.max(Number(process.env.TRIPLOG_SESSION_DAYS ?? SESSION_TTL_DAYS) || SESSION_TTL_DAYS, 1), 365);
 
 function die(msg) {
   console.error(`[triplog-api] ${msg}`);
@@ -58,6 +79,9 @@ if (WRITE_KEY.length < 24) {
 }
 if (READ_KEY.length < 16) {
   die('TRIPLOG_READ_KEY 太短，不適合當讀取金鑰。');
+}
+if (AUTH_MODE && !GOOGLE_CLIENT_ID) {
+  die('TRIPLOG_AUTH 開了但沒給 TRIPLOG_GOOGLE_CLIENT_ID：拿不到 Google 的 Client ID 就沒人登得了入。');
 }
 
 const store = openStore(DATA_DIR);
@@ -71,6 +95,8 @@ const limitShareRead = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_SHARE_
 const limitShareWrite = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_SHARE_WRITE ?? 30), windowMs: 60_000 });
 // 配對碼是 8 個字（約 40 位熵）的一次性憑證，要靠限流撐住猜的攻擊：一台一分鐘 8 次
 const limitPair = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_PAIR ?? 8), windowMs: 60_000 });
+// 登入端點拿到的是「別人簽的好憑證」，能猜的只有我們自己的實作瑕疵；限流是擋洪水不是擋破解
+const limitAuth = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_AUTH ?? 12), windowMs: 60_000 });
 
 /* -------------------------------------------------------------- 資料視圖 */
 
@@ -195,6 +221,8 @@ const SCHEMA_HINT = {
     'API tokens: POST /api/tokens {label,scope:read|write,expiresInDays} mints a revocable bearer (shown once, stored hashed); GET /api/tokens lists them and POST /api/tokens/revoke {id} retires one. Minting, listing, revoking and POST /api/admin/clear all require the master TRIPLOG_API_KEY — an issued token can never mint or wipe.',
     'Pairing (no long key on the new device): POST /api/tokens/pairings {label,scope,expiresInMinutes<=120} (master only) returns an 8-char code shown once; the new device posts it to POST /api/pair {code,device} without any bearer and receives a fresh token (365 days). Codes are single-use, expire, and can be voided with POST /api/tokens/pairings/revoke {id}; GET /api/tokens/pairings lists them.',
     'Master key lifecycle: GET /api/tokens/master reports whether the key was rotated (once rotated, the .env TRIPLOG_API_KEY and TRIPLOG_READ_KEY stop being accepted). POST /api/tokens/master/rotate {confirm:"rotate-master"} returns the new key once; it refuses unless at least one live token exists (or confirm:"rotate-master-no-backup") so you cannot lock yourself out. Rolling back needs SSH: node server/src/cli.js master-reset.',
+    'Accounts (only when the server runs with TRIPLOG_AUTH=1): GET /api/auth/config tells you the Google OAuth client id; POST /api/auth/google {idToken} exchanges a Google ID token for a tls_ session (first login claims the pre-account data); GET /api/auth/me and /api/auth/sessions use it; POST /api/auth/logout {id?} retires one session. Bearer slot takes the tls_ session or a tlk_/master key alike.',
+    'Tenancy: every read, write, stats and share call is scoped to the authenticated account. Sessions see that person\'s own ledger; the master key and tlk_ agent tokens see the legacy ledger (the one the app used before accounts existed), which is empty once somebody has claimed it. Check GET /api/health for auth.mode.',
   ],
 };
 
@@ -213,9 +241,16 @@ async function route(req, res) {
   const resource = parts[1] ?? '';
 
   if (resource === 'health') {
-    const s = store.stats();
+    const s = store.statsAll();
     // masterRotated 只是個布林：讓部署完的自查能看出「現在吃的是資料庫裡那把，不是 .env」
-    return send(res, 200, { ok: true, version: VERSION, hasData: !!s.head, masterRotated: !!store.masterHash(), ...s });
+    return send(res, 200, {
+      ok: true,
+      version: VERSION,
+      hasData: !!s.head,
+      masterRotated: !!store.masterHash(),
+      auth: { mode: AUTH_MODE ? 'account' : 'key', clientId: AUTH_MODE ? GOOGLE_CLIENT_ID : null, keysAllowed: !AUTH_MODE || KEYS_ALLOWED },
+      ...s,
+    });
   }
   if (resource === 'schema') {
     return send(res, 200, { ok: true, version: VERSION, schema: SCHEMA_HINT });
@@ -229,30 +264,22 @@ async function route(req, res) {
   if (resource === 'pair') {
     return handlePair(req, res, clientIp(req));
   }
-
-  const key = bearer(req);
-  /**
-   * 主金鑰的定義權在資料庫：輪換過一次，就以存進去的雜湊為準，`.env` 那把（連同只讀鑰）
-   * 當場失效。這樣「換鑰」才真的能把外流的舊鑰擋在門外；要退回 .env 只能從 SSH
-   * （`node server/src/cli.js master-reset`），刻意不給 HTTP 路徑——否則拿到舊鑰的人
-   * 也能把輪換取消。
-   */
-  const storedMaster = store.masterHash();
-  const isMaster = storedMaster ? matchesHash(key, storedMaster) : tokenEquals(key, WRITE_KEY);
-  const isBootstrapReadable = !storedMaster && tokenEquals(key, READ_KEY);
-  const isMasterReadable = isMaster || isBootstrapReadable;
-  /** 從 app「設定 → 金鑰與裝置」簽發出來的那種：自帶層級與期限，能單獨作廢 */
-  let issued = null;
-  if (!isMasterReadable && looksLikeApiToken(key)) {
-    const row = store.apiTokenByHash(hashToken(key));
-    if (row && tokenStatus(row).live) issued = row;
+  // 登入相關：config 是公開的（前端要知道該不該顯示登入鈕），其餘自己判斷有無 session
+  if (resource === 'auth' || resource === 'me') {
+    const action = resource === 'me' ? 'me' : [parts[2], parts[3]].filter(Boolean).join('/');
+    return handleAuth(req, res, action, clientIp(req));
   }
-  const canRead = isMasterReadable || issued !== null;
-  const canWrite = isMaster || (issued !== null && scopeAllows(issued.scope, 'write'));
+
+  const { uid, isMaster, issued, canRead, canWrite, reason } = resolveAuth(req);
   if (!canRead) {
+    // 「還沒登入」與「金鑰不對」要分開講：前者缺的是登入鈕，後者缺的是正確的憑證
+    if (AUTH_MODE && reason !== 'bad-credential') {
+      return fail(res, 401, '請先用 Google 登入', { login: true, reason, mode: 'account' });
+    }
     return fail(res, 401, 'missing or wrong bearer token', {
       need: 'TRIPLOG_API_KEY（主金鑰）、TRIPLOG_READ_KEY（只讀）或一把 tlk_ 開頭的憑證',
-      rotated: !!storedMaster,
+      rotated: !!store.masterHash(),
+      ...(AUTH_MODE ? { mode: 'account' } : {}),
     });
   }
 
@@ -261,19 +288,19 @@ async function route(req, res) {
   // 通過限流才算一次真實使用，被擋掉的洪水不進統計；寫入在下面另外記一筆（含 writes）
   if (issued && req.method === 'GET') store.touchApiToken(issued.id);
 
-  const { snapshot } = store.base();
+  const { snapshot } = store.base(uid);
 
   /* ------------------------------------------------------------- 讀取端 */
   if (req.method === 'GET') {
     if (resource === 'base') {
-      const stats = store.stats();
+      const stats = store.stats(uid);
       // 「還沒有基準」用 404 表達：客戶端第一次同步時會把它當成「本機就是基準」直接推上去
       if (!stats.head) return fail(res, 404, 'no snapshot yet');
       const base = lite(snapshot);
       return send(res, 200, { ok: true, base, bytes: Buffer.byteLength(JSON.stringify(base)), head: stats.head, counts: counts(snapshot) });
     }
     if (resource === 'history') {
-      return send(res, 200, { ok: true, snapshots: store.list({ limit: Number(url.searchParams.get('limit') ?? 20) }) });
+      return send(res, 200, { ok: true, snapshots: store.list({ uid, limit: Number(url.searchParams.get('limit') ?? 20) }) });
     }
     if (resource === 'trips' && parts.length === 2) {
       const trips = (snapshot.trips ?? [])
@@ -334,7 +361,7 @@ async function route(req, res) {
     }
     if (resource === 'shares') {
       const tripId = url.searchParams.get('tripId');
-      return send(res, 200, { ok: true, shares: store.listShares(tripId || null) });
+      return send(res, 200, { ok: true, shares: store.listShares({ tripId: tripId || null, uid }) });
     }
     if (resource === 'tokens' && parts[2] === 'pairings') {
       // 配對碼清單等于「誰還能換到憑證」的名單，同樣只給主金鑰看
@@ -384,7 +411,7 @@ async function route(req, res) {
 
   if (resource === 'backup') {
     try {
-      const saved = store.put(body, { source: 'push' });
+      const saved = store.put(body, { uid, source: 'push' });
       return send(res, 200, { ok: true, ...saved, savedAt: saved.exportedAt });
     } catch (err) {
       return fail(res, err.message?.includes('too large') ? 413 : 400, String(err.message ?? err), {});
@@ -394,8 +421,8 @@ async function route(req, res) {
   if (resource === 'sync') {
     // 客戶端只送「它碰過的資料」，伺服器併進基準後回傳完整基準，避免整檔覆寫 race
     try {
-      const saved = store.put({ ...body, format: 'triplog-backup', exportedAt: new Date().toISOString() }, { source: 'sync' });
-      const merged = store.base().snapshot;
+      const saved = store.put({ ...body, format: 'triplog-backup', exportedAt: new Date().toISOString() }, { uid, source: 'sync' });
+      const merged = store.base(uid).snapshot;
       return send(res, 200, { ok: true, saved, merged: counts(merged), base: lite(merged) });
     } catch (err) {
       return fail(res, 400, String(err.message ?? err), {});
@@ -514,16 +541,17 @@ async function route(req, res) {
       return fail(res, err.status ?? 400, String(err.message ?? err), {});
     }
     const label = typeof body?.label === 'string' && body.label.trim() ? body.label.trim().slice(0, 60) : trip.name;
-    return send(res, 200, { ok: true, share: store.createShare({ tripId, label, expiresAt }) });
+    return send(res, 200, { ok: true, share: store.createShare({ tripId, label, expiresAt, uid }) });
   }
 
   if (resource === 'shares' && parts[2] === 'revoke') {
     const token = String(body?.token ?? '');
-    const changed = store.revokeShare(token);
     const row = store.share(token);
-    if (!row) return fail(res, 404, '找不到這個分享連結', {});
+    if (!row || row.uid !== uid) return fail(res, 404, '找不到這個分享連結', {});
+    // 只能作廢自己帳本裡的連結：帳號模式下別人手拿同一把 token 也動不了它
+    const changed = store.revokeShare(token, uid);
     // 已經作廢過再按一次也不算錯：按下去要的就是「這個連結沒了」的狀態
-    return send(res, 200, { ok: true, revoked: true, changed, share: row });
+    return send(res, 200, { ok: true, revoked: true, changed, share: store.share(token) });
   }
 
   if (resource === 'admin' && parts[2] === 'clear') {
@@ -534,6 +562,179 @@ async function route(req, res) {
     }
     const removed = store.clear();
     return send(res, 200, { ok: true, ...removed });
+  }
+
+  return fail(res, 404, 'not found', {});
+}
+
+/**
+ * 這個請求屬於誰的帳本。
+ *
+ * 兩種模式差的是「誰能進來」，不差「資料怎麼放」：
+ * - 金鑰模式（TRIPLOG_AUTH 未開）：主金鑰／只讀鑰／tlk_ 憑證，全部讀寫 '' 那個分帳，
+ *   行為跟帳號制度出現之前完全一樣。
+ * - 帳號模式：只認自己簽的 session（tls_），每個人一份基準檔。主金鑰與憑證預設還進得來，
+ *   但它們看到的仍是 '' 那份——那是救援與 agent 的通道，不是某個人的帳本；不想留這條路
+ *   就設 TRIPLOG_AUTH_ALLOW_KEYS=0（屆時只能從 SSH 處理資料）。
+ *
+ * 主金鑰的定義權在資料庫：輪換過一次，就以存進去的雜湊為準，`.env` 那把（連同只讀鑰）
+ * 當場失效。這樣「換鑰」才真的能把外流的舊鑰擋在門外；要退回 .env 只能從 SSH
+ * （`node server/src/cli.js master-reset`），刻意不給 HTTP 路徑——否則拿到舊鑰的人
+ * 也能把輪換取消。
+ *
+ * @returns {{ uid: string, canRead: boolean, canWrite: boolean, isMaster: boolean, issued: any, session: any, user: any, reason: 'ok' | 'no-credential' | 'bad-credential' | 'expired-session' | 'revoked-session' }}
+ */
+function resolveAuth(req) {
+  const key = bearer(req);
+  const storedMaster = store.masterHash();
+  const isMaster = storedMaster ? matchesHash(key, storedMaster) : tokenEquals(key, WRITE_KEY);
+  const isBootstrapReadable = !storedMaster && tokenEquals(key, READ_KEY);
+  const isMasterReadable = isMaster || isBootstrapReadable;
+  /** 從 app「設定 → 金鑰與裝置」簽發出來的那種：自帶層級與期限，能單獨作廢 */
+  let issued = null;
+  if (!isMasterReadable && looksLikeApiToken(key)) {
+    const row = store.apiTokenByHash(hashToken(key));
+    if (row && tokenStatus(row).live) issued = row;
+  }
+  const keysAllowed = !AUTH_MODE || KEYS_ALLOWED;
+  const deny = (reason) => ({ uid: '', canRead: false, canWrite: false, isMaster: false, issued: null, session: null, user: null, reason });
+
+  if (keysAllowed && (isMasterReadable || issued)) {
+    return {
+      uid: '',
+      canRead: true,
+      canWrite: isMaster || scopeAllows(issued?.scope, 'write'),
+      isMaster,
+      issued,
+      session: null,
+      user: null,
+      reason: 'ok',
+    };
+  }
+
+  if (AUTH_MODE && looksLikeSession(key)) {
+    const row = store.sessionByHash(hashSecret(key));
+    if (!row) return deny('bad-credential');
+    const st = sessionStatus(row);
+    if (st.live) {
+      store.touchSession(row.id);
+      // 滑動續期：過了一半就延一次，常用裝置不會在第 30 天當場被踢出登入
+      if (st.renew) store.extendSession(row.id, sessionExpiresAt(SESSION_DAYS));
+      const user = store.user(row.userId);
+      if (!user) return deny('bad-credential');
+      return { uid: user.id, canRead: true, canWrite: true, isMaster: false, issued: null, session: row, user, reason: 'ok' };
+    }
+    return deny(st.reason === 'revoked' ? 'revoked-session' : 'expired-session');
+  }
+
+  return deny(key ? 'bad-credential' : 'no-credential');
+}
+
+/**
+ * 登入與「我是誰」：`/api/auth/*` 與 `/api/me`。
+ *
+ * 為什麼後端要自己再驗一次 Google 的 ID token：前端傳來的任何字串都不能直接當成身分。
+ * 驗簽（auth.js）才是「這個 sub 真的由 Google 簽發」的依據，繞過它等於讓任何人憑空捏一個帳號。
+ *
+ * 第一次登入的帳號會把帳號制度之前的那份單一基準認領過來（claimLegacyBase）：
+ * 沒有這一步，老使用者一登入就看到空帳本，舊資料變成沒人拿得到的孤兒。
+ */
+async function handleAuth(req, res, action, ip) {
+  if (action === 'config') {
+    // 公開：前端要知道這台部署該不該顯示登入鈕、拿哪個 Client ID 去叫 Google 的腳本
+    return send(res, 200, {
+      ok: true,
+      mode: AUTH_MODE ? 'account' : 'key',
+      provider: 'google',
+      clientId: GOOGLE_CLIENT_ID || null,
+      sessionDays: SESSION_DAYS,
+      keysAllowed: !AUTH_MODE || KEYS_ALLOWED,
+    });
+  }
+
+  const auth = resolveAuth(req);
+  const user = auth.user;
+
+  if (action === 'me' || !action) {
+    if (user) {
+      return send(res, 200, { ok: true, mode: 'account', user, session: { id: auth.session.id, expiresAt: auth.session.expiresAt } });
+    }
+    if (!AUTH_MODE) {
+      // 金鑰模式下「我是誰」就是「這台吃的是單一基準」：讓客戶端能問得出模式
+      return send(res, 200, { ok: true, mode: 'key', user: null, authenticated: auth.canRead });
+    }
+    return fail(res, 401, '請先用 Google 登入', { login: true, reason: auth.reason });
+  }
+
+  if (action === 'google') {
+    if (req.method !== 'POST') return fail(res, 405, 'method not allowed', {});
+    if (!AUTH_MODE) return fail(res, 404, '這台伺服器沒開帳號登入（用金鑰即可）', { mode: 'key' });
+    if (!limitAuth(ip)) return fail(res, 429, '登入嘗試太多，請一分鐘後再試', { retryAfterMs: 60_000, login: true });
+    let body = null;
+    try {
+      body = await readJsonBody(req, MAX_SHARE_BODY);
+    } catch (err) {
+      return fail(res, err.status ?? 400, err.message, {});
+    }
+    let profile;
+    try {
+      profile = await verifyIdToken(String(body?.idToken ?? ''), { clientId: GOOGLE_CLIENT_ID });
+    } catch (err) {
+      if (!(err instanceof AuthError)) console.error('[triplog-api] 登入時炸了：', err);
+      return fail(res, err instanceof AuthError ? err.status : 502, String(err?.message ?? '登入失敗'), { login: true });
+    }
+    const known = store.userBySub(profile.sub);
+    const firstAccount = !known && store.countUsers() === 0;
+    let row = known ?? store.createUser(profile);
+    row = store.touchLogin(row.id, profile) ?? row;
+    if (firstAccount) {
+      const { moved } = store.claimLegacyBase(row.id);
+      if (moved) console.log(`[triplog-api] 舊基準已認領給 ${row.email}（${moved} 筆快照）`);
+    }
+    const sess = newSession(SESSION_DAYS);
+    const session = store.insertSession({
+      id: sess.id,
+      hash: sess.hash,
+      userId: row.id,
+      label: tokenLabel(body?.device, '', 40),
+      expiresAt: sess.expiresAt,
+    });
+    // 完整 token 只在這一次回應出現；之後資料庫只有雜湊，遺失裝置就在這裡單獨撤銷
+    return send(res, 200, { ok: true, token: sess.secret, user: row, session, expiresInDays: SESSION_DAYS, created: !known });
+  }
+
+  // 下面都需要一條有效的 session
+  if (!user) return fail(res, 401, '請先用 Google 登入', { login: true, reason: auth.reason });
+
+  if (action === 'logout') {
+    if (req.method !== 'POST') return fail(res, 405, 'method not allowed', {});
+    const changed = store.revokeSession(auth.session.id, user.id);
+    return send(res, 200, { ok: true, revoked: changed });
+  }
+
+  if (action === 'sessions') {
+    if (req.method !== 'GET') return fail(res, 405, 'method not allowed', {});
+    return send(res, 200, { ok: true, sessions: store.listSessions(user.id) });
+  }
+
+  if (action === 'sessions/revoke') {
+    if (req.method !== 'POST') return fail(res, 405, 'method not allowed', {});
+    let body = null;
+    try {
+      body = await readJsonBody(req, MAX_SHARE_BODY);
+    } catch (err) {
+      return fail(res, err.status ?? 400, err.message, {});
+    }
+    if (body?.allExceptThis === true) {
+      const removed = store.revokeOtherSessions(user.id, auth.session.id);
+      return send(res, 200, { ok: true, revoked: true, removed });
+    }
+    const id = String(body?.id ?? '');
+    const changed = store.revokeSession(id, user.id);
+    // 不屬於自己的 id 與不存在的 id 都回 404：不拿別人的 session id 探測什麼存在
+    const row = store.session(id);
+    if (!row || row.userId !== user.id) return fail(res, 404, '找不到這條登入紀錄', {});
+    return send(res, 200, { ok: true, revoked: true, changed, session: row });
   }
 
   return fail(res, 404, 'not found', {});
@@ -605,7 +806,8 @@ async function handleShare(req, res, tokenPart, action) {
   const ip = clientIp(req);
   if (!limitShareRead(`${token}|${ip}`)) return fail(res, 429, 'too many requests', { retryAfterMs: 60_000 });
 
-  const { snapshot, head } = store.base();
+  // 連結屬於誰的帳本，就讀誰的基準檔：帳號模式下每個人的資料互不相通
+  const { snapshot, head } = store.base(share.uid);
 
   if (req.method === 'GET' && !action) {
     store.touchShare(token);
@@ -638,7 +840,7 @@ async function handleShare(req, res, tokenPart, action) {
     } catch (err) {
       return fail(res, err instanceof ShareError ? err.status : 400, String(err.message ?? err), {});
     }
-    const saved = store.put(partialOf(table, row), { source: 'share' });
+    const saved = store.put(partialOf(table, row), { uid: share.uid, source: 'share' });
     store.touchShare(token, { write: true });
     return send(res, 200, { ok: true, [action]: row, saved: { id: saved.id, unchanged: saved.unchanged === true } });
   }
@@ -715,9 +917,17 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  const stats = store.stats();
+  const stats = store.statsAll();
   console.log(`[triplog-api] listening on http://${HOST}:${PORT} · data=${DATA_DIR}`);
-  console.log(`[triplog-api] snapshots=${stats.snapshots} bytes=${stats.totalBytes} head=${stats.head?.exportedAt ?? '(none)'} keep=${stats.keep}`);
+  console.log(
+    `[triplog-api] 模式=${AUTH_MODE ? '帳號（Google 登入為唯一入口）' : '金鑰（單一基準）'} · snapshots=${stats.snapshots} bytes=${stats.totalBytes} head=${stats.head?.exportedAt ?? '(none)'} keep=${stats.keep} users=${stats.users}`,
+  );
+  if (AUTH_MODE) {
+    console.log(`[triplog-api] Client ID=${GOOGLE_CLIENT_ID.slice(0, 22)}… · session=${SESSION_DAYS} 天 · 金鑰通道=${KEYS_ALLOWED ? '開（救援／agent）' : '關'}`);
+    if (stats.users === 0 && stats.head) {
+      console.log('[triplog-api] 提示：資料庫裡還有帳號制度之前的基準，第一個登入的帳號會把它認領過去。');
+    }
+  }
   console.log('[triplog-api] 沒有 DELETE API：寫入只有新增與覆寫，刪除請在本機操作後再同步。');
   console.log('[triplog-api] 分享連結：/api/share/<token> 只用 token 授權，限一趟旅行、只能新增。');
 });

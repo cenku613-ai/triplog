@@ -67,7 +67,8 @@ if (cmd === 'status') {
     `.env 那把：${info ? '已失效（資料庫為準）' : '有效'}；hint ${masterHint((process.env.TRIPLOG_API_KEY ?? '').trim() || '(未設定)')}`,
     `簽發過的憑證：${tokens.length} 把，其中生效中 ${live(tokens).length} 把（可寫 ${live(tokens).filter((r) => r.scope === 'write').length} 把）`,
     `配對碼：${pairings.length} 組，未用且未過期 ${live(pairings.filter((p) => !p.usedAt)).length} 組`,
-    `分享連結：${store.listShares(null).length} 條`,
+    `分享連結：${store.listShares({ uid: null }).length} 條`,
+    `帳號：${store.countUsers()} 個（登入紀錄只列最近 100 條，撤銷要從 app 裡按）`,
   );
   process.exit(0);
 }

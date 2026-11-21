@@ -233,6 +233,33 @@ docker compose -f docker-compose.yml -f deploy/compose.api.yml exec triplog-api 
 ssh opc@<你的IP> 'docker run --rm -v triplog_triplog_data:/d -v $PWD:/out alpine tar czf /out/triplog-data.tgz -C /d .'
 ```
 
+### 選裝：帳號模式（Google 登入，每人一份帳本）
+
+覺得「一把金鑰＝整個資料庫」太粗，想換成一人一個帳號、各看各的帳本時，多設兩個環境變數就開得起來：
+
+```bash
+# .env
+TRIPLOG_AUTH=1
+TRIPLOG_GOOGLE_CLIENT_ID=<Google Cloud 的 OAuth 用戶端 ID>
+SSH_TARGET=opc@<你的IP> bash deploy/deploy.sh
+```
+
+用戶端 ID 在 Google Cloud Console →「API 與服務」→「憑證」→ 建立 OAuth 用戶端 ID，類型選「網頁應用程式」，兩處都填同一個網址：已授權的 JavaScript 來源填 `https://你的網域`（**不含**尾端的 `/`，也不能是 `http`），重新導向 URI 填同一個。這一把是公開資訊（本來就會出現在瀏覽器裡），而且**不需要 `client_secret`**——伺服器驗的是 Google 簽給瀏覽器的那張 ID token，不是拿 code 去換 token，所以少一個要藏的祕密，也少一個會外流的東西。伺服器只需要能連外（抓 Google 公鑰），入站照舊只有 443，防火牆不用動。
+
+開起來之後的規則：
+
+- 沒登入就打資料端點會拿到 `401` 與 `login: true`，app 據此決定要顯示登入鈕而不是「金鑰錯了」；Google 登入是讀寫資料的唯一入口。
+- **第一次登入會把帳號制度之前的那份基準認領過來**（`store.claimLegacyBase`）：你原本的行程、支出、分享連結全部跟著你的帳號走，不會憑空多出一個空帳本。之後第二個人登入看到的是他自己那一份，兩人互看不見，歷史保留上限也各算各的。
+- 登入換回的是自家憑證 `tls_…`（資料庫一樣只存雜湊），預設 30 天，常用裝置會自動滑動續期，所以它的實際意義是「連續這麼多天沒上線才要重新登入」。設定頁能列出每條 session 並單獨撤銷，撤銷只砍那一台，不會把自己關在門外。
+- 主金鑰與 app 簽發的 `tlk_` 憑證預設還進得來，但它們看到的是「制度前那份基準」——你一認領，它們那邊就空了。留著是要當救援通道與 agent 出入口；不想留就設 `TRIPLOG_AUTH_ALLOW_KEYS=0`，屆時資料只能從 SSH 處理。
+- 分享連結在帳號模式下屬於擁有者的分帳：同行者開匿名連結、代記一筆，資料仍然寫進你那一份，不會跑到他自己的帳號裡。
+
+邊界都寫在 `server/src/auth.js`：簽章只收 RS256；`kid` 對不上就重抓公鑰（快取 10 分鐘）；`iss`／`aud`／`exp` 必須全對，`sub` 形狀不對也直接拒；`email_verified` 是 false 給 403；可以再用 `TRIPLOG_GOOGLE_HOSTED_DOMAIN` 把登入限死在某個 Workspace 網域。連不上 Google 時登入回 502，不會「假裝成功」，而已經登入的裝置完全不受影響。登入端點另有每 IP 每分鐘 `TRIPLOG_RATE_AUTH`（預設 12）次上限，專門擋「拿別人的 token 一直試」。
+
+**開啟之前先把雲端庫備一份**（上面那條 `tar czf` 指令）。認領本身只改一欄分帳標籤、內容一個 byte 都不動，但這是這專案到目前最大的一次資料模型變動，退路要留著。要退回金鑰模式就把 `TRIPLOG_AUTH` 清空再重跑部署，並先 `node server/src/cli.js status` 看一眼資料現在落在誰的分帳下。
+
+app 端的登入流程（按鈕、session 存放、每帳號的本機庫）是下一階段；後端與測試已就緒，正式機目前仍未開啟帳號模式。
+
 ### 更新與日常操作
 
 ```bash
@@ -258,4 +285,4 @@ curl -s -o /dev/null -w '%{http_code}\n' https://<網址>/api/share/nope   # 404
 
 **刪除語意（tombstone）**：目前的同步是合併並集，一端刪掉的記錄會被另一端帶回來，所以 MCP 乾脆不提供刪除。要做的是記「已刪除」標記而不是真的抹掉。
 
-其餘：帳號系統（現在只靠金鑰，一把金鑰＝整個資料庫）、同行者分帳清算（目前只記「誰付的」與各人代墊合計）、CSV 匯出、行程項之間的路線連線與距離、照片的地點／時間 EXIF 解析、PDF 的多趟合併與直排版面。
+其餘：用帳號邀請同行者共用某一趟（`grants` 表與 store 方法已就緒，端點與 UI 還沒開——目前共用仍然走分享連結）、同行者分帳清算（目前只記「誰付的」與各人代墊合計）、CSV 匯出、行程項之間的路線連線與距離、照片的地點／時間 EXIF 解析、PDF 的多趟合併與直排版面。

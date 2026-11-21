@@ -5,10 +5,13 @@
  * 「存最新並集 + 留歷史」，schema 就不會和 App 的欄位一起膨脹，
  * 也天生支援未來新增的欄位（JSON 直接進出）。
  *
- * 沒有帳號系統：bearer 比對 .env 裡的主金鑰（見 index.js），另外可以比對「簽發出去
- * 的 API token」的雜湊（見 tokens.js；資料庫裡只有雜湊，主金鑰本身永遠不落庫），
- * 以及「分享連結」用的 trip 級 token（見 share.js）。因此這裡刻意不做任何刪除資料的
- * API，誤刪的風險留給本機（有備份檔）而不是伺服器。
+ * 一人一份帳：snapshots.user_id 是分帳標籤（'' ＝帳號制度之前的那份單一基準），
+ * 所有讀寫端點都帶著「這個請求屬於誰」進來（見 index.js 的 auth context）。
+ * 身分辨識存在 users（Google sub）與 sessions（只存雜湊），邀請存在 grants；
+ * 金鑰那條路（主金鑰／tlk_ 憑證）保留給救援與 agent，它們看的是 '' 那個分帳。
+ *
+ * 依然刻意不做任何刪除資料的 API：沒有 DELETE 端點，也沒有「撤銷邀請就順手刪資料」
+ * 這種事——邀請只收權限，動不到內容。誤刪的風險留給本機（有備份檔）而不是伺服器。
  */
 import { mkdirSync, readFileSync, existsSync, renameSync } from 'node:fs';
 import path from 'node:path';
@@ -94,6 +97,8 @@ function stripPhotoData(p) {
 function shareView(r) {
   return {
     token: r.token,
+    /** 這把連結隸屬哪個分帳：'' ＝帳號制度之前的單一基準（匿名開連結時靠它找到資料） */
+    uid: r.user_id ?? '',
     tripId: r.trip_id,
     label: r.label ?? '',
     createdAt: r.created_at,
@@ -138,6 +143,45 @@ function pairingView(r) {
     usedAt: r.used_at ?? null,
     revokedAt: r.revoked_at ?? null,
     usedLabel: r.used_label ?? '',
+  };
+}
+/**
+ * 帳號的對外視圖。`google_sub` 不外傳：它是別家給的穩定識別碼，對我們的介面來說
+ * 「這是誰」看 id 與 email 就夠了，少一個欄位就少一個能被拿去比對的把手。
+ */
+function userView(r) {
+  return {
+    id: r.id,
+    email: r.email ?? '',
+    name: r.name ?? '',
+    picture: r.picture ?? '',
+    createdAt: r.created_at ?? null,
+    lastLoginAt: r.last_login_at ?? null,
+    logins: Number(r.login_count ?? 0),
+  };
+}
+
+/** session 的清單視圖：同樣不出現雜湊，完整值只在登入那次回應裡有 */
+function sessionView(r) {
+  return {
+    id: r.id,
+    label: r.label ?? '',
+    createdAt: r.created_at,
+    expiresAt: r.expires_at ?? null,
+    revokedAt: r.revoked_at ?? null,
+    lastSeenAt: r.last_seen_at ?? null,
+  };
+}
+
+function grantView(r) {
+  return {
+    id: r.id,
+    tripId: r.trip_id,
+    owner: r.owner_user_id,
+    email: r.grantee_email,
+    role: r.role === 'write' ? 'write' : 'read',
+    createdAt: r.created_at,
+    revokedAt: r.revoked_at ?? null,
   };
 }
 
@@ -251,6 +295,46 @@ export class Store {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+      /* 帳號：身分辨識是 Google 的 sub（穩定不變），email 只是給人看的標籤與邀請地址。
+         這裡刻意不存任何 Google 的 token——登入只用來確認身分，之後吃自己的 session。 */
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        google_sub TEXT NOT NULL UNIQUE,
+        email TEXT NOT NULL,
+        name TEXT NOT NULL DEFAULT '',
+        picture TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        last_login_at TEXT,
+        login_count INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS users_email ON users(email);
+      /* 本機 session：跟 api_tokens 同一套規矩，庫裡只有雜湊，完整值只出現在登入那次回應。
+         可單獨撤銷（裝置遺失），到期由 auth.js 判斷。 */
+      CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        session_hash TEXT NOT NULL UNIQUE,
+        user_id TEXT NOT NULL,
+        label TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        revoked_at TEXT,
+        last_seen_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
+      /* 邀請／共筆：把某一趟行程授給另一個帳號。資料仍在擁有者的分帳裡，
+         這張表只決定「誰讀得到、誰補得了」。 */
+      CREATE TABLE IF NOT EXISTS grants (
+        id TEXT PRIMARY KEY,
+        trip_id TEXT NOT NULL,
+        owner_user_id TEXT NOT NULL,
+        grantee_email TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'read',
+        created_at TEXT NOT NULL,
+        revoked_at TEXT,
+        UNIQUE(trip_id, grantee_email)
+      );
+      CREATE INDEX IF NOT EXISTS grants_grantee ON grants(grantee_email);
+      CREATE INDEX IF NOT EXISTS grants_owner ON grants(owner_user_id);
     `);
     // 舊資料庫補上內容指紋欄位；SQLite 沒有 ADD COLUMN IF NOT EXISTS，重複執行就當它已經有了
     try {
@@ -258,27 +342,58 @@ export class Store {
     } catch {
       /* 欄位已存在 */
     }
+    /**
+     * 分帳欄位：'' 是「帳號出現之前那份單一基準」，登入後每個帳號一個自己的 id。
+     * 用預設空字串而不是 NULL，舊列搬遷時不用寫任何資料——它們本來就屬於還沒有帳號時的那位
+     * 使用者，第一次登入時用 claimLegacyBase() 整個認領過來（見 auth 路由的說明）。
+     */
+    try {
+      this.db.exec("ALTER TABLE snapshots ADD COLUMN user_id TEXT NOT NULL DEFAULT ''");
+    } catch {
+      /* 欄位已存在 */
+    }
+    // 分享連結也要知道自己在誰的帳本裡：匿名開連結時靠這個欄位找到擁有者的基準檔
+    try {
+      this.db.exec("ALTER TABLE shares ADD COLUMN user_id TEXT NOT NULL DEFAULT ''");
+    } catch {
+      /* 欄位已存在 */
+    }
+    this.db.exec('CREATE INDEX IF NOT EXISTS snapshots_user ON snapshots(user_id, exported_at DESC, created_at DESC)');
     this._insert = this.db.prepare(
-      'INSERT INTO snapshots (id, exported_at, created_at, source, bytes, fp, payload) VALUES (@id, @exportedAt, @createdAt, @source, @bytes, @fp, @payload)',
+      'INSERT INTO snapshots (id, user_id, exported_at, created_at, source, bytes, fp, payload) VALUES (@id, @uid, @exportedAt, @createdAt, @source, @bytes, @fp, @payload)',
     );
-    this._latest = this.db.prepare('SELECT * FROM snapshots ORDER BY exported_at DESC, created_at DESC LIMIT 1');
-    this._byId = this.db.prepare('SELECT * FROM snapshots WHERE id = ?');
-    this._count = this.db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(bytes),0) AS bytes FROM snapshots');
+    this._latest = this.db.prepare(
+      'SELECT * FROM snapshots WHERE user_id = ? ORDER BY exported_at DESC, created_at DESC LIMIT 1',
+    );
+    this._headAny = this.db.prepare('SELECT * FROM snapshots ORDER BY exported_at DESC, created_at DESC LIMIT 1');
+    this._byId = this.db.prepare('SELECT * FROM snapshots WHERE id = ? AND user_id = ?');
+    this._count = this.db.prepare(
+      'SELECT COUNT(*) AS n, COALESCE(SUM(bytes),0) AS bytes FROM snapshots WHERE (? IS NULL OR user_id = ?)',
+    );
     this._list = this.db.prepare(
-      'SELECT id, exported_at, created_at, source, bytes FROM snapshots ORDER BY exported_at DESC LIMIT ? OFFSET ?',
+      'SELECT id, exported_at, created_at, source, bytes FROM snapshots WHERE user_id = ? ORDER BY exported_at DESC LIMIT ? OFFSET ?',
     );
     this._prune = this.db.prepare(
-      'DELETE FROM snapshots WHERE id NOT IN (SELECT id FROM snapshots ORDER BY exported_at DESC, created_at DESC LIMIT ?)',
+      'DELETE FROM snapshots WHERE user_id = ? AND id NOT IN (SELECT id FROM snapshots WHERE user_id = ? ORDER BY exported_at DESC, created_at DESC LIMIT ?)',
     );
+    this._payloads = this.db.prepare(
+      'SELECT payload FROM snapshots WHERE user_id = ? ORDER BY exported_at DESC, created_at DESC LIMIT ?',
+    );
+    this._claim = this.db.prepare("UPDATE snapshots SET user_id = ? WHERE user_id = ''");
+    this._userCount = this.db.prepare('SELECT COUNT(*) AS n FROM users');
     this._metaGet = this.db.prepare('SELECT value FROM meta WHERE key = ?');
     this._metaSet = this.db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
     this._shareInsert = this.db.prepare(
-      'INSERT INTO shares (token, trip_id, label, created_at, expires_at) VALUES (@token, @tripId, @label, @createdAt, @expiresAt)',
+      'INSERT INTO shares (token, user_id, trip_id, label, created_at, expires_at) VALUES (@token, @uid, @tripId, @label, @createdAt, @expiresAt)',
     );
     this._shareGet = this.db.prepare('SELECT * FROM shares WHERE token = ?');
-    this._shareList = this.db.prepare('SELECT * FROM shares WHERE trip_id = ? ORDER BY created_at DESC');
+    this._shareList = this.db.prepare('SELECT * FROM shares WHERE user_id = ? AND trip_id = ? ORDER BY created_at DESC');
+    this._shareListUser = this.db.prepare('SELECT * FROM shares WHERE user_id = ? ORDER BY created_at DESC LIMIT 200');
     this._shareAll = this.db.prepare('SELECT * FROM shares ORDER BY created_at DESC LIMIT 200');
     this._shareRevoke = this.db.prepare('UPDATE shares SET revoked_at = ? WHERE token = ? AND revoked_at IS NULL');
+    this._shareRevokeOwn = this.db.prepare(
+      'UPDATE shares SET revoked_at = ? WHERE token = ? AND user_id = ? AND revoked_at IS NULL',
+    );
     this._shareHit = this.db.prepare(
       'UPDATE shares SET hits = hits + @read, writes = writes + @write, last_seen_at = @at WHERE token = @token',
     );
@@ -303,6 +418,36 @@ export class Store {
     this._keyGet = this.db.prepare('SELECT value FROM server_keys WHERE key = ?');
     this._keySet = this.db.prepare('INSERT INTO server_keys (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
     this._keyDel = this.db.prepare('DELETE FROM server_keys WHERE key = ?');
+    this._userInsert = this.db.prepare(
+      'INSERT INTO users (id, google_sub, email, name, picture, created_at, last_login_at, login_count) VALUES (@id, @sub, @email, @name, @picture, @createdAt, @createdAt, 1)',
+    );
+    this._userBySub = this.db.prepare('SELECT * FROM users WHERE google_sub = ?');
+    this._userById = this.db.prepare('SELECT * FROM users WHERE id = ?');
+    this._userByEmail = this.db.prepare('SELECT * FROM users WHERE email = ? ORDER BY created_at ASC LIMIT 1');
+    this._userList = this.db.prepare('SELECT * FROM users ORDER BY created_at DESC LIMIT 200');
+    this._userLogin = this.db.prepare(
+      'UPDATE users SET email = @email, name = @name, picture = @picture, last_login_at = @at, login_count = login_count + 1 WHERE id = @id',
+    );
+    this._sessInsert = this.db.prepare(
+      'INSERT INTO sessions (id, session_hash, user_id, label, created_at, expires_at) VALUES (@id, @hash, @userId, @label, @createdAt, @expiresAt)',
+    );
+    this._sessByHash = this.db.prepare('SELECT * FROM sessions WHERE session_hash = ?');
+    this._sessById = this.db.prepare('SELECT * FROM sessions WHERE id = ?');
+    this._sessList = this.db.prepare('SELECT * FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 100');
+    this._sessRevoke = this.db.prepare('UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL');
+    this._sessRevokeOthers = this.db.prepare(
+      'UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND id <> ? AND revoked_at IS NULL',
+    );
+    this._sessExpire = this.db.prepare('UPDATE sessions SET expires_at = ? WHERE id = ?');
+    this._sessHit = this.db.prepare('UPDATE sessions SET last_seen_at = ? WHERE id = ?');
+    this._grantInsert = this.db.prepare(
+      'INSERT INTO grants (id, trip_id, owner_user_id, grantee_email, role, created_at) VALUES (@id, @tripId, @owner, @email, @role, @createdAt) ON CONFLICT(trip_id, grantee_email) DO UPDATE SET role = excluded.role, owner_user_id = excluded.owner_user_id, created_at = excluded.created_at, revoked_at = NULL',
+    );
+    this._grantListOwned = this.db.prepare('SELECT * FROM grants WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT 200');
+    this._grantListFor = this.db.prepare("SELECT * FROM grants WHERE grantee_email = ? AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 200");
+    this._grantById = this.db.prepare('SELECT * FROM grants WHERE id = ?');
+    this._grantRevoke = this.db.prepare('UPDATE grants SET revoked_at = ? WHERE id = ? AND owner_user_id = ? AND revoked_at IS NULL');
+    this._grantFind = this.db.prepare('SELECT * FROM grants WHERE trip_id = ? AND grantee_email = ?');
   }
 
   /* ------------------------------------------------------ 輪換過的主金鑰 */
@@ -333,6 +478,140 @@ export class Store {
     const hint = this._keyGet.get('master_hint');
     const at = this._keyGet.get('master_set_at');
     return { rotated: true, hint: hint ? String(hint.value) : '', setAt: at ? String(at.value) : null };
+  }
+
+  /* ---------------------------------------------------------- 帳號與登入 */
+
+  /** 第一次登入就生出帳號；同一個 Google =sub 再來只會回到同一列 */
+  createUser({ sub, email, name = '', picture = '' }) {
+    const id = `u_${crypto.randomBytes(8).toString('hex')}`;
+    const createdAt = new Date().toISOString();
+    this._userInsert.run({ id, sub: String(sub), email: String(email), name: String(name ?? ''), picture: String(picture ?? ''), createdAt });
+    return userView(this._userById.get(id));
+  }
+
+  userBySub(sub) {
+    const row = this._userBySub.get(String(sub ?? ''));
+    return row ? userView(row) : undefined;
+  }
+
+  user(id) {
+    const row = this._userById.get(String(id ?? ''));
+    return row ? userView(row) : undefined;
+  }
+
+  /** 邀請用：同一個信箱若有多個帳號（幾乎不可能，除非有人換過 Google 帳號），認最早那個 */
+  userByEmail(email) {
+    const row = this._userByEmail.get(String(email ?? '').trim().toLowerCase());
+    return row ? userView(row) : undefined;
+  }
+
+  listUsers() {
+    return this._userList.all().map(userView);
+  }
+
+  countUsers() {
+    return Number(this._userCount.get().n ?? 0);
+  }
+
+  /**
+   * 每次登入都順手更新顯示名、頭像與信箱：改頭像不該生出第二個帳號，也不該在介面上留舊的。
+   * Google 那次沒給的欄位（空字串）保留原本的值，不要把資料擦掉。
+   */
+  touchLogin(id, profile = {}) {
+    const row = this._userById.get(String(id ?? ''));
+    if (!row) return undefined;
+    this._userLogin.run({
+      id: row.id,
+      email: String(profile.email || row.email),
+      name: String(profile.name || row.name),
+      picture: String(profile.picture || row.picture),
+      at: new Date().toISOString(),
+    });
+    return userView(this._userById.get(id));
+  }
+
+  insertSession({ id, hash, userId, label = '', expiresAt }) {
+    const createdAt = new Date().toISOString();
+    this._sessInsert.run({ id, hash, userId, label: String(label ?? '').slice(0, 60), createdAt, expiresAt });
+    return sessionView(this._sessById.get(id));
+  }
+
+  /** 拿 bearer 的雜湊查；查不到回 undefined，讓路由層回到 401 */
+  sessionByHash(hash) {
+    const row = this._sessByHash.get(String(hash ?? ''));
+    return row ? { ...sessionView(row), userId: row.user_id } : undefined;
+  }
+
+  session(id) {
+    const row = this._sessById.get(String(id ?? ''));
+    return row ? { ...sessionView(row), userId: row.user_id } : undefined;
+  }
+
+  listSessions(userId) {
+    return this._sessList.all(String(userId ?? '')).map(sessionView);
+  }
+
+  revokeSession(id, userId = null) {
+    const row = this._sessById.get(String(id ?? ''));
+    if (!row) return false;
+    if (userId && row.user_id !== String(userId)) return false;
+    return this._sessRevoke.run(new Date().toISOString(), String(id ?? '')).changes > 0;
+  }
+
+  /** 「退出其他裝置」：留著手上這條，其餘全斷 */
+  revokeOtherSessions(userId, exceptId) {
+    return this._sessRevokeOthers.run(new Date().toISOString(), String(userId ?? ''), String(exceptId ?? '')).changes;
+  }
+
+  /** 滑動續期：到期前換一個新的 expires_at，不換 secret，客戶端不用處理輪換 */
+  extendSession(id, expiresAt) {
+    return this._sessExpire.run(String(expiresAt), String(id ?? '')).changes > 0;
+  }
+
+  touchSession(id) {
+    this._sessHit.run(new Date().toISOString(), String(id ?? ''));
+  }
+
+  /* ------------------------------------------------------------------ 邀請 */
+
+  /** 同一組（行程, 信箱）再邀一次就當更新權限，不會生出兩條 */
+  upsertGrant({ tripId, owner, email, role = 'read' }) {
+    const id = `g_${crypto.randomBytes(8).toString('hex')}`;
+    const createdAt = new Date().toISOString();
+    this._grantInsert.run({
+      id,
+      tripId: String(tripId ?? ''),
+      owner: String(owner ?? ''),
+      email: String(email ?? '').trim().toLowerCase(),
+      role: role === 'write' ? 'write' : 'read',
+      createdAt,
+    });
+    return grantView(this._grantFind.get(String(tripId ?? ''), String(email ?? '').trim().toLowerCase()));
+  }
+
+  grant(id) {
+    const row = this._grantById.get(String(id ?? ''));
+    return row ? grantView(row) : undefined;
+  }
+
+  /** 擁有者看自己發出去的邀請（含已撤銷的，清單要能交代歷史） */
+  listGrants(ownerUserId) {
+    return this._grantListOwned.all(String(ownerUserId ?? '')).map(grantView);
+  }
+
+  /** 受邀者看「別人給我的」：已作廢的不算，那代表邀請人已經反悔 */
+  listGrantsFor(email) {
+    return this._grantListFor.all(String(email ?? '').trim().toLowerCase()).map(grantView);
+  }
+
+  grantFor(tripId, email) {
+    const row = this._grantFind.get(String(tripId ?? ''), String(email ?? '').trim().toLowerCase());
+    return row ? grantView(row) : undefined;
+  }
+
+  revokeGrant(id, ownerUserId) {
+    return this._grantRevoke.run(new Date().toISOString(), String(id ?? ''), String(ownerUserId ?? '')).changes > 0;
   }
 
   /* ------------------------------------------------------------ 配對碼 */
@@ -402,12 +681,13 @@ export class Store {
 
   /* ------------------------------------------------------------ 分享連結 */
 
-  /** @returns {{ token: string, tripId: string, label: string, createdAt: string, expiresAt: string|null }} */
-  createShare({ tripId, label = '', expiresAt = null }) {
+  /** @returns {{ token: string, uid: string, tripId: string, label: string, createdAt: string, expiresAt: string|null }} */
+  createShare({ tripId, label = '', expiresAt = null, uid = '' }) {
     const token = newToken();
     const createdAt = new Date().toISOString();
-    this._shareInsert.run({ token, tripId, label: String(label ?? '').slice(0, 60), createdAt, expiresAt });
-    return { token, tripId, label: String(label ?? '').slice(0, 60), createdAt, expiresAt, revokedAt: null, hits: 0, writes: 0, lastSeenAt: null };
+    const owner = String(uid ?? '');
+    this._shareInsert.run({ token, uid: owner, tripId, label: String(label ?? '').slice(0, 60), createdAt, expiresAt });
+    return { token, uid: owner, tripId, label: String(label ?? '').slice(0, 60), createdAt, expiresAt, revokedAt: null, hits: 0, writes: 0, lastSeenAt: null };
   }
 
   /** 回傳 undefined 代表這個 token 根本沒存在過 */
@@ -416,14 +696,21 @@ export class Store {
     return row ? shareView(row) : undefined;
   }
 
-  listShares(tripId = null) {
-    const rows = tripId ? this._shareList.all(String(tripId)) : this._shareAll.all();
+  /**
+   * 清單永遠以分帳為單位：`uid` 傳 null 才是「整台都有誰發過連結」（給 SSH 救援看）。
+   * 帳號模式下不帶 uid 就查，等於讓任何人看到別人的邀請名單，所以預設是 ''。
+   */
+  listShares({ tripId = null, uid = '' } = {}) {
+    if (uid === null) return this._shareAll.all().map(shareView);
+    const rows = tripId ? this._shareList.all(String(uid), String(tripId)) : this._shareListUser.all(String(uid));
     return rows.map(shareView);
   }
 
   /** 作廢：只有 revoked_at 是 NULL 的會被打上時間戳，回傳有沒有真的改到 */
-  revokeShare(token) {
-    return this._shareRevoke.run(new Date().toISOString(), String(token ?? '')).changes > 0;
+  revokeShare(token, uid = null) {
+    const at = new Date().toISOString();
+    if (uid === null) return this._shareRevoke.run(at, String(token ?? '')).changes > 0;
+    return this._shareRevokeOwn.run(at, String(token ?? ''), String(uid)).changes > 0;
   }
 
   /** 開一次連結算一筆 hit，代記一筆算一筆 write；擁有者才需要知道這些數字 */
@@ -448,31 +735,36 @@ export class Store {
    * 自動同步每次都會推，不擋的話 keep 那 20 格一下就被同一份資料塞滿，真的要回頭
    * 找舊版本時反而找不到。
    *
+   * `uid` 決定這筆落在誰的分帳：'' 是帳號制度之前的那份單一基準（金鑰模式也寫這裡），
+   * 登入後的裝置傳自己的帳號 id。歷史保留上限（keep）是分帳各自算的，
+   * 誰推得頻繁都不會把別人的歷史擠掉。
+   *
    * @returns {{ id: string, exportedAt: string, bytes: number, trimmedPhotos: number, unchanged?: boolean }}
    */
-  put(body, { source = 'push' } = {}) {
+  put(body, { uid = '', source = 'push' } = {}) {
+    const owner = String(uid ?? '');
     const { backup, bytes, trimmedPhotos } = normalizeSnapshot(body);
     const fp = fingerprint(backup);
-    const head = this._latest.get();
+    const head = this._latest.get(owner);
     // 舊資料列還沒有 fp（補欄位之前的快照），退回用 payload 算一次
     if (head && (head.fp ?? fingerprint(JSON.parse(head.payload))) === fp) {
       return { id: head.id, exportedAt: head.exported_at, bytes: head.bytes, unchanged: true, trimmedPhotos };
     }
     const createdAt = new Date().toISOString();
     let id = backup.exportedAt;
-    if (this._byId.get(id)) id = `${backup.exportedAt}#${crypto.randomBytes(3).toString('hex')}`;
-    this._insert.run({ id, exportedAt: backup.exportedAt, createdAt, source, bytes, fp, payload: JSON.stringify(backup) });
-    this._prune.run(this.keep);
+    if (this._byId.get(id, owner)) id = `${backup.exportedAt}#${crypto.randomBytes(3).toString('hex')}`;
+    this._insert.run({ id, uid: owner, exportedAt: backup.exportedAt, createdAt, source, bytes, fp, payload: JSON.stringify(backup) });
+    this._prune.run(owner, owner, this.keep);
     return { id, exportedAt: backup.exportedAt, bytes, trimmedPhotos };
   }
 
-  /** 基準快照：最新一筆 + 所有歷史的並集，重複推送不會把別人的資料洗掉 */
-  base() {
-    const head = this._latest.get();
+  /** 基準快照：這個分帳的最新一筆 + 所有歷史的並集，重複推送不會把別人的資料洗掉 */
+  base(uid = '') {
+    const owner = String(uid ?? '');
+    const head = this._latest.get(owner);
     if (!head) return { snapshot: emptySnapshot(), head: null, history: 0 };
-    const all = this.db
-      .prepare('SELECT payload FROM snapshots ORDER BY exported_at DESC, created_at DESC LIMIT ?')
-      .all(this.keep)
+    const all = this._payloads
+      .all(owner, this.keep)
       .map((r) => JSON.parse(r.payload));
     // 由新到舊合併：時間戳較新者勝、平手偏向第一份，所以最新快照自然成為基準
     const snapshot = mergeSources(all);
@@ -483,13 +775,13 @@ export class Store {
     };
   }
 
-  get(id) {
-    const row = this._byId.get(id);
+  get(id, uid = '') {
+    const row = this._byId.get(String(id ?? ''), String(uid ?? ''));
     return row ? { ...JSON.parse(row.payload), id: row.id } : null;
   }
 
-  list({ limit = 20, offset = 0 } = {}) {
-    return this._list.all(Math.min(100, limit), offset).map((r) => ({
+  list({ uid = '', limit = 20, offset = 0 } = {}) {
+    return this._list.all(String(uid ?? ''), Math.min(100, limit), offset).map((r) => ({
       id: r.id,
       exportedAt: r.exported_at,
       createdAt: r.created_at,
@@ -498,16 +790,44 @@ export class Store {
     }));
   }
 
-  stats() {
-    const row = this._count.get();
-    const head = this._latest.get();
+  /** 某個分帳的體況（給 /api/base 與客戶端的「伺服器上有多大」） */
+  stats(uid = '') {
+    const owner = String(uid ?? '');
+    const row = this._count.get(owner, owner);
+    const head = this._latest.get(owner);
     return {
-      snapshots: row.n,
-      totalBytes: row.bytes,
+      snapshots: Number(row.n),
+      totalBytes: Number(row.bytes),
       head: head ? { id: head.id, exportedAt: head.exported_at, bytes: head.bytes } : null,
       keep: this.keep,
       maxSize: MAX_SNAPSHOT_BYTES,
     };
+  }
+
+  /** 整台伺服器的統計：只給 /api/health 與開機日誌，用來判斷「有沒有爆盤」，不分帳 */
+  statsAll() {
+    const row = this._count.get(null, null);
+    const head = this._headAny.get();
+    return {
+      snapshots: Number(row.n),
+      totalBytes: Number(row.bytes),
+      head: head ? { id: head.id, exportedAt: head.exported_at, bytes: head.bytes } : null,
+      keep: this.keep,
+      maxSize: MAX_SNAPSHOT_BYTES,
+      users: this.countUsers(),
+    };
+  }
+
+  /**
+   * 把帳號制度之前的那份單一基準認領給某個帳號（只在第一次登入時做）。
+   *
+   * 這是「舊資料跟著人走」的關鍵：沒有這一步，使用者一登入就會看到一個空帳本，
+   * 而原本的資料變成誰也拿不到的孤兒。移動的是分帳標籤，內容一個 byte 都不改。
+   * @returns {{ moved: number }}
+   */
+  claimLegacyBase(userId) {
+    const info = this._claim.run(String(userId ?? ''));
+    return { moved: info.changes };
   }
 
   clear() {
