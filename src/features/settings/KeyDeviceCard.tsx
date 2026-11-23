@@ -11,9 +11,10 @@
  *    主金鑰，舊的（含 `.env` 與只讀鑰）當場不被接受；要回退只能從伺服器 SSH 跑
  *    `node server/src/cli.js master-reset`。
  *
- * 這些呼叫一定要用主金鑰打 `/api/tokens`：拿簽發出去的 token 叫它再發一把，等於任何
- * 一把外流的 agent 憑證都能自己擴權。唯獨 `/api/pair` 不需要金鑰，它靠配對碼授權，
- * 而且限流獨立（預設每 IP 每分鐘 8 次）。
+ * 這些呼叫要用**主金鑰**或**已登入裝置那條 session** 打 `/api/tokens`：主金鑰管全站，
+ * 登入者只能動自己帳號那批（簽出來的憑證也自帶那個帳號）。唯獨拿已經簽發出去的 token
+ * 叫它再發一把是 403，否則任何一把外流的 agent 憑證都能自己擴權。`/api/pair` 不需要金鑰，
+ * 它靠配對碼授權，而且限流獨立（預設每 IP 每分鐘 8 次）。
  */
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useUi } from '../../app/ui';
@@ -23,7 +24,9 @@ import { Field } from '../../components/Controls';
 import { copyText } from '../../lib/share';
 import { loadSyncConfig, saveSyncConfig, type SyncConfig } from '../../lib/sync';
 import {
+  AGENT_TOKEN_PLACEHOLDER,
   activeTokens,
+  agentConfig,
   createApiToken,
   createPairingCode,
   daysLeft,
@@ -81,6 +84,9 @@ const SCOPE_KEY: Record<TokenScope, Key> = {
   read: 'tokens.scopeRead',
   write: 'tokens.scopeWrite',
 };
+
+/** 簽發那張卡下方的四步說明（順序有意義：最後一步「同步才看得到」是最多人漏的） */
+const guideSteps: Key[] = ['tokens.guide1', 'tokens.guide2', 'tokens.guide3', 'tokens.guide4'];
 
 /** 時間戳跨年時年份要看得到，否則「2/19」會被讀成今年 */
 function when(iso: string | null, locale: string): string {
@@ -280,6 +286,17 @@ export function KeyDeviceCard() {
     void reload();
   };
 
+  /**
+   * 把 MCP 那段設定複製走。帶剛簽發的 secret 時就真的是「複製完就能用」，
+   * 沒有 secret（已被收起來）時給佔位符，讓人自己貼——完整值我們也存不了，
+   * 資料庫裡只有雜湊，這一格本來就查不回來。
+   */
+  const copyAgentConfig = async (secret: string, which: TokenScope) => {
+    if (!cfg) return;
+    const ok = await copyText(agentConfig(cfg.baseUrl, secret, which));
+    toast(ok ? t('tokens.configCopied') : t('tokens.copyFail'), ok ? undefined : { kind: 'error' });
+  };
+
   const drop = async (row: ApiTokenRow) => {
     if (!cfg || busy) return;
     const name = row.label || row.hint;
@@ -447,6 +464,12 @@ export function KeyDeviceCard() {
         >
           <button
             className="btn btn-sm"
+            onClick={() => void copyAgentConfig(freshToken.secret, freshToken.row.scope)}
+          >
+            {t('tokens.copyConfig')}
+          </button>
+          <button
+            className="btn btn-sm"
             onClick={() => void applyToThisDevice(freshToken.secret, freshToken.row.scope === 'read')}
           >
             {t('tokens.apply')}
@@ -468,9 +491,37 @@ export function KeyDeviceCard() {
         />
       ) : null}
 
-      <p className="tiny" style={{ margin: 0 }}>
-        {t('tokens.mcpHint', { url: cfg.baseUrl })}
-      </p>
+      {/* agent 那一側的接法。存在是為了「env 名字讓人記」一定會記錯，乾脆把整段給他複製 */}
+      <div className="stack-s" style={{ padding: 12, border: '1px solid var(--line)', borderRadius: 12 }}>
+        <strong style={{ fontSize: 14 }}>{t('tokens.guideTitle')}</strong>
+        <ol className="tiny" style={{ margin: 0, paddingLeft: 18, lineHeight: 1.7 }}>
+          {(guideSteps as Key[]).map((k) => (
+            <li key={k}>{t(k)}</li>
+          ))}
+        </ol>
+        <p className="tiny" style={{ margin: 0 }}>
+          {t('tokens.mcpHint', { url: cfg.baseUrl })}
+        </p>
+        <div
+          style={{
+            whiteSpace: 'pre-wrap',
+            fontFamily: 'var(--mono)',
+            fontSize: 12,
+            lineHeight: 1.5,
+            padding: 10,
+            borderRadius: 10,
+            background: 'var(--bg)',
+            overflowWrap: 'anywhere',
+          }}
+        >
+          {agentConfig(cfg.baseUrl, AGENT_TOKEN_PLACEHOLDER, scope)}
+        </div>
+        <div className="row wrap">
+          <button className="btn btn-sm" onClick={() => void copyAgentConfig(AGENT_TOKEN_PLACEHOLDER, scope)}>
+            {t('tokens.copyConfig')}
+          </button>
+        </div>
+      </div>
 
       {error ? (
         <p className="tiny" style={{ color: 'var(--danger)', margin: 0 }}>

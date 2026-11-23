@@ -89,6 +89,7 @@ const DEFAULT_TARGETS = [
   'server',
   'deploy',
   'scripts',
+  'docs',
   'README.md',
   'vite.config.ts',
   'vite.mcp.config.ts',

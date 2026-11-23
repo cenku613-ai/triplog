@@ -11,8 +11,9 @@
  * - 產生一次性配對碼（`createPairingCode`），新裝置只打 8 個字就換到一把憑證（`pairWithCode`）
  * - 輪換主金鑰（`rotateMasterKey`）：換完 `.env` 那把當場失效，只剩資料庫裡那把能用
  *
- * 這組介面一律用主金鑰打 `/api/tokens`；拿簽發出去的 token 叫它是 403，
- * 那樣等於任何一把外流的 agent 憑證都能自己再發一把。唯一不需要金鑰的是 `/api/pair`，
+ * 這組介面用**主金鑰**或**已登入裝置那條 session** 打 `/api/tokens`：主金鑰管全站，
+ * 登入者只能替自己的帳號簽發與撤銷。唯獨拿簽發出去的 `tlk_` 叫它是 403——那樣等於任何
+ * 一把外流的 agent 憑證都能自己再發一把。唯一不需要金鑰的是 `/api/pair`，
  * 它靠配對碼本身授權，而且有獨立限流。
  */
 import type { Key } from '../i18n';
@@ -49,7 +50,7 @@ export function isIssuedToken(key: string): boolean {
  *
  * 分開認是為了介面別說錯話：金鑰模式下「不放主金鑰」等於改用可撤銷的憑證，
  * 帳號模式下這台裝置拿的則是自己的登入憑證，它看的是自己的帳本，
- * 也叫不到 /api/tokens 那幾個只有主金鑰能用的端點。
+ * 而且能替自己的帳號簽發 token（清單與撤銷也只看得見自己那批）。
  */
 export function isSessionToken(key: unknown): boolean {
   return /^tls_[A-Za-z0-9_-]{20,}$/.test(String(key ?? '').trim());
@@ -213,6 +214,33 @@ export function createApiToken(
 
 export function revokeApiToken(cfg: SyncConfig, id: string): Promise<{ changed: boolean }> {
   return request<{ changed: boolean }>(cfg, '/revoke', { id });
+}
+
+/** 範本裡留給你手改的兩格：token 與 bin.mjs 的絕對路徑（app 不知道 agent 跑在哪台電腦） */
+export const AGENT_TOKEN_PLACEHOLDER = 'tlk_…';
+export const AGENT_BIN_PLACEHOLDER = 'PATH/TO/triplog/mcp/bin.mjs';
+
+/**
+ * 產生一段能直接貼進 MCP 客戶端的設定（Qoder／Claude Desktop／Cursor 用的都是這個形狀）。
+ *
+ * 做成字串而不是物件，是因為呼叫端要的是「複製起來就能用」；格式由 `JSON.stringify`
+ * 負責，人手打字打不出來的錯這裡擋在源頭。
+ *
+ * 唯讀那把故意放 `TRIPLOG_READ_KEY` 並補上 `TRIPLOG_ALLOW_WRITE=0`：後端已經只給讀，
+ * 工具清單就別再留七個它一叫就 403 的寫入選項（這是 MCP server 認的兩個變數）。
+ * 可寫的放 `TRIPLOG_API_KEY`，寫不寫得動由憑證自己的 scope 決定，不是由變數決定。
+ */
+export function agentConfig(baseUrl: string, secret: string, scope: TokenScope): string {
+  const url = String(baseUrl ?? '').trim().replace(/\/+$/, '');
+  const env =
+    scope === 'read'
+      ? { TRIPLOG_URL: url, TRIPLOG_READ_KEY: secret, TRIPLOG_ALLOW_WRITE: '0' }
+      : { TRIPLOG_URL: url, TRIPLOG_API_KEY: secret };
+  return JSON.stringify(
+    { mcpServers: { triplog: { command: 'node', args: [AGENT_BIN_PLACEHOLDER], env } } },
+    null,
+    2,
+  );
 }
 
 /* -------------------------------------------------------------- 配對碼 */

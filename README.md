@@ -86,6 +86,7 @@ npm run preview     # 以本地靜態伺服器預覽 dist/，PWA 與離線行為
 | `server/src/keys.js`、`server/src/cli.js` | 配對碼與主金鑰輪換的純邏輯（形狀／雜湊／生死），以及 SSH 用的救援指令（`status`／`master-reset`／`master-set`） |
 | `deploy/compose.api.yml`、`deploy/Caddyfile.api` | 選裝 API 的 compose 覆寫與反代：容器不綁 port，公網仍只有 443 |
 | `mcp/` | 選裝的 MCP server，讓 AI agent 打上面的 API（見 `mcp/README.md`） |
+| `docs/agent-setup.md` | 給**使用者**的 agent 接手教學：簽憑證 → 貼 MCP 設定 → 驗收 → 撤銷（不講實作） |
 | `deploy/deploy.sh` | 一鍵推送＋建置＋啟動；`.env` 有金鑰時自動多掛 API |
 
 ### VPS 前置作業（Oracle Cloud 常見坑）
@@ -170,7 +171,7 @@ SSH_TARGET=opc@<你的IP> bash deploy/deploy.sh
 
 裝置端打開 app：**設定 → 跨裝置同步**，有兩條路——「用配對碼連線」（在已同步好的那台裝置的「金鑰與裝置」裡產生一組 8 個字的碼，這邊打進去就換到屬於這台裝置的憑證，長金鑰不必經手），或照原本「貼金鑰連線」貼入位址（`https://你的名字.duckdns.org`）與金鑰。選前者時按「配對」就會自己拉一次基準檔；選後者請按「測試連線」確認讀得到基準檔，再按「立即同步」。這兩顆鈕任何一顆成功時，只要本機放的是主金鑰，app 就會自動簽一把 90 天的本裝置憑證並寫回本機設定（主金鑰從此不在裝置上）；自動簽不動（例如貼的是 `.env` 的只讀鑰）就照舊用原本那把同步，只在卡片上留一句說明，不會丟錯誤、也不擋同步。之後可以打開自動開關，之後每次啟動 app 且線上時會自己拉一次同步並顯示結果。同一個卡片會列出伺服器上的旅行，可以只拉某一趟。
 
-Agent 端（MCP）請看 [`mcp/README.md`](mcp/README.md)：打包 `npm run mcp:build`，把 `mcp/bin.mjs` 掛進 MCP 客戶端並給 `TRIPLOG_URL` ＋金鑰，就有 14 個讀寫工具；`TRIPLOG_ALLOW_WRITE=0` 是唯讀模式。
+Agent 端（MCP）請看 [`mcp/README.md`](mcp/README.md)：打包 `npm run mcp:build`，把 `mcp/bin.mjs` 掛進 MCP 客戶端並給 `TRIPLOG_URL` ＋金鑰，就有 14 個讀寫工具；`TRIPLOG_ALLOW_WRITE=0` 是唯讀模式。要一份**照著做就行、不講實作**的版本給使用者，是 [`docs/agent-setup.md`](docs/agent-setup.md)（app 裡「設定 → 金鑰與裝置」下方那段四步說明就是從它縮出來的，按鈕能直接複製設定）。
 
 **金鑰要怎麼拿出來、換掉了該怎麼辦**：金鑰只有 `.env` 裡那一份，沒有第二份副本，所以要用時從那裡讀（別把它貼進聊天、issue 或 commit）：
 
@@ -188,11 +189,11 @@ grep TRIPLOG_READ_KEY .env    # 只讀金鑰：只想看的 agent
 - **自動簽發本裝置憑證**：走「貼金鑰連線」時不必按任何按鈕——「測試連線」或「立即同步」一成功，app 就用主金鑰簽一把 `本機裝置 · <裝置名>`（可讀可寫、90 天）並立刻改用，清單上那列會標成「本裝置」；剩下的效期不到 14 天時卡片會提前提醒，過期那天同步會停，重簽一把並按「讓這台裝置改用這把」就好。
 - **輪換主金鑰**：`.env` 那把外流時唯一真正的補救。按下去之後資料庫裡只存新鑰的雜湊，舊主金鑰與 `.env` 的只讀鑰**當場不再被接受**，app 簽發過的憑證則全部繼續可用（所以輪換前務必先幫至少一台裝置簽一把並套用，卡才會讓你按）。新值 `tlm_…` 也只顯示一次。
 
-簽發出來的憑證直接填進 MCP 客戶端就能用（可寫的填 `TRIPLOG_API_KEY`，唯讀的另加 `TRIPLOG_ALLOW_WRITE=0`）；拿它打 `/api/sync` 寫資料，如果簽發時選的是唯讀，會得到 403。
+簽發出來的憑證直接填進 MCP 客戶端就能用（可寫的填 `TRIPLOG_API_KEY`，唯讀的另加 `TRIPLOG_ALLOW_WRITE=0`）；卡片下方的「把它接給 agent」那塊會照你選的權限生成一段 `mcpServers` 設定，按「複製 agent 設定」貼進客戶端就少打一串字。拿它打 `/api/sync` 寫資料，如果簽發時選的是唯讀，會得到 403。
 
 邊界都在 `server/src/tokens.js`、`server/src/keys.js` 與 `server/src/index.js`：
 
-- 只有**主金鑰**能叫 `/api/tokens`（簽發、列清單、撤銷）、`/api/tokens/pairings`（發配對碼）與 `/api/tokens/master`（狀態與輪換），以及 `/api/admin/clear`。拿簽發出去的 token 叫它再發一把會是 403，否則任何一把外流的 agent 憑證都能自己擴權或把整個庫清掉
+- 簽發／列清單／撤銷要用**主金鑰**或**已登入裝置那條 session**：主金鑰管全站（`/api/tokens/pairings` 發配對碼、`/api/tokens/master` 狀態與輪換、`/api/admin/clear` 也只有它能用），登入者只能動自己帳號那批，簽出來的憑證也自帶那個帳號。拿簽發出去的 token 叫它再發一把會是 403，否則任何一把外流的 agent 憑證都能自己擴權或把整個庫清掉
 - 資料庫存的都是 `sha256(...)`（憑證、配對碼、輪換後的主金鑰都一樣），不是原文；`hint` 只留頭尾幾字讓人認得出，反推不回去
 - 層級只有兩檔：`read` 與 `write`，`write` 包含 `read`。沒有「只能動某一趟」這種細度——那由分享連結負責
 - 撤銷與過期都是即時生效（`revokedAt` 比 `expiresAt` 優先判斷）；使用統計只在真的通過限流後才累加，被擋掉的洪水不進清單，寫入另記 `writes`

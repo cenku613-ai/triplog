@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { setLang, t } from '../i18n';
 import {
+  AGENT_BIN_PLACEHOLDER,
+  AGENT_TOKEN_PLACEHOLDER,
   TokenError,
   activeTokens,
+  agentConfig,
   createApiToken,
   createPairingCode,
   daysLeft,
@@ -410,6 +413,44 @@ describe('本裝置憑證的自動簽發', () => {
     // 本機放的是主金鑰時根本不該跳這句（它沒有效期）
     expect(deviceTokenExpiringSoon([mine({ expiresAt: new Date(NOW + 86_400_000).toISOString() })], 'master-key', NOW)).toBe(false);
     expect(deviceTokenExpiringSoon([], key, NOW)).toBe(false);
+  });
+});
+
+describe('agentConfig（複製給 MCP 客戶端的那段設定）', () => {
+  const parsed = (scope: 'read' | 'write', secret = 'tlk_secretvalue') =>
+    JSON.parse(agentConfig('https://x.duckdns.org', secret, scope)) as {
+      mcpServers: { triplog: { command: string; args: string[]; env: Record<string, string> } };
+    };
+
+  it('可讀可寫的放 TRIPLOG_API_KEY，不多給唯讀開關', () => {
+    const env = parsed('write').mcpServers.triplog.env;
+    expect(env.TRIPLOG_URL).toBe('https://x.duckdns.org');
+    expect(env.TRIPLOG_API_KEY).toBe('tlk_secretvalue');
+    expect(env.TRIPLOG_READ_KEY).toBeUndefined();
+    expect(env.TRIPLOG_ALLOW_WRITE).toBeUndefined();
+  });
+
+  it('唯讀那把換成 TRIPLOG_READ_KEY 並關掉寫入工具', () => {
+    const cfg = parsed('read', AGENT_TOKEN_PLACEHOLDER);
+    const env = cfg.mcpServers.triplog.env;
+    expect(env.TRIPLOG_READ_KEY).toBe(AGENT_TOKEN_PLACEHOLDER);
+    expect(env.TRIPLOG_ALLOW_WRITE).toBe('0');
+    // 沒給 API_KEY：否則 MCP 那邊 KEY 會去抓一個根本不存在的值，報錯訊息會很怪
+    expect(env.TRIPLOG_API_KEY).toBeUndefined();
+  });
+
+  it('輸出真的是 JSON，路徑留佔位符（app 不會知道 agent 跑在哪台電腦）', () => {
+    const triplog = parsed('write').mcpServers.triplog;
+    expect(triplog.command).toBe('node');
+    expect(triplog.args).toEqual([AGENT_BIN_PLACEHOLDER]);
+    expect(AGENT_TOKEN_PLACEHOLDER.startsWith('tlk_')).toBe(true);
+  });
+
+  it('位址前後空白與多餘斜線都清掉——手貼設定最容易出的兩個錯', () => {
+    const env = JSON.parse(agentConfig('  https://x.duckdns.org///  ', 'tlk_a', 'read')) as {
+      mcpServers: { triplog: { env: Record<string, string> } };
+    };
+    expect(env.mcpServers.triplog.env.TRIPLOG_URL).toBe('https://x.duckdns.org');
   });
 });
 
