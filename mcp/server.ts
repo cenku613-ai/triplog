@@ -27,6 +27,12 @@ import {
 const VERSION = '0.1.0';
 const BASE_URL = (process.env.TRIPLOG_URL ?? 'https://triplogmo.duckdns.org').replace(/\/+$/, '');
 const KEY = (process.env.TRIPLOG_API_KEY ?? process.env.TRIPLOG_READ_KEY ?? '').trim();
+/**
+ * 主金鑰算在哪一份帳上：帳號 id 或那顆已驗證的 Google 信箱。
+ * 一台伺服器只有一個帳號時可以不填（後端自己認唯一那個）；多個人共用同一台時就填這裡，
+ * 否則 agent 讀到的會是「帳號制度之前那份空基準」——第一次登入把舊資料認領走之後就一直如此。
+ */
+const ACCOUNT = (process.env.TRIPLOG_ACCOUNT ?? '').trim();
 const ALLOW_WRITE = process.env.TRIPLOG_ALLOW_WRITE !== '0';
 const TIMEOUT = Number(process.env.TRIPLOG_TIMEOUT_MS ?? 30_000);
 
@@ -50,6 +56,8 @@ async function api(path: string, opts: { method?: string; body?: unknown } = {})
       method: opts.method ?? (opts.body ? 'POST' : 'GET'),
       headers: {
         authorization: `Bearer ${KEY}`,
+        // 主金鑰本身不認得帳號，靠這顆標頭指認要讀哪一份帳（後端只在主金鑰請求看它）
+        ...(ACCOUNT ? { 'x-triplog-account': ACCOUNT } : {}),
         ...(opts.body ? { 'content-type': 'application/json' } : {}),
       },
       body: opts.body ? JSON.stringify(opts.body) : undefined,

@@ -7,10 +7,11 @@ import type { DayItem } from '../../db/types';
 import { builtinKindLabel, categoryChar, categoryLabel, expenseLabel } from '../../lib/labels';
 import { formatAmount } from '../../db/currency';
 import { dateRange, dayIndex, dayLabel, formatDuration, prettyDate } from '../../lib/dates';
-import { ExpenseForm, ItemForm } from './ShareForms';
+import { ExpenseForm, ItemForm, PinForm } from './ShareForms';
 import {
   describeShareError,
   fetchShare,
+  loadSharePin,
   loadViewerName,
   type ShareView,
 } from '../../lib/share';
@@ -23,6 +24,7 @@ import {
  * 也把照片隔在外面，所以這裡拿到什麼就顯示什麼，不需要再做過濾。
  * 離線時會退回上次載入的副本（sessionStorage，關掉分頁就沒了），
  * 但連結被作廢或到期時一定顯示錯誤——那時候「還看得到舊內容」是漏洞不是善意。
+ * 設了訪客 PIN 的連結同理：PIN 對之前連副本都不該翻出來。
  */
 
 const CACHE_PREFIX = 'triplog:share:view:';
@@ -45,6 +47,15 @@ function writeCache(token: string, view: ShareView): void {
   }
 }
 
+/** 那份副本是靠 PIN 換來的，PIN 失效時要一起清掉，不然離線時還會被翻出來 */
+function dropCache(token: string): void {
+  try {
+    sessionStorage.removeItem(CACHE_PREFIX + token);
+  } catch {
+    /* 清不掉也沒什麼：下一次載入成功就會蓋過去 */
+  }
+}
+
 const shortWhen = (iso: string, locale: string): string => {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? '' : d.toLocaleString(locale, { dateStyle: 'short', timeStyle: 'short' });
@@ -54,7 +65,7 @@ export function SharePage({ token }: { token: string }) {
   const { toast } = useUi();
   const { t, lang, setLang, locale } = useI18n();
   const [view, setView] = useState<ShareView | null>(null);
-  const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [status, setStatus] = useState<'loading' | 'ready' | 'error' | 'pin'>('loading');
   const [error, setError] = useState('');
   /** 顯示的是上次載入的副本：讓人家知道這可能不是最新 */
   const [stale, setStale] = useState(false);
@@ -62,19 +73,41 @@ export function SharePage({ token }: { token: string }) {
   const [form, setForm] = useState<null | 'item' | 'expense'>(null);
   const [who, setWho] = useState(() => loadViewerName());
   const [online, setOnline] = useState(() => (typeof navigator === 'undefined' ? true : navigator.onLine !== false));
+  /** PIN 卡片要順帶說明這條是唯讀連結：伺服器在「要 PIN」那次回應裡就講了 */
+  const [pinReadonly, setPinReadonly] = useState(false);
+  /** 卡片自己的錯誤：例如分頁裡存著的 PIN 被擁有者換掉了 */
+  const [pinError, setPinError] = useState('');
+  /** 送出時才被伺服器說是唯讀（連結在開頁之後被改過）：按鈕要立刻收起來 */
+  const [writeBlocked, setWriteBlocked] = useState(false);
 
   const load = useCallback(
     async (opts: { silent?: boolean } = {}) => {
       if (!opts.silent) setStatus('loading');
       try {
-        const next = await fetchShare(token);
+        const next = await fetchShare(token, loadSharePin(token));
         setView(next);
         setStale(false);
+        setError('');
+        setPinError('');
+        // 連結被改回可寫時，上一次那個「唯讀」的判斷要跟著失效，以伺服器的說法為準
+        setWriteBlocked(false);
         setStatus('ready');
         writeCache(token, next);
         return next;
       } catch (err) {
         const code = (err as { code?: string })?.code ?? 'server';
+        if (code === 'pin') {
+          // 還沒填或填錯了：畫面換成問 PIN 那張卡，連上次載入的副本都不顯示
+          setView(null);
+          dropCache(token);
+          setStale(false);
+          setError('');
+          setPinReadonly((err as { canWrite?: boolean }).canWrite === false);
+          // 手上沒有 PIN 時「要 PIN」不是錯誤，只是關卡；有 PIN 還被打回才需要講一句
+          setPinError(loadSharePin(token) ? describeShareError(err, t) : '');
+          setStatus('pin');
+          return null;
+        }
         const cached = STALE_CODES.has(code) ? readCache(token) : null;
         if (cached) {
           setView(cached);
@@ -153,6 +186,30 @@ export function SharePage({ token }: { token: string }) {
     await load({ silent: true });
   };
 
+  /** 唯讀有兩個來源：伺服器一開始就說不能寫，或是寫下去才被擋掉 */
+  const canWrite = !!view && view.share.canWrite !== false && !writeBlocked;
+
+  const unlocked = (next: ShareView) => {
+    setView(next);
+    setStale(false);
+    setError('');
+    setPinError('');
+    setStatus('ready');
+    writeCache(token, next);
+  };
+
+  /**
+   * 寫入時才被 PIN 打回：表單裡再問一次沒意義（這一趟的內容本來就得靠 PIN 才拿得到），
+   * 所以連畫面帶副本一起收掉，回到問 PIN 那張卡。
+   */
+  const reopenPin = () => {
+    setForm(null);
+    setView(null);
+    dropCache(token);
+    setPinError(t('share.errPin'));
+    setStatus('pin');
+  };
+
   const toggleLang = () => setLang(lang === 'en' ? 'zh-Hant' : 'en');
 
   return (
@@ -175,6 +232,10 @@ export function SharePage({ token }: { token: string }) {
           <div className="card card-pad">
             <span className="tiny">{t('share.sending')}</span>
           </div>
+        ) : null}
+
+        {status === 'pin' ? (
+          <PinForm token={token} readOnly={pinReadonly} error={pinError} onUnlocked={unlocked} />
         ) : null}
 
         {status === 'error' ? (
@@ -212,14 +273,21 @@ export function SharePage({ token }: { token: string }) {
                 <div className="tiny">{t('share.updatedAt', { when: shortWhen(view.totals.lastWrite, locale) })}</div>
               ) : null}
               {stale ? <span className="badge">{t('share.stale')}</span> : null}
-              <div className="row wrap" style={{ marginTop: 'var(--sp-2)' }}>
-                <button className="btn btn-sm btn-primary" onClick={() => setForm('expense')}>
-                  {t('share.addSpend')}
-                </button>
-                <button className="btn btn-sm" onClick={() => setForm('item')}>
-                  {t('share.addItem')}
-                </button>
-              </div>
+              {/* 唯讀連結不把按鈕留在那裡讓人按了才知道不行：一句話講清楚這頁能做什麼 */}
+              {canWrite ? (
+                <div className="row wrap" style={{ marginTop: 'var(--sp-2)' }}>
+                  <button className="btn btn-sm btn-primary" onClick={() => setForm('expense')}>
+                    {t('share.addSpend')}
+                  </button>
+                  <button className="btn btn-sm" onClick={() => setForm('item')}>
+                    {t('share.addItem')}
+                  </button>
+                </div>
+              ) : (
+                <p className="tiny" style={{ margin: 0 }}>
+                  {t('share.viewOnly')}
+                </p>
+              )}
             </section>
 
             <div className="tabs" role="tablist">
@@ -338,6 +406,8 @@ export function SharePage({ token }: { token: string }) {
           onWho={setWho}
           onClose={() => setForm(null)}
           onSaved={() => void afterSaved()}
+          onNeedPin={reopenPin}
+          onReadOnly={() => setWriteBlocked(true)}
         />
       ) : null}
       {view && form === 'item' ? (
@@ -347,6 +417,8 @@ export function SharePage({ token }: { token: string }) {
           who={who}
           onClose={() => setForm(null)}
           onSaved={() => void afterSaved()}
+          onNeedPin={reopenPin}
+          onReadOnly={() => setWriteBlocked(true)}
         />
       ) : null}
 

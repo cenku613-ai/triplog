@@ -518,6 +518,120 @@ await check('沒被作廢的另一把連結還活著', async () => {
   assert.equal(r.json.trip.id, 'trip_b');
 });
 
+console.log('\n— 訪客共筆（唯讀／PIN／署名）');
+/*
+ * 這一節測的是「不想登入的同行者」那條路（Phase 4b）：他手上只有連結，
+ * 所以規則必須由伺服器守住——唯讀就是寫不進去、PIN 沒對就連內容都看不到、
+ * 名字只是給主人看的註記（不是身分）。
+ */
+let roToken = '';
+let pinToken = '';
+await check('唯讀連結：讀得到那一趟，POST 一律 403 且講清楚是唯讀', async () => {
+  const made = await api('/api/shares', { method: 'POST', body: { tripId: 'trip_a', canWrite: false } });
+  assert.equal(made.status, 200, made.text);
+  roToken = made.json.share.token;
+  assert.equal(made.json.share.canWrite, false, '簽發回應要照實講這條是唯讀');
+  assert.equal(made.json.share.hasPin, false);
+  const view = await api(`/api/share/${roToken}`, { key: null });
+  assert.equal(view.status, 200, view.text);
+  assert.equal(view.json.share.canWrite, false, '分享頁靠這個旗標把「記一筆」收起來');
+  assert.equal(view.json.trip.id, 'trip_a');
+  const denied = await api(`/api/share/${roToken}/expense`, {
+    key: null,
+    method: 'POST',
+    body: { amount: 100, currency: 'TWD', date: '2026-03-02', who: '路過的阿明' },
+  });
+  assert.equal(denied.status, 403, denied.text);
+  assert.match(denied.json.error, /唯讀/, '文案要讓前端能分流（也要讓人看懂發生了什麼）');
+  assert.equal(denied.json.readOnly, true);
+});
+await check('PIN 的形狀不對就 400，而且不會生出一條沒 PIN 的連結', async () => {
+  const before = (await api('/api/shares?tripId=trip_a')).json.shares.length;
+  for (const bad of ['123', '12345678901', '12a4', '1234 5678 9']) {
+    const r = await api('/api/shares', { method: 'POST', body: { tripId: 'trip_a', pin: bad } });
+    assert.equal(r.status, 400, `pin=${bad} → ${r.status} ${r.text}`);
+    assert.match(r.json.error, /PIN/, r.text);
+  }
+  const after = (await api('/api/shares?tripId=trip_a')).json.shares.length;
+  assert.equal(after, before, '上面那幾個壞 PIN 的請求不該留下任何連結');
+});
+await check('設了 PIN：沒對連內容都看不到，對了才讀到、也才寫得進去', async () => {
+  const made = await api('/api/shares', { method: 'POST', body: { tripId: 'trip_a', pin: '4321', expiresInDays: 30 } });
+  assert.equal(made.status, 200, made.text);
+  pinToken = made.json.share.token;
+  assert.equal(made.json.pin, '4321', '明文只在這一次回應裡出現');
+  assert.equal(made.json.share.hasPin, true);
+  assert.ok(!JSON.stringify(made.json).includes('pin_hash'), '資料庫欄位名都不該出現在回應裡');
+
+  const noPin = await api(`/api/share/${pinToken}`, { key: null });
+  assert.equal(noPin.status, 401, noPin.text);
+  assert.equal(noPin.json.needPin, true, '前端靠這個旗標決定要不要彈 PIN');
+  assert.equal(noPin.json.trip, undefined, '沒對 PIN 就不能吐出行程內容');
+  assert.equal(JSON.stringify(noPin.json).includes('hasPin'), false, '匿名回應不透露連結的內部旗標');
+  const wrongPin = await api(`/api/share/${pinToken}`, { key: null, headers: { 'x-triplog-pin': '1234' } });
+  assert.equal(wrongPin.status, 401, wrongPin.text);
+  const right = await api(`/api/share/${pinToken}`, { key: null, headers: { 'x-triplog-pin': '4321' } });
+  assert.equal(right.status, 200, right.text);
+  assert.equal(right.json.trip.id, 'trip_a');
+  assert.equal(right.json.share.canWrite, true, '這條沒關寫入，前端才不會把表單藏起來');
+
+  const writeNoPin = await api(`/api/share/${pinToken}/expense`, {
+    key: null,
+    method: 'POST',
+    body: { amount: 200, currency: 'TWD', date: '2026-03-02' },
+  });
+  assert.equal(writeNoPin.status, 401, writeNoPin.text);
+  assert.equal(writeNoPin.json.needPin, true);
+  const writeBodyPin = await api(`/api/share/${pinToken}/expense`, {
+    key: null,
+    method: 'POST',
+    body: { amount: 200, currency: 'TWD', date: '2026-03-02', pin: '4321', who: '小美' },
+  });
+  assert.equal(writeBodyPin.status, 200, writeBodyPin.text);
+  assert.equal(writeBodyPin.json.expense.payee, '', '名字不自動等於付錢者：那是使用者自己填的欄位');
+  const writeHeadPin = await api(`/api/share/${pinToken}/item`, {
+    key: null,
+    method: 'POST',
+    headers: { 'x-triplog-pin': '4321' },
+    body: { title: '錦市場', date: '2026-03-02', kind: 'activity', who: '小美' },
+  });
+  assert.equal(writeHeadPin.status, 200, writeHeadPin.text);
+  assert.equal(writeHeadPin.json.item.tripId, 'trip_a');
+});
+await check('連結清單讓主人看得出：能不能記、有沒有 PIN、最後誰用過', async () => {
+  const rows = (await api('/api/shares?tripId=trip_a')).json.shares;
+  const pin = rows.find((s) => s.token === pinToken);
+  const ro = rows.find((s) => s.token === roToken);
+  assert.ok(pin && ro, `兩條連結都要在清單上：${JSON.stringify(rows.map((r) => r.token))}`);
+  assert.equal(pin.hasPin, true);
+  assert.equal(pin.canWrite, true);
+  assert.equal(pin.lastWriter, '小美', `lastWriter=${pin.lastWriter}`);
+  assert.ok(pin.writes >= 2, `用過兩次以上：writes=${pin.writes}`);
+  assert.equal(ro.canWrite, false);
+  assert.equal(ro.hasPin, false);
+  assert.equal(ro.lastWriter, '', '唯讀那條被人試著寫過但不該留下署名');
+  assert.ok(!JSON.stringify(rows).includes('pin_hash'), '清單不能帶出雜湊');
+});
+await check('舊連結在新規則下不變：預設仍可寫、沒有 PIN', async () => {
+  const r = await api(`/api/share/${survivorToken}`, { key: null });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.share.canWrite, true, '既有的連結行為一個字都不能變');
+  const row = (await api('/api/shares')).json.shares.find((s) => s.token === survivorToken);
+  assert.equal(row.hasPin, false);
+  assert.equal(row.canWrite, true);
+});
+await check('PIN 試錯有自己的限流：每分鐘十次，打爆就 429', async () => {
+  const made = await api('/api/shares', { method: 'POST', body: { tripId: 'trip_b', pin: '9999' } });
+  const token = made.json.share.token;
+  let last = null;
+  for (let i = 0; i < 12; i++) last = await api(`/api/share/${token}`, { key: null, headers: { 'x-triplog-pin': `000${i}`.slice(-4) } });
+  assert.equal(last.status, 429, `第十二次應該已被擋：${last.status} ${last.text}`);
+  assert.match(last.json.error, /PIN|一分鐘/, last.text);
+  // 同一條連結就算 PIN 對了也還在限流窗口裡（同 token|ip），但別的連結不受影響
+  const other = await api(`/api/share/${survivorToken}`, { key: null });
+  assert.equal(other.status, 200, '限流是按連結分開的，不能一條被試就全站陪葬');
+});
+
 console.log('\n— API token 簽發（可撤銷的 bearer）');
 let readToken = '';
 let writeToken = '';
@@ -969,6 +1083,7 @@ child = authBoot();
 await waitUpAt(AUTH_BASE);
 const A2 = (...a) => hit(AUTH_BASE, ...a);
 /** 後面好幾個檢查都要用同一組 session，所以放在外層 */
+let anaUid = '';
 let sessionA = '';
 let sessionB = '';
 
@@ -997,6 +1112,7 @@ await check('Google ID token 換到 session，第一次登入把舊基準認領�
   assert.equal(r.user.name, '安娜');
   assert.equal(r.user.id.startsWith('u_'), true);
   assert.equal(r.user.googleSub, undefined, '回應不要把 Google 的 sub 傳出去');
+  anaUid = r.user.id;
   sessionA = r.token;
   const base = await A2('/api/base', { token: r.token });
   assert.equal(base.status, 200, base.text);
@@ -1005,9 +1121,15 @@ await check('Google ID token 換到 session，第一次登入把舊基準認領�
   assert.equal(me.json.user.id, r.user.id, me.text);
 });
 
-await check('認領之後，金鑰那條路不再看得到這個人的帳本', async () => {
-  const gone = await A2('/api/base', { token: KEY });
-  assert.equal(gone.status, 404, `基準已被認領，金鑰不該還看得到：${gone.status} ${gone.text}`);
+await check('認領之後主金鑰不會看到空帳本：只有一個帳號時自動落在那一份上', async () => {
+  // 這一條測的是正式機踩過的事故：第一次 Google 登入把舊基準認領走（搬走，不是複製），
+  // 而金鑰／`tlk_`／MCP 沒有身分可比對，於是 `/api/base` 直接 404、agent 看到空帳本。
+  // 现在的規矩是：全站只有一個帳號時，金鑰就落在那個帳號的帳上。
+  const seen = await A2('/api/base', { token: KEY });
+  assert.equal(seen.status, 200, `唯一帳號要看得見：${seen.status} ${seen.text}`);
+  assert.ok(seen.json.base.trips.some((t) => t.id === 'trip_a'), '那該是安娜認領過的那份基準');
+  const health = await A2('/api/health');
+  assert.equal(health.json.auth.keysSeeUid, anaUid, `健康檢查要講清楚金鑰落在哪：${JSON.stringify(health.json.auth)}`);
   const admin = await A2('/api/tokens', { token: KEY });
   assert.equal(admin.status, 200, admin.text);
   assert.ok(Array.isArray(admin.json.tokens), '主金鑰仍保有管理端點（救援用）');
@@ -1025,6 +1147,114 @@ await check('第二個帳號有自己的空帳本，寫進去的東西不會出�
   const mineA = await A2('/api/trips', { token: sessionA });
   assert.equal(mineA.json.trips.some((t) => t.id === 'trip_z'), false, '跨帳號看到了別人的行程');
   assert.ok(mineA.json.trips.some((t) => t.id === 'trip_a'), mineA.text);
+});
+
+/* ---------------------------------- 金鑰／憑證要落在哪一份帳上（Phase 4a） */
+
+await check('兩個帳號之後金鑰不再亂猜：要嘛指名，要嘛退回帳號制度之前那份基準', async () => {
+  const blind = await A2('/api/base', { token: KEY });
+  assert.equal(blind.status, 404, `沒有人可當預設時就該是空的：${blind.status} ${blind.text}`);
+  const byEmail = await A2('/api/base', { token: KEY, headers: { 'x-triplog-account': 'bo@example.com' } });
+  assert.equal(byEmail.status, 200, byEmail.text);
+  assert.deepEqual(byEmail.json.base.trips.map((t) => t.id), ['trip_z'], '指誰就只看誰的帳');
+  const byUid = await A2('/api/base', { token: KEY, headers: { 'x-triplog-account': anaUid } });
+  assert.equal(byUid.status, 200, byUid.text);
+  assert.ok(byUid.json.base.trips.some((t) => t.id === 'trip_a'), '帳號 id 與信箱兩種寫法都要認');
+  const ghost = await A2('/api/base', { token: KEY, headers: { 'x-triplog-account': 'nobody@example.com' } });
+  assert.equal(ghost.status, 404, '指不到的帳號不能順手退回首頁那份帳');
+  const health = await A2('/api/health');
+  assert.equal(health.json.auth.keysSeeUid, '', `健康檢查要承認現在沒預設帳號：${JSON.stringify(health.json.auth)}`);
+});
+
+await check('只讀金鑰不能靠標頭換人：那顆標頭只對主金鑰有效', async () => {
+  const r = await A2('/api/base', { token: READ, headers: { 'x-triplog-account': 'ana@example.com' } });
+  assert.equal(r.status, 404, r.text);
+});
+
+await check('用 session 簽的憑證自帶帳號：之後那台裝置不用登入也看得到自己的帳', async () => {
+  const mint = await A2('/api/tokens', { method: 'POST', token: sessionA, body: { label: '安娜的 agent', scope: 'write', expiresInDays: 7 } });
+  assert.equal(mint.status, 200, mint.text);
+  assert.match(String(mint.json.secret ?? ''), /^tlk_/, mint.text);
+  assert.equal(mint.json.token.uid, anaUid, '簽出來就要認得安娜，否則綁帳號這件事只做一半');
+  const seen = await A2('/api/trips', { token: mint.json.secret });
+  assert.equal(seen.status, 200, seen.text);
+  assert.ok(seen.json.trips.some((t) => t.id === 'trip_a'), '憑證自己知道是哪份帳，不需要標頭');
+  assert.equal(seen.json.trips.some((t) => t.id === 'trip_z'), false, '也不能順手看到 Bo 的');
+  // 清單與撤銷都以帳號為單位：別人的憑證連存在與否都不該讓你知道
+  const mineRows = (await A2('/api/tokens', { token: sessionA })).json.tokens;
+  assert.ok(mineRows.some((r) => r.id === mint.json.token.id), `自己的清單要看到自己簽的：${JSON.stringify(mineRows)}`);
+  const boRows = (await A2('/api/tokens', { token: sessionB })).json.tokens;
+  assert.equal(boRows.some((r) => r.id === mint.json.token.id), false, '別人簽的不該出現在你的清單上');
+  const stolen = await A2('/api/tokens/revoke', { method: 'POST', token: sessionB, body: { id: mint.json.token.id } });
+  assert.equal(stolen.status, 404, '撤銷別人的憑證要當它不存在');
+  const own = await A2('/api/tokens/revoke', { method: 'POST', token: sessionA, body: { id: mint.json.token.id } });
+  assert.equal(own.status, 200, own.text);
+  const dead = await A2('/api/trips', { token: mint.json.secret });
+  assert.equal(dead.status, 401, `撤銷後就該進不來：${dead.status} ${dead.text}`);
+});
+
+await check('配對碼也認得帳號：新裝置配對完不會看到空帳本', async () => {
+  const made = await A2('/api/tokens/pairings', { method: 'POST', token: sessionB, body: { label: 'Bo 的新手機', scope: 'write', expiresInMinutes: 30 } });
+  assert.equal(made.status, 200, made.text);
+  assert.equal(made.json.pairing.uid, (await A2('/api/me', { token: sessionB })).json.user.id, made.text);
+  const paired = await A2('/api/pair', { method: 'POST', body: { code: made.json.code, device: '手機' } });
+  assert.equal(paired.status, 200, paired.text);
+  const seen = await A2('/api/trips', { token: paired.json.secret });
+  assert.equal(seen.status, 200, seen.text);
+  assert.deepEqual(seen.json.trips.map((t) => t.id), ['trip_z'], '配對出來的憑證要落在邀請它那組碼的主人帳上');
+  const rows = (await A2('/api/tokens/pairings', { token: sessionA })).json.pairings;
+  assert.equal(rows.some((r) => r.id === made.json.pairing.id), false, '別人發的配對碼不在你的清單裡');
+});
+
+await check('TRIPLOG_DEFAULT_UID：多人共用一台時，金鑰固定看那一個帳號', async () => {
+  // 另開一台（自己的資料夾）：環境變數是開機時讀的，不能拿正在跑的那台測
+  const envDir = mkdtempSync(path.join(os.tmpdir(), 'triplog-smoke-uid-'));
+  const envBase = `http://127.0.0.1:${AUTH_PORT + 60}`;
+  const withDefault = spawn(process.execPath, [entry], {
+    env: {
+      ...process.env,
+      TRIPLOG_API_KEY: KEY,
+      TRIPLOG_READ_KEY: READ,
+      TRIPLOG_DATA_DIR: envDir,
+      PORT: String(AUTH_PORT + 60),
+      TRIPLOG_AUTH: '1',
+      TRIPLOG_GOOGLE_CLIENT_ID: CLIENT_ID,
+      TRIPLOG_GOOGLE_JWKS_URL: `http://127.0.0.1:${JWKS_PORT}/certs`,
+      TRIPLOG_DEFAULT_UID: 'carol@example.com',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  withDefault.stdout.on('data', (d) => logs.push(String(d)));
+  withDefault.stderr.on('data', (d) => logs.push(String(d)));
+  try {
+    await waitUpAt(envBase);
+    const bo2 = await hit(envBase, '/api/auth/google', { method: 'POST', body: { idToken: idToken({ sub: '776655443322110099887', email: 'bo2@example.com', name: 'Bo2' }) } });
+    assert.equal(bo2.status, 200, bo2.text);
+    const carol = await hit(envBase, '/api/auth/google', { method: 'POST', body: { idToken: idToken({ sub: '665544332211009988776', email: 'carol@example.com', name: 'Carol' }) } });
+    assert.equal(carol.status, 200, carol.text);
+    await hit(envBase, '/api/backup', { method: 'POST', token: carol.json.token, body: { format: 'triplog-backup', exportedAt: iso(40), trips: [{ id: 'trip_c', name: 'Carol 的墾丁', startDate: '2026-07-01', endDate: '2026-07-02', updatedAt: iso(40), createdAt: iso(40) }], dayItems: [], expenses: [], categories: [], photos: [], meta: [] } });
+    // 兩個帳號都在，「唯一那個」這條規則已經失效；此時預設完全由環境變數決定
+    const seen = await hit(envBase, '/api/trips', { token: KEY });
+    assert.equal(seen.status, 200, seen.text);
+    assert.deepEqual(seen.json.trips.map((t) => t.id), ['trip_c'], '金鑰該落在設定的那個帳號上');
+    const health = await hit(envBase, '/api/health');
+    assert.equal(health.json.auth.keysSeeUid, carol.json.user.id, `健康檢查要講出同一個答案：${JSON.stringify(health.json.auth)}`);
+    const override = await hit(envBase, '/api/trips', { token: KEY, headers: { 'x-triplog-account': 'bo2@example.com' } });
+    assert.equal(override.json.trips.some((t) => t.id === 'trip_c'), false, '請求上指名時以請求為準');
+    const minted = await hit(envBase, '/api/tokens', { method: 'POST', token: KEY, body: { label: '備份排程', scope: 'write' } });
+    assert.equal(minted.status, 200, minted.text);
+    assert.equal(minted.json.token.uid, carol.json.user.id, '主金鑰簽的憑證也要跟著預設帳號落地');
+    const viaToken = await hit(envBase, '/api/trips', { token: minted.json.secret });
+    assert.deepEqual(viaToken.json.trips.map((t) => t.id), ['trip_c'], '那把憑證之後自己就知道在看誰的帳');
+  } finally {
+    withDefault.kill();
+    await new Promise((r) => setTimeout(r, 400));
+    try {
+      rmSync(envDir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      /* Windows 的 WAL 鎖而已 */
+    }
+  }
 });
 
 await check('同一個 Google 帳號再登入不會生出第二個帳本，也不會多一個 people 列', async () => {

@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useUi } from '../../app/ui';
 import { useI18n } from '../../i18n';
+import { useSignOut } from '../auth/useSignOut';
 import { guessDeviceName } from '../../lib/tokens';
 import { loadSyncConfig } from '../../lib/sync';
 import {
@@ -21,10 +22,8 @@ import {
   listMySessions,
   loadAccount,
   loginWithGoogle,
-  logout,
   mountGoogleButton,
   refreshAccount,
-  rememberMode,
   rememberedMode,
   revokeMySession,
   sameOriginBase,
@@ -201,23 +200,8 @@ export function AccountCard() {
     }
   };
 
-  const signOut = async () => {
-    if (!account) return;
-    const ok = await ask(t('auth.logoutQ'), { confirmLabel: t('auth.logout'), danger: true });
-    if (!ok) return;
-    setBusy('logout');
-    try {
-      await logout(account);
-      await finishLogout(account);
-      rememberMode('account');
-      window.location.reload();
-    } catch (err) {
-      // 斷線也要讓這台裝置先脫離登入狀態，否則畫面會卡在「已登入但什麼都讀不到」
-      await finishLogout(account);
-      window.location.reload();
-      fail(err);
-    }
-  };
+  /* 登出的實作抽在 useSignOut，讓頂部導覽那顆按鈕按的是同一支（收尾少一步就會卡在半登入） */
+  const { busy: signingOut, signOut } = useSignOut();
 
   /* ------------------------------------------------------------- 未登入 */
 
@@ -283,7 +267,7 @@ export function AccountCard() {
         <button type="button" className="btn btn-sm" onClick={refresh} disabled={busy !== ''}>
           {busy === 'refresh' ? t('auth.working') : t('auth.refresh')}
         </button>
-        <button type="button" className="btn btn-sm" onClick={signOut} disabled={busy !== ''}>
+        <button type="button" className="btn btn-sm" onClick={signOut} disabled={busy !== '' || signingOut}>
           {t('auth.logout')}
         </button>
       </div>

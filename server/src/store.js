@@ -107,6 +107,12 @@ function shareView(r) {
     hits: Number(r.hits ?? 0),
     writes: Number(r.writes ?? 0),
     lastSeenAt: r.last_seen_at ?? null,
+    /** 唯讀連結看得到、按下去不會寫東西（Phase 4b 給「只想讓人看」的那組人） */
+    canWrite: r.can_write !== 0,
+    /** 有無訪客 PIN：只講有沒有，雜湊留在資料層，清單回應裡永遠看不到它 */
+    hasPin: Boolean(r.pin_hash),
+    /** 最後一個用這條連結記錄的人：邀請人在自己手機上就能看到「小美記了兩筆」 */
+    lastWriter: r.last_writer ?? '',
   };
 }
 
@@ -120,6 +126,8 @@ function tokenView(r) {
     hint: r.hint ?? '',
     label: r.label ?? '',
     scope: r.scope === 'write' ? 'write' : 'read',
+    /** 這把鑰打 API 時算誰的帳：'' ＝簽發時還不知道帳號（走預設帳號那條路） */
+    uid: r.user_id ?? '',
     createdAt: r.created_at,
     expiresAt: r.expires_at ?? null,
     revokedAt: r.revoked_at ?? null,
@@ -138,6 +146,8 @@ function pairingView(r) {
     id: r.id,
     label: r.label ?? '',
     scope: r.scope === 'read' ? 'read' : 'write',
+    /** 用這組配對碼換到的憑證會落在誰的帳上（跟簽發者一致，不會掉回空分帳） */
+    uid: r.user_id ?? '',
     createdAt: r.created_at,
     expiresAt: r.expires_at ?? null,
     usedAt: r.used_at ?? null,
@@ -358,6 +368,43 @@ export class Store {
     } catch {
       /* 欄位已存在 */
     }
+    /**
+     * 簽出去的憑證與配對碼同樣要認得帳號。理由有一個真實事故：第一次登入會把舊基準
+     * 認領進那個帳號（claimLegacyBase），而金鑰與 `tlk_` requests 向來解析成 `''` 分帳，
+     * 於是「認領之後」主金鑰打 /api/base 直接 404、MCP 看到的是空帳本。
+     * 從這版起新簽的都帶簽發者帳號；舊的（'' ）照舊走預設帳號那條路（見 index.js defaultAccountUid）。
+     */
+    try {
+      this.db.exec("ALTER TABLE api_tokens ADD COLUMN user_id TEXT NOT NULL DEFAULT ''");
+    } catch {
+      /* 欄位已存在 */
+    }
+    try {
+      this.db.exec("ALTER TABLE pairings ADD COLUMN user_id TEXT NOT NULL DEFAULT ''");
+    } catch {
+      /* 欄位已存在 */
+    }
+    /**
+     * 訪客共筆的三個開關（Phase 4b）：這條連結能不能記、要不要 PIN、最後是誰用它記的。
+     * `pin_hash` 存雜湊、`can_write` 預設 1（既有的連結行為完全不變），
+     * `last_writer` 是顯示用的名字——真正的付錢者已经在 expenses.payee 裡，這裡只是讓
+     * 主人知道「這把連結有人用過、是小美」。
+     */
+    try {
+      this.db.exec('ALTER TABLE shares ADD COLUMN can_write INTEGER NOT NULL DEFAULT 1');
+    } catch {
+      /* 欄位已存在 */
+    }
+    try {
+      this.db.exec('ALTER TABLE shares ADD COLUMN pin_hash TEXT');
+    } catch {
+      /* 欄位已存在 */
+    }
+    try {
+      this.db.exec("ALTER TABLE shares ADD COLUMN last_writer TEXT NOT NULL DEFAULT ''");
+    } catch {
+      /* 欄位已存在 */
+    }
     this.db.exec('CREATE INDEX IF NOT EXISTS snapshots_user ON snapshots(user_id, exported_at DESC, created_at DESC)');
     this._insert = this.db.prepare(
       'INSERT INTO snapshots (id, user_id, exported_at, created_at, source, bytes, fp, payload) VALUES (@id, @uid, @exportedAt, @createdAt, @source, @bytes, @fp, @payload)',
@@ -384,7 +431,7 @@ export class Store {
     this._metaGet = this.db.prepare('SELECT value FROM meta WHERE key = ?');
     this._metaSet = this.db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
     this._shareInsert = this.db.prepare(
-      'INSERT INTO shares (token, user_id, trip_id, label, created_at, expires_at) VALUES (@token, @uid, @tripId, @label, @createdAt, @expiresAt)',
+      'INSERT INTO shares (token, user_id, trip_id, label, created_at, expires_at, can_write, pin_hash) VALUES (@token, @uid, @tripId, @label, @createdAt, @expiresAt, @canWrite, @pinHash)',
     );
     this._shareGet = this.db.prepare('SELECT * FROM shares WHERE token = ?');
     this._shareList = this.db.prepare('SELECT * FROM shares WHERE user_id = ? AND trip_id = ? ORDER BY created_at DESC');
@@ -395,26 +442,34 @@ export class Store {
       'UPDATE shares SET revoked_at = ? WHERE token = ? AND user_id = ? AND revoked_at IS NULL',
     );
     this._shareHit = this.db.prepare(
-      'UPDATE shares SET hits = hits + @read, writes = writes + @write, last_seen_at = @at WHERE token = @token',
+      'UPDATE shares SET hits = hits + @read, writes = writes + @write, last_seen_at = @at, last_writer = COALESCE(NULLIF(@who, \'\'), last_writer) WHERE token = @token',
     );
     this._tokInsert = this.db.prepare(
-      'INSERT INTO api_tokens (id, token_hash, hint, label, scope, created_at, expires_at) VALUES (@id, @hash, @hint, @label, @scope, @createdAt, @expiresAt)',
+      'INSERT INTO api_tokens (id, token_hash, hint, label, scope, user_id, created_at, expires_at) VALUES (@id, @hash, @hint, @label, @scope, @uid, @createdAt, @expiresAt)',
     );
     this._tokByHash = this.db.prepare('SELECT * FROM api_tokens WHERE token_hash = ?');
     this._tokById = this.db.prepare('SELECT * FROM api_tokens WHERE id = ?');
     this._tokList = this.db.prepare('SELECT * FROM api_tokens ORDER BY created_at DESC LIMIT 200');
+    this._tokListUser = this.db.prepare('SELECT * FROM api_tokens WHERE user_id = ? ORDER BY created_at DESC LIMIT 200');
     this._tokRevoke = this.db.prepare('UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL');
+    this._tokRevokeOwn = this.db.prepare(
+      'UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL',
+    );
     this._tokHit = this.db.prepare(
       'UPDATE api_tokens SET hits = hits + @read, writes = writes + @write, last_seen_at = @at WHERE id = @id',
     );
     this._pairInsert = this.db.prepare(
-      'INSERT INTO pairings (id, code_hash, label, scope, created_at, expires_at) VALUES (@id, @hash, @label, @scope, @createdAt, @expiresAt)',
+      'INSERT INTO pairings (id, code_hash, label, scope, user_id, created_at, expires_at) VALUES (@id, @hash, @label, @scope, @uid, @createdAt, @expiresAt)',
     );
     this._pairByHash = this.db.prepare('SELECT * FROM pairings WHERE code_hash = ?');
     this._pairById = this.db.prepare('SELECT * FROM pairings WHERE id = ?');
     this._pairList = this.db.prepare('SELECT * FROM pairings ORDER BY created_at DESC LIMIT 100');
+    this._pairListUser = this.db.prepare('SELECT * FROM pairings WHERE user_id = ? ORDER BY created_at DESC LIMIT 100');
     this._pairUse = this.db.prepare('UPDATE pairings SET used_at = ?, used_label = ? WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL');
     this._pairRevoke = this.db.prepare('UPDATE pairings SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL AND used_at IS NULL');
+    this._pairRevokeOwn = this.db.prepare(
+      'UPDATE pairings SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL AND used_at IS NULL',
+    );
     this._keyGet = this.db.prepare('SELECT value FROM server_keys WHERE key = ?');
     this._keySet = this.db.prepare('INSERT INTO server_keys (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
     this._keyDel = this.db.prepare('DELETE FROM server_keys WHERE key = ?');
@@ -629,9 +684,9 @@ export class Store {
 
   /* ------------------------------------------------------------ 配對碼 */
 
-  createPairing({ id, hash, label, scope, expiresAt }) {
+  createPairing({ id, hash, label, scope, expiresAt, uid = '' }) {
     const createdAt = new Date().toISOString();
-    this._pairInsert.run({ id, hash, label, scope, createdAt, expiresAt });
+    this._pairInsert.run({ id, hash, label, scope, uid: String(uid ?? ''), createdAt, expiresAt });
     return pairingView(this._pairById.get(id));
   }
 
@@ -646,8 +701,14 @@ export class Store {
     return row ? pairingView(row) : undefined;
   }
 
-  listPairings() {
-    return this._pairList.all().map(pairingView);
+  /**
+   * `uid` 傳 null（預設）是「整台伺服器的配對碼」，只有主金鑰該這樣查；
+   * 登入者查自己的那份清單，所以傳帳號 id。注意 `''` 是有意義的分帳（帳號制度之前那筆），
+   * 因此判斷用 `=== null`，不能用 `uid || null`。
+   */
+  listPairings(uid = null) {
+    if (uid === null) return this._pairList.all().map(pairingView);
+    return this._pairListUser.all(String(uid)).map(pairingView);
   }
 
   /** 用掉就蓋時間戳；回 false 代表已經被用過或已被作廢（防重放） */
@@ -655,16 +716,18 @@ export class Store {
     return this._pairUse.run(new Date().toISOString(), String(usedLabel ?? '').slice(0, 60), String(id ?? '')).changes > 0;
   }
 
-  revokePairing(id) {
-    return this._pairRevoke.run(new Date().toISOString(), String(id ?? '')).changes > 0;
+  revokePairing(id, uid = null) {
+    const at = new Date().toISOString();
+    if (uid === null) return this._pairRevoke.run(at, String(id ?? '')).changes > 0;
+    return this._pairRevokeOwn.run(at, String(id ?? ''), String(uid)).changes > 0;
   }
 
   /* -------------------------------------------------- 簽發出去的 API token */
 
   /** 原字串不在這裡出現，傳進來的已經是雜湊 */
-  createApiToken({ id, hash, hint, label, scope, expiresAt = null }) {
+  createApiToken({ id, hash, hint, label, scope, expiresAt = null, uid = '' }) {
     const createdAt = new Date().toISOString();
-    this._tokInsert.run({ id, hash, hint, label, scope, createdAt, expiresAt });
+    this._tokInsert.run({ id, hash, hint, label, scope, uid: String(uid ?? ''), createdAt, expiresAt });
     return tokenView(this._tokById.get(id));
   }
 
@@ -674,17 +737,23 @@ export class Store {
     return row ? tokenView(row) : undefined;
   }
 
-  apiToken(id) {
+  /** 清單與撤銷都按分帳收口：`uid === null` 才是「整台」（只有主金鑰該這樣看） */
+  apiToken(id, uid = null) {
     const row = this._tokById.get(String(id ?? ''));
-    return row ? tokenView(row) : undefined;
+    if (!row) return undefined;
+    const view = tokenView(row);
+    return uid === null || view.uid === String(uid) ? view : undefined;
   }
 
-  listApiTokens() {
-    return this._tokList.all().map(tokenView);
+  listApiTokens(uid = null) {
+    if (uid === null) return this._tokList.all().map(tokenView);
+    return this._tokListUser.all(String(uid)).map(tokenView);
   }
 
-  revokeApiToken(id) {
-    return this._tokRevoke.run(new Date().toISOString(), String(id ?? '')).changes > 0;
+  revokeApiToken(id, uid = null) {
+    const at = new Date().toISOString();
+    if (uid === null) return this._tokRevoke.run(at, String(id ?? '')).changes > 0;
+    return this._tokRevokeOwn.run(at, String(id ?? ''), String(uid)).changes > 0;
   }
 
   /** 用一次算一筆，擁有者才需要知道哪把還在被使用 */
@@ -694,13 +763,36 @@ export class Store {
 
   /* ------------------------------------------------------------ 分享連結 */
 
-  /** @returns {{ token: string, uid: string, tripId: string, label: string, createdAt: string, expiresAt: string|null }} */
-  createShare({ tripId, label = '', expiresAt = null, uid = '' }) {
+  createShare({ tripId, label = '', expiresAt = null, uid = '', canWrite = true, pinHash = null }) {
     const token = newToken();
     const createdAt = new Date().toISOString();
     const owner = String(uid ?? '');
-    this._shareInsert.run({ token, uid: owner, tripId, label: String(label ?? '').slice(0, 60), createdAt, expiresAt });
-    return { token, uid: owner, tripId, label: String(label ?? '').slice(0, 60), createdAt, expiresAt, revokedAt: null, hits: 0, writes: 0, lastSeenAt: null };
+    const writable = canWrite === false ? 0 : 1;
+    this._shareInsert.run({
+      token,
+      uid: owner,
+      tripId,
+      label: String(label ?? '').slice(0, 60),
+      createdAt,
+      expiresAt,
+      canWrite: writable,
+      pinHash,
+    });
+    return {
+      token,
+      uid: owner,
+      tripId,
+      label: String(label ?? '').slice(0, 60),
+      createdAt,
+      expiresAt,
+      revokedAt: null,
+      hits: 0,
+      writes: 0,
+      lastSeenAt: null,
+      canWrite: writable === 1,
+      hasPin: Boolean(pinHash),
+      lastWriter: '',
+    };
   }
 
   /** 回傳 undefined 代表這個 token 根本沒存在過 */
@@ -727,8 +819,22 @@ export class Store {
   }
 
   /** 開一次連結算一筆 hit，代記一筆算一筆 write；擁有者才需要知道這些數字 */
-  touchShare(token, { write = false } = {}) {
-    this._shareHit.run({ token: String(token ?? ''), read: 1, write: write ? 1 : 0, at: new Date().toISOString() });
+  touchShare(token, { write = false, who = '' } = {}) {
+    const name = String(who ?? '').trim().slice(0, 24);
+    this._shareHit.run({ token: String(token ?? ''), read: 1, write: write ? 1 : 0, who: name, at: new Date().toISOString() });
+  }
+
+  /**
+   * 訪客 PIN 的比對留在資料層：雜湊不進 `shareView`，路由層就拿不到、也不可能誤回給前端。
+   * 沒設 PIN 的連結一律算過——那是絕大多數（「丟到 LINE Grupo 就能記」）的路徑。
+   */
+  sharePinOk(token, pin) {
+    const row = this._shareGet.get(String(token ?? ''));
+    if (!row) return false;
+    if (!row.pin_hash) return true;
+    const want = Buffer.from(String(row.pin_hash), 'hex');
+    const got = crypto.createHash('sha256').update(String(pin ?? ''), 'utf8').digest();
+    return want.length === 32 && crypto.timingSafeEqual(want, got);
   }
 
   get keep() {

@@ -151,7 +151,17 @@ export function sharePayload(snapshot, tripId, share) {
       byCurrency: byCurrency(expenses),
       lastWrite: expenses.concat(items).reduce((m, r) => (String(r.updatedAt) > m ? String(r.updatedAt) : m), ''),
     },
-    share: { label: share?.label ?? '', createdAt: share?.createdAt ?? null, expiresAt: share?.expiresAt ?? null },
+    share: {
+      label: share?.label ?? '',
+      createdAt: share?.createdAt ?? null,
+      expiresAt: share?.expiresAt ?? null,
+      /**
+       * 匿名訪客只拿得到這兩個旗標，而且一定要拿到：分享頁靠它們決定要不要把表單收起來、
+       * 要不要先問 PIN。`hasPin` 不在這裡——有無 PIN 由 GET 的回應碼本人說明，
+       * 清單那側（擁有者）才需要知道設了沒。
+       */
+      canWrite: share?.canWrite !== false,
+    },
   };
 }
 
@@ -168,6 +178,19 @@ function byCurrency(expenses) {
 }
 
 /* ---------------------------------------------------------------- 寫入端 */
+
+/**
+ * 訪客自介（「誰用這條連結記的」）：只留顯示用的名字，最長 24 字元。
+ * 它不是身分、也不參與比對，純粹是讓主人回來看的時候知道該找誰問。
+ */
+export function visitorName(input) {
+  const s = String(input ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 64);
+  // 24 個 UTF-16 單位可能只塞了十來個 emoji：按 code point 剪，才剪不出斷頭的字
+  return Array.from(s).slice(0, 24).join('');
+}
 
 /**
  * 把送來的支出裁成合法的一列。

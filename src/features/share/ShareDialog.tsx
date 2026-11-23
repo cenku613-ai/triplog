@@ -28,6 +28,9 @@ const EXPIRY: { value: string; key: Key }[] = [
   { value: 'never', key: 'share.expiresNever' },
 ];
 
+/** 訪客 PIN 的形狀：跟後端 normalizePin 同一條規則，差在這裡先擋掉一次往返 */
+const PIN_RE = /^\d{4,8}$/;
+
 /** 時間戳顯示成「2027/2/19, 下午2:51」：跨年時年份要看得到，不然「2/19」會誤判 */
 function shortWhen(iso: string, locale: string): string {
   const d = new Date(iso);
@@ -46,8 +49,13 @@ export function ShareDialog({ trip, onClose }: { trip: Trip; onClose: () => void
   const [busy, setBusy] = useState(false);
   const [expiry, setExpiry] = useState('90');
   const [note, setNote] = useState('');
+  /** 預設能記帳：那個開關是要把連結收緊，不是要開啟新功能，舊連結的行為也一樣 */
+  const [allowWrite, setAllowWrite] = useState(true);
+  const [pin, setPin] = useState('');
   /** 剛產生那條：連結只在這裡完整出現一次，舊的從列表按「複製」拿 */
   const [fresh, setFresh] = useState<ShareRow | null>(null);
+  /** 明文 PIN 也只在這裡出現一次：伺服器那邊只留雜湊，關掉對話框就再也拿不回來 */
+  const [freshPin, setFreshPin] = useState('');
 
   const reload = useCallback(async () => {
     if (!cfg) return;
@@ -75,16 +83,27 @@ export function ShareDialog({ trip, onClose }: { trip: Trip; onClose: () => void
 
   const make = async () => {
     if (!cfg) return;
+    const code = pin.trim();
+    // 形狀不對先在這裡講：後端那句 400 只說「訪客 PIN」，看不出該改哪裡、要改成幾個字
+    if (code && !PIN_RE.test(code)) {
+      setError(t('share.pinBad'));
+      return;
+    }
     setBusy(true);
     setError('');
     try {
-      const share = await createShare(cfg, {
+      const { row, pin: issued } = await createShare(cfg, {
         tripId: trip.id,
         expiresInDays: expiry === 'never' ? 'never' : Number(expiry),
         label: note.trim() || undefined,
+        canWrite: allowWrite,
+        pin: code || undefined,
       });
-      setFresh(share);
+      setFresh(row);
+      setFreshPin(issued);
       setNote('');
+      // 輸入框跟著清空：留著舊 PIN 會讓人以為下一條連結也是這組數字
+      setPin('');
       toast(t('share.made'));
       await reload();
     } catch (err) {
@@ -99,7 +118,10 @@ export function ShareDialog({ trip, onClose }: { trip: Trip; onClose: () => void
     if (!(await ask(t('share.revokeQ'), { confirmLabel: t('share.revoke'), danger: true }))) return;
     try {
       await revokeShare(cfg, row.token);
-      if (fresh?.token === row.token) setFresh(null);
+      if (fresh?.token === row.token) {
+        setFresh(null);
+        setFreshPin('');
+      }
       toast(t('share.revoked'));
       await reload();
     } catch (err) {
@@ -147,37 +169,74 @@ export function ShareDialog({ trip, onClose }: { trip: Trip; onClose: () => void
                   <button className="btn btn-sm btn-primary" onClick={() => void copy(fresh)}>
                     {t('share.copy')}
                   </button>
+                  {/* PIN 跟連結放在一起：兩樣都要傳出去，而 PIN 只有這一次看得到 */}
+                  {freshPin ? (
+                    <div className="stack-s">
+                      <strong style={{ fontSize: '1.1rem' }}>{t('share.pinShown', { pin: freshPin })}</strong>
+                      <p className="tiny" style={{ margin: 0 }}>
+                        {t('share.pinOnce')}
+                      </p>
+                    </div>
+                  ) : null}
                 </div>
               </Field>
             ) : (
-              <Field label={t('share.linkLabel')} hint={t('share.syncFirst')}>
-                <div className="row wrap">
-                  <select
-                    value={expiry}
-                    onChange={(e) => setExpiry(e.target.value)}
-                    aria-label={t('share.expiresLabel')}
-                  >
-                    {EXPIRY.map((o) => (
-                      <option key={o.value} value={o.value}>
-                        {o.key === 'share.expiresDays'
-                          ? t('share.expiresDays', { n: Number(o.value) })
-                          : t(o.key)}
-                      </option>
-                    ))}
-                  </select>
+              <>
+                <Field label={t('share.linkLabel')} hint={t('share.syncFirst')}>
+                  <div className="row wrap">
+                    <select
+                      value={expiry}
+                      onChange={(e) => setExpiry(e.target.value)}
+                      aria-label={t('share.expiresLabel')}
+                    >
+                      {EXPIRY.map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.key === 'share.expiresDays'
+                            ? t('share.expiresDays', { n: Number(o.value) })
+                            : t(o.key)}
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      className="grow"
+                      value={note}
+                      maxLength={60}
+                      onChange={(e) => setNote(e.target.value)}
+                      placeholder={t('share.labelPlaceholder')}
+                      aria-label={t('share.labelField')}
+                    />
+                    <button className="btn btn-primary" onClick={() => void make()} disabled={busy}>
+                      {busy ? t('share.sending') : t('share.make')}
+                    </button>
+                  </div>
+                </Field>
+
+                {/* 兩個收緊用的開關，預設都維持舊行為：能看也能記、不設 PIN */}
+                <label className="row" style={{ gap: 8 }}>
                   <input
-                    className="grow"
-                    value={note}
-                    maxLength={60}
-                    onChange={(e) => setNote(e.target.value)}
-                    placeholder={t('share.labelPlaceholder')}
-                    aria-label={t('share.labelField')}
+                    type="checkbox"
+                    checked={allowWrite}
+                    onChange={(e) => setAllowWrite(e.target.checked)}
+                    aria-label={t('share.allowWrite')}
                   />
-                  <button className="btn btn-primary" onClick={() => void make()} disabled={busy}>
-                    {busy ? t('share.sending') : t('share.make')}
-                  </button>
-                </div>
-              </Field>
+                  <span>
+                    {t('share.allowWrite')}
+                    <div className="tiny">{t('share.allowWriteHint')}</div>
+                  </span>
+                </label>
+
+                <Field label={t('share.pinField')} hint={t('share.pinHint')}>
+                  <input
+                    value={pin}
+                    onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 8))}
+                    inputMode="numeric"
+                    autoComplete="off"
+                    maxLength={8}
+                    placeholder={t('share.pinPlaceholder')}
+                    aria-label={t('share.pinField')}
+                  />
+                </Field>
+              </>
             )}
 
             {error ? (
@@ -193,12 +252,27 @@ export function ShareDialog({ trip, onClose }: { trip: Trip; onClose: () => void
               {live.map((row) => (
                 <div className="row wrap" key={row.token} aria-label={t('share.rowAria', { label: row.label })}>
                   <div className="grow" style={{ minWidth: 0 }}>
-                    <div style={{ fontWeight: 600 }}>{row.label || trip.name}</div>
+                    <div style={{ fontWeight: 600 }}>
+                      {row.label || trip.name}
+                      {/* 唯讀與 PIN 是這條連結自己的條件：列出來才不用開連結去試 */}
+                      {row.canWrite === false ? (
+                        <span className="badge" style={{ marginLeft: 6 }}>
+                          {t('share.readonlyTag')}
+                        </span>
+                      ) : null}
+                      {row.hasPin ? (
+                        <span className="badge" style={{ marginLeft: 6 }}>
+                          {t('share.pinTag')}
+                        </span>
+                      ) : null}
+                    </div>
                     <div className="tiny">
                       {t('share.hits', { n: row.hits })} · {t('share.writes', { n: row.writes })} ·{' '}
                       {row.lastSeenAt
                         ? t('share.lastSeen', { when: shortWhen(row.lastSeenAt, locale) })
                         : t('share.neverSeen')}
+                      {/* 空字串＝還沒有人用這條記過，硬翻成「最後由  記錄」會很奇怪 */}
+                      {row.lastWriter ? ` · ${t('share.lastWriter', { name: row.lastWriter })}` : ''}
                     </div>
                     <div className="tiny">
                       {row.expiresAt

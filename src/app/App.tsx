@@ -16,6 +16,7 @@ import { describeSyncError, loadSyncConfig, syncNow } from '../lib/sync';
 import { isSessionToken } from '../lib/tokens';
 import { fetchAuthConfig, gateFor, loadAccount, rememberedMode, sameOriginBase } from '../lib/account';
 import { LoginGate } from '../features/auth/LoginGate';
+import { useSignOut } from '../features/auth/useSignOut';
 
 /**
  * 分享頁不在 Shell 裡：來按連結的人可能用別人的裝置，不該看到本機別的旅行，
@@ -84,14 +85,15 @@ function Shell() {
     }
   }, [needRefresh, offlineReady, reload, toast, t]);
 
-  // 共筆的入口只在「這台裝置是用 Google 登入的」時出現：金鑰模式沒有可比對的身分
+  // 共筆的入口只在「這台裝置是用 Google 登入的」時出現：金鑰模式沒有可比對的身分，
+  // 列出來只是一個按下去會報錯的選項。登出同理——沒有憑證可退的時候不該出現。
   const shared = loadSyncConfig();
+  const signedIn = Boolean(shared && isSessionToken(shared.apiKey));
+  const { busy: signingOut, signOut } = useSignOut();
   const nav = [
     { to: '/', label: t('nav.trips'), icon: '🧳', end: true },
     { to: '/expenses', label: t('nav.expenses'), icon: '💸', end: false },
-    ...(shared && isSessionToken(shared.apiKey)
-      ? [{ to: '/shared', label: t('invite.mineTitle'), icon: '🤝', end: false }]
-      : []),
+    ...(signedIn ? [{ to: '/shared', label: t('invite.mineTitle'), icon: '🤝', end: false }] : []),
     { to: '/settings', label: t('nav.settings'), icon: '⚙', end: false },
   ];
 
@@ -135,6 +137,12 @@ function Shell() {
           </NavLink>
         ))}
         <div style={{ marginTop: 'var(--sp-4)' }}>{fab}</div>
+        {/* 登出放側欄底層：要退出這台裝置的人通常就在這一側，不必先跑進設定頁 */}
+        {signedIn ? (
+          <button type="button" className="btn btn-sm side-signout" onClick={() => void signOut()} disabled={signingOut}>
+            {t('auth.logout')}
+          </button>
+        ) : null}
         <div className="side-foot tiny">
           {online ? t('net.offlineCanRecord') : t('net.offlineSaving')}
           <br />
@@ -149,11 +157,16 @@ function Shell() {
         </Link>
         {!online ? <span className="badge">{t('net.offline')}</span> : null}
         <div className="actions">
-          {/* 手機沒有側欄，共筆的入口就掛在標頭上；金鑰模式下這顆不出現 */}
-          {shared && isSessionToken(shared.apiKey) ? (
+          {/* 手機沒有側欄，共筆的入口與登出都掛在標頭上；金鑰模式下這兩顆不出現 */}
+          {signedIn ? (
             <Link to="/shared" className="btn btn-sm">
               {t('invite.mineTitle')}
             </Link>
+          ) : null}
+          {signedIn ? (
+            <button type="button" className="btn btn-sm" onClick={() => void signOut()} disabled={signingOut}>
+              {t('auth.logout')}
+            </button>
           ) : null}
           <button className="btn btn-sm" onClick={() => setQuick(true)}>
             {t('expense.quickBtn')}
@@ -296,7 +309,7 @@ function AuthGate({ children }: { children: ReactNode }) {
     fetchAuthConfig(server)
       .then((c) => !cancelled && setMode(c.mode))
       .catch(() => {
-        /* 問不到就当沒這回事：本機記錄照用，同步失敗自有 toast 講 */
+        /* 問不到就當沒這回事：本機記錄照用，同步失敗自有 toast 講 */
       });
     return () => {
       cancelled = true;

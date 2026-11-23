@@ -283,6 +283,14 @@
     padding: var(--sp-3) var(--sp-2);
   }
 
+  /* 登出跟上面的選單同形，但它是動作、不是頁面：靠下、顏色淡一階，別讓人以為是多一個分頁 */
+  .sidenav .side-signout {
+    width: 100%;
+    justify-content: flex-start;
+    margin-bottom: var(--sp-2);
+    color: var(--text-2);
+  }
+
   .trips-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }

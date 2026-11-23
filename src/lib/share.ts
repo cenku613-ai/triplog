@@ -24,6 +24,12 @@ export type ShareRow = {
   hits: number;
   writes: number;
   lastSeenAt: string | null;
+  /** false ＝這把連結只能看（後端 POST 一律 403） */
+  canWrite: boolean;
+  /** 有沒有設訪客 PIN：伺服器永遠只回這個旗標，不會把雜湊傳出來 */
+  hasPin: boolean;
+  /** 最後一個用這條連結記錄的人（沒有任何記錄時是空字串） */
+  lastWriter: string;
 };
 
 export type ShareView = {
@@ -39,7 +45,11 @@ export type ShareView = {
     byCurrency: Record<string, { amount: number; count: number; baseAmount: number }>;
     lastWrite: string;
   };
-  share: { label: string; createdAt: string; expiresAt: string | null };
+  /**
+   * 匿名訪客只拿得到這兩個旗標：hasPin 不在這裡——有無 PIN 由 GET 的回應碼自己說，
+   * 把旗標傳出去等於是告訴拿到連結的人「這把鑰匙還有第二層」，沒意義。
+   */
+  share: { label: string; createdAt: string; expiresAt: string | null; canWrite: boolean };
   head: { id: string; exportedAt: string } | null;
 };
 
@@ -74,6 +84,10 @@ export type ShareErrorCode =
   | 'gone'
   | 'notfound'
   | 'auth'
+  /** 401＋needPin：要訪客 PIN（還沒填或填錯），跟身分不對是兩件事 */
+  | 'pin'
+  /** 403＋readOnly：這條連結只能看，寫入一律被擋 */
+  | 'readonly'
   | 'tooMany'
   | 'conflict'
   | 'server'
@@ -84,10 +98,16 @@ export class ShareError extends Error {
   code: ShareErrorCode;
   /** 410 的兩種死因要分開講：被作廢 vs 到期 */
   reason?: string;
-  constructor(code: ShareErrorCode, message: string, reason?: string) {
+  /**
+   * 401＋needPin 順帶回來的 canWrite：問 PIN 那張卡片要照它改口，
+   * 否則唯讀連結會先叫人家「填了 PIN 就能記帳」，填完才被打第二次。
+   */
+  canWrite?: boolean;
+  constructor(code: ShareErrorCode, message: string, reason?: string, canWrite?: boolean) {
     super(message);
     this.code = code;
     this.reason = reason;
+    this.canWrite = canWrite;
   }
 }
 
@@ -110,11 +130,14 @@ export function shareLink(baseUrl: string, token: string): string {
 
 /* ------------------------------------------------------------------ 請求 */
 
-type FetchInit = { method?: 'GET' | 'POST'; body?: unknown; token?: string };
+type FetchInit = { method?: 'GET' | 'POST'; body?: unknown; token?: string; pin?: string };
 
 async function call<T>(url: string, init: FetchInit = {}): Promise<T> {
   const headers: Record<string, string> = {};
   if (init.token) headers.authorization = `Bearer ${init.token}`;
+  // PIN 走標頭而不是塞進表單：要寫入的內容不該夾著一道入場關卡，
+  // 除錯時複製那份 JSON 也不會連 PIN 一起傳出去
+  if (init.pin) headers['x-triplog-pin'] = init.pin;
   if (init.body !== undefined) headers['content-type'] = 'application/json';
   let res: Response;
   try {
@@ -139,6 +162,13 @@ async function call<T>(url: string, init: FetchInit = {}): Promise<T> {
   if (res.status === 410) throw new ShareError('gone', serverMsg, String(json.reason ?? ''));
   if (res.status === 404) throw new ShareError('notfound', serverMsg);
   if (res.status === 409) throw new ShareError('conflict', serverMsg);
+  // 需要訪客 PIN 的 401 不能混進「金鑰不對」那條：畫面上要問 PIN，不是叫人去檢查設定
+  if (res.status === 401 && json.needPin === true) {
+    const cw = typeof json.canWrite === 'boolean' ? json.canWrite : undefined;
+    throw new ShareError('pin', serverMsg, undefined, cw);
+  }
+  // 唯讀連結的 403 同理：那是連結本身的權限，不是這位訪客搞錯身分
+  if (res.status === 403 && json.readOnly === true) throw new ShareError('readonly', serverMsg);
   if (res.status === 401 || res.status === 403) throw new ShareError('auth', serverMsg);
   if (res.status === 429) throw new ShareError('tooMany', serverMsg);
   if (!res.ok) throw new ShareError('server', serverMsg || `HTTP ${res.status}`);
@@ -160,24 +190,41 @@ export async function copyText(text: string): Promise<boolean> {
 
 /* -------------------------------------------------------------- 同行者側 */
 
-export function fetchShare(token: string): Promise<ShareView> {
-  return call<ShareView>(shareApiUrl(`api/share/${encodeURIComponent(token)}`));
+/**
+ * 讀這一趟。`pin` 是這把連結的訪客 PIN（有設才需要）；
+ * 沒對的話伺服器只回「要 PIN」，不會把資料傳出來。
+ */
+export function fetchShare(token: string, pin = ''): Promise<ShareView> {
+  return call<ShareView>(shareApiUrl(`api/share/${encodeURIComponent(token)}`), { pin });
 }
 
-/** 記一筆支出。id 自己產生：按兩下去才不會變兩筆 */
-export function pushShareExpense(token: string, draft: ExpenseDraft): Promise<{ expense: Expense }> {
+/**
+ * 記一筆支出。id 自己產生：按兩下去才不會變兩筆。
+ * `who` 只是讓連結那側記住「最後是誰來記錄」，不會動到 payee／note 的寫法。
+ */
+export function pushShareExpense(
+  token: string,
+  draft: ExpenseDraft,
+  pin = '',
+  who = '',
+): Promise<{ expense: Expense }> {
   return call(shareApiUrl(`api/share/${encodeURIComponent(token)}/expense`), {
-    body: { id: newId('exp'), ...draft },
+    body: { id: newId('exp'), ...draft, ...(who ? { who } : {}) },
+    pin,
   });
 }
 
-export function pushShareItem(token: string, draft: ItemDraft): Promise<{ item: DayItem }> {
+export function pushShareItem(token: string, draft: ItemDraft, pin = '', who = ''): Promise<{ item: DayItem }> {
   return call(shareApiUrl(`api/share/${encodeURIComponent(token)}/item`), {
-    body: { id: newId('item'), ...draft },
+    body: { id: newId('item'), ...draft, ...(who ? { who } : {}) },
+    pin,
   });
 }
 
-/** 同行者的名字（誰付的／誰加的），記在本機 localStorage，不上伺服器 */
+/**
+ * 同行者的名字（誰付的／誰加的）：存在本機 localStorage，重新開連結還填得回來。
+ * 送出時它本來就在 payee／note 裡跟著上去，額外那欄 `who` 只讓連結記住最後是誰。
+ */
 const WHO_KEY = 'triplog:share:who';
 
 export function loadViewerName(): string {
@@ -197,6 +244,44 @@ export function saveViewerName(name: string): void {
   }
 }
 
+/**
+ * 訪客 PIN 記在 sessionStorage，而且按 token 分開放。
+ *
+ * 用 sessionStorage 不是偷懶：同行者常常是借用別人的手機，
+ * PIN 該跟著這個分頁一起消失，不該留在那台裝置上給下一個人用。
+ * 分 token 是因為同一個分頁可能開兩條不一樣的連結，混在一起會互相蓋掉。
+ * 名字（WHO_KEY）反而留 localStorage——那是「我是誰」，不是鑰匙。
+ */
+const PIN_KEY = 'triplog:share:pin';
+
+function pinMap(): Record<string, string> {
+  try {
+    const raw = sessionStorage.getItem(PIN_KEY);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : {};
+    // 存過壞值（或被人動過）就當沒有，讀 PIN 不該把頁面弄崩
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
+}
+
+export function loadSharePin(token: string): string {
+  const v = pinMap()[token];
+  return typeof v === 'string' ? v : '';
+}
+
+/** 傳空字串＝忘記這條的 PIN（例如送出去被打回），下次就當沒填 */
+export function saveSharePin(token: string, pin: string): void {
+  try {
+    const map = { ...pinMap() };
+    if (pin) map[token] = pin;
+    else delete map[token];
+    sessionStorage.setItem(PIN_KEY, JSON.stringify(map));
+  } catch {
+    /* 無痕模式記不住 PIN：每次重新整理重填一次而已，功能不會壞 */
+  }
+}
+
 /* -------------------------------------------------------------- 擁有者側 */
 
 export function listShares(cfg: SyncConfig, tripId?: string): Promise<ShareRow[]> {
@@ -210,21 +295,35 @@ export function listShares(cfg: SyncConfig, tripId?: string): Promise<ShareRow[]
  * 產生連結。這趟還沒推上伺服器時後端回 409（連結開了會是一片空），
  * 所以這裡先補跑一次同步再試一次——使用者按的是「分享」，
  * 不該先學會「同步」。
+ *
+ * `pin` 的明文只在建立這一次的回應裡出現（伺服器那邊留的是雜湊），
+ * 所以照原樣交回給對話框顯示一次；關掉之後就再也問不進了。
  */
 export async function createShare(
   cfg: SyncConfig,
-  input: { tripId: string; expiresInDays?: number | 'never'; label?: string },
-): Promise<ShareRow> {
+  input: { tripId: string; expiresInDays?: number | 'never'; label?: string; pin?: string; canWrite?: boolean },
+): Promise<{ row: ShareRow; pin: string }> {
   const url = `${cfg.baseUrl.replace(/\/+$/, '')}/api/shares`;
-  const body = { tripId: input.tripId, expiresInDays: input.expiresInDays ?? 90, label: input.label };
+  // 形狀不對的 PIN 不送（後端只認 4–8 位數字）：對話框那關先擋，這裡算第二道，
+  // 免得使用者貼了帶空白或型號的字串，只收到一句看不懂的回覆
+  const digits = String(input.pin ?? '').replace(/[^\d]/g, '');
+  const body = {
+    tripId: input.tripId,
+    expiresInDays: input.expiresInDays ?? 90,
+    label: input.label,
+    // 未設定時當做可記帳：跟沒有這個開關的舊行為一致
+    canWrite: input.canWrite !== false,
+    ...(digits.length >= 4 && digits.length <= 8 ? { pin: digits } : {}),
+  };
+  const send = () => call<{ share: ShareRow; pin?: string }>(url, { body, token: cfg.apiKey });
   try {
-    const r = await call<{ share: ShareRow }>(url, { body, token: cfg.apiKey });
-    return r.share;
+    const r = await send();
+    return { row: r.share, pin: typeof r.pin === 'string' ? r.pin : '' };
   } catch (err) {
     if (!(err instanceof ShareError) || err.code !== 'conflict') throw err;
     await syncNow(cfg);
-    const r = await call<{ share: ShareRow }>(url, { body, token: cfg.apiKey });
-    return r.share;
+    const r = await send();
+    return { row: r.share, pin: typeof r.pin === 'string' ? r.pin : '' };
   }
 }
 
@@ -249,6 +348,8 @@ const ERROR_KEYS: Record<string, Key> = {
   insecure: 'share.errInsecure',
   notfound: 'share.errNotFound',
   auth: 'share.errAuth',
+  pin: 'share.errPin',
+  readonly: 'share.errReadOnly',
   tooMany: 'share.errTooMany',
   conflict: 'share.errConflict',
   server: 'share.errServer',

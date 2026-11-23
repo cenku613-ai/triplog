@@ -44,6 +44,7 @@ npm run mcp:build          # 打包成單一檔 mcp/dist/index.mjs（不入版�
 | `TRIPLOG_URL` | `https://triplogmo.duckdns.org` | API 位置結尾不用加 `/` |
 | `TRIPLOG_API_KEY` | 空 | 可讀可寫。沒給就完全打不到後端 |
 | `TRIPLOG_READ_KEY` | 空 | 只讀金鑰；當你不打算讓 agent 動資料時給這個 |
+| `TRIPLOG_ACCOUNT` | 空 | **帳號模式的部署才需要**：主金鑰不認得任何人，這裡填那個人的帳號 id 或已驗證信箱，agent 才讀得到他的帳本。伺服器上只有一個帳號時可以不填（後端自動落在那唯一一份），多台帳號請直接改用 app 簽發的 `tlk_…` 憑證——那類憑證簽出來就自帶帳號，連這顆變數都不用設 |
 | `TRIPLOG_ALLOW_WRITE` | `1` | 設 `0` 時**連寫入工具都不註冊**，agent 看不到也叫不到 |
 | `TRIPLOG_TIMEOUT_MS` | `30000` | 單一請求逾時 |
 
@@ -109,6 +110,7 @@ API 是「兩端各自推送、伺服器合併」，agent 推完不等於裝置�
 | `API 401 …（金鑰不對）` | 金鑰跟後端不一致，檢查兩邊 `.env` |
 | `API 403 …只有讀取權` | 拿讀取金鑰做寫入，改用 `TRIPLOG_API_KEY` |
 | `API 404 …後端還沒有資料` | 先用 app 推送一次，或叫 `triplog_create_trip` |
+| 連得上、健康檢查也 200，但清單永遠是空的 | 這台部署開了帳號模式（`TRIPLOG_AUTH=1`）而主金鑰不認得任何人：改填 app 簽發的 `tlk_…` 憑證（簽發時綁了帳號），或設 `TRIPLOG_ACCOUNT`。答案要看的話打 `GET /api/health`，`auth.keysSeeUid` 會講金鑰現在落在哪一份帳上 |
 | `連不到 https://…` | DNS 還沒指過來、Caddy 憑證還在簽，或防火牆沒開 443 |
 | `unknown tool`／唯讀拒絕 | 這組工具跑在 `TRIPLOG_ALLOW_WRITE=0` |
 

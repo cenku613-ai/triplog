@@ -17,6 +17,7 @@ import {
   sanitizeItem,
   sharePayload,
   shareStatus,
+  visitorName,
 } from './share.js';
 import { TOKEN_SCOPES, hashToken, looksLikeApiToken, newApiToken, scopeAllows, tokenLabel, tokenStatus } from './tokens.js';
 import {
@@ -68,6 +69,15 @@ const GOOGLE_CLIENT_ID = (process.env.TRIPLOG_GOOGLE_CLIENT_ID ?? '').trim();
 const KEYS_ALLOWED = !['0', 'false', 'no', 'off'].includes(String(process.env.TRIPLOG_AUTH_ALLOW_KEYS ?? '').trim().toLowerCase());
 /** 一條 session 的有效期（天）：常用裝置會滑動續期，所以它其實是「多久沒上線就要重新登入」 */
 const SESSION_DAYS = Math.min(Math.max(Number(process.env.TRIPLOG_SESSION_DAYS ?? SESSION_TTL_DAYS) || SESSION_TTL_DAYS, 1), 365);
+/**
+ * 金鑰那條路要算在誰的帳上。帳號制度上線後「第一次登入會把舊基準認領進那個帳號」
+ * （claimLegacyBase），而憑證向來解析成 `''` 分帳——正式機因此踩過：認領之後主金鑰打
+ * `GET /api/base` 直接 404、MCP 等於對著名單外的空帳本。這裡是那個缺口的正面解法。
+ * 可填帳號 id（`u_…`）或那顆已驗證的信箱；留空＝用「資料庫只有一個帳號就自動選它」那條規則。
+ */
+const DEFAULT_ACCOUNT = (process.env.TRIPLOG_DEFAULT_UID ?? '').trim();
+/** 主金鑰可以在單次請求裡點名要動哪份帳（它本來就是整個資料庫的密碼） */
+const ACCOUNT_HEADER = 'x-triplog-account';
 
 function die(msg) {
   console.error(`[triplog-api] ${msg}`);
@@ -97,6 +107,11 @@ const limitShareWrite = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_SHARE
 const limitPair = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_PAIR ?? 8), windowMs: 60_000 });
 // 登入端點拿到的是「別人簽的好憑證」，能猜的只有我們自己的實作瑕疵；限流是擋洪水不是擋破解
 const limitAuth = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_AUTH ?? 12), windowMs: 60_000 });
+/**
+ * 訪客 PIN 的試錯桶（讀、寫都算同一個）：4 位數在 240 次/分鐘下撐不過半小時，
+ * 收到每分鐘 10 次就拉長成十幾個小時、6 位數是幾個月——而這段時間主人早就發現並作廢連結了。
+ */
+const limitPinTry = rateLimiter({ max: Number(process.env.TRIPLOG_RATE_PIN ?? 10), windowMs: 60_000 });
 
 /* -------------------------------------------------------------- 資料視圖 */
 
@@ -224,10 +239,11 @@ const SCHEMA_HINT = {
     'There is no delete endpoint by design. To archive a trip set archived=true.',
     'Amounts stay in the original currency; baseAmount is what statistics use.',
     'Sharing: POST /api/shares {tripId,expiresInDays} (needs the key) mints a trip-scoped token; GET /api/share/<token> reads that trip only and POST /api/share/<token>/expense|item appends to it without any key. POST /api/shares/revoke {token} kills a link; it revokes a grant, not data.',
-    'API tokens: POST /api/tokens {label,scope:read|write,expiresInDays} mints a revocable bearer (shown once, stored hashed); GET /api/tokens lists them and POST /api/tokens/revoke {id} retires one. Minting, listing, revoking and POST /api/admin/clear all require the master TRIPLOG_API_KEY — an issued token can never mint or wipe.',
-    'Pairing (no long key on the new device): POST /api/tokens/pairings {label,scope,expiresInMinutes<=120} (master only) returns an 8-char code shown once; the new device posts it to POST /api/pair {code,device} without any bearer and receives a fresh token (365 days). Codes are single-use, expire, and can be voided with POST /api/tokens/pairings/revoke {id}; GET /api/tokens/pairings lists them.',
+    'API tokens: POST /api/tokens {label,scope:read|write,expiresInDays,account?} mints a revocable bearer (shown once, stored hashed); GET /api/tokens lists them and POST /api/tokens/revoke {id} retires one. The master key may mint/list/revoke across the whole server; a signed-in device (tls_ session) may do the same for its own account only, and cannot choose whose ledger the token points at. An issued token can never mint or wipe either way.',
+    'Which ledger a key writes to: every minted token is stamped with the account that issued it (api_tokens.user_id), and that binding wins. The master key falls back to TRIPLOG_DEFAULT_UID, then to the sole account when the server has exactly one, then to the pre-account ledger; it can also name an account per request with the x-triplog-account header (uid or verified email). This exists because the first Google login claims the pre-account data, and a key still pointing at the empty legacy ledger would silently read "no data yet".',
+    'Pairing (no long key on the new device): POST /api/tokens/pairings {label,scope,expiresInMinutes<=120} (master key or a signed-in device) returns an 8-char code shown once; the new device posts it to POST /api/pair {code,device} without any bearer and receives a fresh token (365 days) bound to the same account as the code. Codes are single-use, expire, and can be voided with POST /api/tokens/pairings/revoke {id}; GET /api/tokens/pairings lists them.',
     'Master key lifecycle: GET /api/tokens/master reports whether the key was rotated (once rotated, the .env TRIPLOG_API_KEY and TRIPLOG_READ_KEY stop being accepted). POST /api/tokens/master/rotate {confirm:"rotate-master"} returns the new key once; it refuses unless at least one live token exists (or confirm:"rotate-master-no-backup") so you cannot lock yourself out. Rolling back needs SSH: node server/src/cli.js master-reset.',
-    'Accounts (only when the server runs with TRIPLOG_AUTH=1): GET /api/auth/config tells you the Google OAuth client id; POST /api/auth/google {idToken} exchanges a Google ID token for a tls_ session (first login claims the pre-account data); GET /api/auth/me and /api/auth/sessions use it; POST /api/auth/logout {id?} retires one session. Bearer slot takes the tls_ session or a tlk_/master key alike.',
+    'Accounts (only when the server runs with TRIPLOG_AUTH=1): GET /api/auth/config tells you the Google OAuth client id; POST /api/auth/google {idToken} exchanges a Google ID token for a tls_ session (first login claims the pre-account data); GET /api/auth/me and /api/auth/sessions use it. POST /api/auth/logout retires the session that called it (that device only); POST /api/auth/sessions/revoke {id} retires one named session and {allExceptThis:true} retires every other device. Bearer slot takes the tls_ session or a tlk_/master key alike. /api/health reports which account the key path currently resolves to (auth.keysSeeUid).',
     'Sharing by identity (needs TRIPLOG_AUTH=1): POST /api/invites {tripId,email,role} binds one trip to a Google account\'s verified email; that person reads GET /api/trips/<tripId>/shared and, when role=write, appends with POST /api/trips/<tripId>/shared/expense|item into the inviter\'s ledger. Revoking the invite (or POST /api/invites/leave) cuts access at the next request; no rows are deleted in either direction.',
     'Tenancy: every read, write, stats and share call is scoped to the authenticated account. Sessions see that person\'s own ledger; the master key and tlk_ agent tokens see the legacy ledger (the one the app used before accounts existed), which is empty once somebody has claimed it. Check GET /api/health for auth.mode.',
   ],
@@ -255,7 +271,17 @@ async function route(req, res) {
       version: VERSION,
       hasData: !!s.head,
       masterRotated: !!store.masterHash(),
-      auth: { mode: AUTH_MODE ? 'account' : 'key', clientId: AUTH_MODE ? GOOGLE_CLIENT_ID : null, keysAllowed: !AUTH_MODE || KEYS_ALLOWED },
+      auth: {
+        mode: AUTH_MODE ? 'account' : 'key',
+        clientId: AUTH_MODE ? GOOGLE_CLIENT_ID : null,
+        keysAllowed: !AUTH_MODE || KEYS_ALLOWED,
+        /**
+         * 金鑰／`tlk_` 那條路現在算在哪份帳上（uid，不是信箱：/api/health 是公開的）。
+         * 空字串＝還沒有人認領過舊基準，或帳號不止一個又沒設 TRIPLOG_DEFAULT_UID，
+         * 那時金鑰看到的是帳號制度之前那份 `''` 分帳。部署完自查這一格就知道 MCP 為何有資料。
+         */
+        keysSeeUid: !AUTH_MODE || KEYS_ALLOWED ? defaultAccountUid() : null,
+      },
       ...s,
     });
   }
@@ -379,9 +405,9 @@ async function route(req, res) {
       return send(res, 200, { ok: true, shares: store.listShares({ tripId: tripId || null, uid }) });
     }
     if (resource === 'tokens' && parts[2] === 'pairings') {
-      // 配對碼清單等于「誰還能換到憑證」的名單，同樣只給主金鑰看
-      if (!isMaster) return fail(res, 403, '只有主金鑰看得到配對碼清單', {});
-      return send(res, 200, { ok: true, pairings: store.listPairings() });
+      // 配對碼清單等於「誰還能換到憑證」的名單：主金鑰看整台，登入裝置只看自己簽的那批
+      if (!isMaster && !auth.session) return fail(res, 403, '只有主金鑰或已登入的裝置看得到配對碼清單', {});
+      return send(res, 200, { ok: true, pairings: store.listPairings(isMaster ? null : uid) });
     }
     if (resource === 'tokens' && parts[2] === 'master') {
       if (!isMaster) return fail(res, 403, '只有主金鑰看得到主金鑰狀態', {});
@@ -404,9 +430,10 @@ async function route(req, res) {
       );
     }
     if (resource === 'tokens') {
-      // 清單本身就是「誰還能進來」的名單，簽發出去的 token 不能看到它
-      if (!isMaster) return fail(res, 403, '只有主金鑰（TRIPLOG_API_KEY）看得到 token 清單', {});
-      return send(res, 200, { ok: true, tokens: store.listApiTokens() });
+      // 清單本身就是「誰還能進來」的名單：簽發出去的 write token 不能看到它，
+      // 但登入者本來就是發鑰的人，該看到自己簽的那幾把（含hint、用過幾次）
+      if (!isMaster && !auth.session) return fail(res, 403, '只有主金鑰（TRIPLOG_API_KEY）或已登入的裝置看得到 token 清單', {});
+      return send(res, 200, { ok: true, tokens: store.listApiTokens(isMaster ? null : uid) });
     }
     return fail(res, 404, 'not found', {});
   }
@@ -454,8 +481,9 @@ async function route(req, res) {
 
   if (resource === 'tokens' && !parts[2]) {
     // 這一段不用 canWrite：拿簽發出去的 write token 也能寫資料，
-    // 但它不能再生一枚 token，否則洩一把就等於拿到整台伺服器的發照權
-    if (!isMaster) return fail(res, 403, '簽發 token 要用主金鑰（.env 裡的 TRIPLOG_API_KEY）', {});
+    // 但它不能再生一枚 token，否則洩一把就等於拿到整台伺服器的發照權。
+    // 主金鑰之外，「用 Google 登入進來的那台裝置」也可以簽——它本來就是這份帳的擁有者。
+    if (!isMaster && !auth.session) return fail(res, 403, '簽發 token 要用主金鑰（.env 裡的 TRIPLOG_API_KEY）或已登入的裝置', {});
     const scope = TOKEN_SCOPES.includes(body?.scope) ? body.scope : 'read';
     let expiresAt = null;
     try {
@@ -463,6 +491,13 @@ async function route(req, res) {
     } catch (err) {
       return fail(res, err.status ?? 400, String(err.message ?? err), {});
     }
+    /**
+     * 新簽的這把綁誰的帳：登入裝置簽的永遠是簽發者自己的帳號（不給把手上指定，
+     * 否則誰拿到一台登入中的裝置就能往別人帳本裡發鑰）；主金鑰可以用 body.account
+     * 點名（id 或信箱），沒點就落在預設帳號上——這樣之後換帳號、多一個帳號時，
+     * 這把鑰看到什麼仍然寫在它自己那列上，不會跟著環境變數飄。
+     */
+    const bindUid = auth.session ? uid : uidOfAccount(body?.account) || defaultAccountUid();
     const minted = newApiToken();
     const row = store.createApiToken({
       id: minted.id,
@@ -471,16 +506,19 @@ async function route(req, res) {
       label: tokenLabel(body?.label),
       scope,
       expiresAt,
+      uid: bindUid,
     });
     // 原字串只在這次回應裡出現一次，之後清單上只有 hint
     return send(res, 200, { ok: true, token: row, secret: minted.token });
   }
 
   if (resource === 'tokens' && parts[2] === 'revoke') {
-    if (!isMaster) return fail(res, 403, '撤銷 token 要用主金鑰（.env 裡的 TRIPLOG_API_KEY）', {});
+    if (!isMaster && !auth.session) return fail(res, 403, '撤銷 token 要用主金鑰（.env 裡的 TRIPLOG_API_KEY）或已登入的裝置', {});
     const id = String(body?.id ?? '');
-    const changed = store.revokeApiToken(id);
-    const row = store.apiToken(id);
+    // 登入裝置只能撤自己那帳下的鑰：別人的 id 進到這裡只會被當成「找不到」
+    const scope = isMaster ? null : uid;
+    const changed = store.revokeApiToken(id, scope);
+    const row = store.apiToken(id, scope);
     if (!row) return fail(res, 404, '找不到這個 token', {});
     // 已經撤過再按一次不算錯：按下去要的就是「這把沒了」的狀態
     return send(res, 200, { ok: true, revoked: true, changed, token: row });
@@ -489,7 +527,8 @@ async function route(req, res) {
   /* ---------------------------------------- 配對碼（讓新裝置免貼長金鑰） */
 
   if (resource === 'tokens' && parts[2] === 'pairings' && !parts[3]) {
-    if (!isMaster) return fail(res, 403, '產生配對碼要用主金鑰（TRIPLOG_API_KEY）', {});
+    // 帳號模式下「設定 → 金鑰與裝置」是登入者自己在用的東西，不能每一步都要求先拿出主金鑰
+    if (!isMaster && !auth.session) return fail(res, 403, '產生配對碼要用主金鑰（TRIPLOG_API_KEY）或已登入的裝置', {});
     const scope = TOKEN_SCOPES.includes(body?.scope) ? body.scope : 'write';
     let expiresAt = null;
     try {
@@ -497,6 +536,8 @@ async function route(req, res) {
     } catch (err) {
       return fail(res, err.status ?? 400, String(err.message ?? err), {});
     }
+    // 這組碼換出來的憑證落在誰的帳上，這裡就定死（規則同 /api/tokens：登入者只能綁自己）
+    const bindUid = auth.session ? uid : uidOfAccount(body?.account) || defaultAccountUid();
     const minted = newPairingCode();
     const pairing = store.createPairing({
       id: minted.id,
@@ -504,17 +545,20 @@ async function route(req, res) {
       label: tokenLabel(body?.label, '新裝置'),
       scope,
       expiresAt,
+      uid: bindUid,
     });
     // 原字串只在這一次回應出現；之後清單上只有狀態與用沒用掉
     return send(res, 200, { ok: true, pairing, code: minted.code, display: minted.display, expiresInMinutes: Math.min(Math.trunc(Number(body?.expiresInMinutes ?? DEFAULT_PAIR_MINUTES)), MAX_PAIR_MINUTES) });
   }
 
   if (resource === 'tokens' && parts[2] === 'pairings' && parts[3] === 'revoke') {
-    if (!isMaster) return fail(res, 403, '作廢配對碼要用主金鑰（TRIPLOG_API_KEY）', {});
+    if (!isMaster && !auth.session) return fail(res, 403, '作廢配對碼要用主金鑰（TRIPLOG_API_KEY）或已登入的裝置', {});
     const id = String(body?.id ?? '');
-    const changed = store.revokePairing(id);
+    // 同樣按分帳收口：別人的配對碼對登入裝置來說是「不存在」
+    const scope = isMaster ? null : uid;
+    const changed = store.revokePairing(id, scope);
     const row = store.pairing(id);
-    if (!row) return fail(res, 404, '找不到這組配對碼', {});
+    if (!row || (scope !== null && row.uid !== scope)) return fail(res, 404, '找不到這組配對碼', {});
     return send(res, 200, { ok: true, revoked: true, changed, pairing: row });
   }
 
@@ -572,7 +616,15 @@ async function route(req, res) {
       return fail(res, err.status ?? 400, String(err.message ?? err), {});
     }
     const label = typeof body?.label === 'string' && body.label.trim() ? body.label.trim().slice(0, 60) : trip.name;
-    return send(res, 200, { ok: true, share: store.createShare({ tripId, label, expiresAt, uid }) });
+    // 訪客選項（Phase 4b）：能不能記、要不要 PIN。PIN 在這裡就換成雜湊，明文只回一次
+    const canWrite = body?.canWrite !== false;
+    const pin = normalizePin(body?.pin);
+    if (pin === false) {
+      return fail(res, 400, `訪客 PIN 是 ${PIN_MIN}–${PIN_MAX} 位數字（留空＝不設）`, {});
+    }
+    const share = store.createShare({ tripId, label, expiresAt, uid, canWrite, pinHash: pin ? hashSecret(pin) : null });
+    // PIN 只在這一則回應出現一次（伺服器只有雜湊，之後誰都問不回來）
+    return send(res, 200, { ok: true, share: pubShare(share), ...(pin ? { pin } : {}) });
   }
 
   if (resource === 'shares' && parts[2] === 'revoke') {
@@ -615,6 +667,24 @@ async function route(req, res) {
  *
  * @returns {{ uid: string, canRead: boolean, canWrite: boolean, isMaster: boolean, issued: any, session: any, user: any, reason: 'ok' | 'no-credential' | 'bad-credential' | 'expired-session' | 'revoked-session' }}
  */
+/** 「帳號 id 或信箱」換成 uid；對不上就回 ''，讓呼叫端自己決定要退回哪份帳（不亂猜） */
+function uidOfAccount(handle) {
+  const v = String(handle ?? '').trim();
+  if (!v) return '';
+  const byId = store.user(v);
+  if (byId) return byId.id;
+  return v.includes('@') ? store.userByEmail(v)?.id ?? '' : '';
+}
+
+/**
+ * 金鑰與「還沒綁過帳號的舊憑證」用的預設分帳，由強到弱：
+ * 請求標頭點名（只有主金鑰）> `TRIPLOG_DEFAULT_UID` > 資料庫只有那一個帳號時自動選它 > 舊基準 `''`。
+ * 最後一格很重要：從未開過帳號模式的部署根本沒有帳號列，行為與這一版之前完全一致。
+ */
+function defaultAccountUid(hint) {
+  return uidOfAccount(hint) || uidOfAccount(DEFAULT_ACCOUNT) || (store.countUsers() === 1 ? store.listUsers()[0]?.id ?? '' : '');
+}
+
 function resolveAuth(req) {
   const key = bearer(req);
   const storedMaster = store.masterHash();
@@ -631,8 +701,16 @@ function resolveAuth(req) {
   const deny = (reason) => ({ uid: '', canRead: false, canWrite: false, isMaster: false, issued: null, session: null, user: null, reason });
 
   if (keysAllowed && (isMasterReadable || issued)) {
+    /**
+     * 這把鑰算誰的帳，由強到弱：憑證簽發時綁定的帳號 > 主金鑰在請求裡點名的 > 預設帳號。
+     * 綁定的比較強是有意的：`tlk_` 一旦簽給某人，拿鑰的人（或外洩的那台）就換不了帳本；
+     * 點名標頭只對主金鑰敞開，因為它本來就是整台伺服器的密碼。
+     * 兩格都空時才退回預設帳號——這一條讓「認領之後舊鑰看到空帳本」不再無聲發生。
+     */
+    const bound = issued?.uid || '';
+    const uid = bound || defaultAccountUid(isMaster ? req.headers[ACCOUNT_HEADER] : '');
     return {
-      uid: '',
+      uid,
       canRead: true,
       canWrite: isMaster || scopeAllows(issued?.scope, 'write'),
       isMaster,
@@ -814,6 +892,8 @@ async function handlePair(req, res, ip) {
     label,
     scope: row.scope,
     expiresAt: expiresAtFrom(MAX_SHARE_DAYS) ?? null,
+    // 配對碼是誰簽的就落到誰的帳上：這一步讓「新裝置配對完卻看到空帳本」不會再發生
+    uid: row.uid ?? '',
   });
   // 這台裝置拿到的是普通憑證：之後在擁有者的清單裡看得到、能單獨撤銷
   return send(res, 200, { ok: true, secret: minted.token, token, scope: row.scope, expiresInDays: MAX_SHARE_DAYS });
@@ -841,6 +921,11 @@ async function handleShare(req, res, tokenPart, action) {
   const { snapshot, head } = store.base(share.uid);
 
   if (req.method === 'GET' && !action) {
+    // 設了 PIN 的連結：沒對就不回資料，只回「要 PIN」＋這條連結能不能記（頁面才不會先畫出表單再被打回）
+    if (!store.sharePinOk(token, readPin(req))) {
+      if (!limitPinTry(`${token}|${ip}`)) return fail(res, 429, 'PIN 試太多次，請一分鐘後再試', { retryAfterMs: 60_000 });
+      return fail(res, 401, '這個分享連結需要訪客 PIN', { needPin: true, canWrite: share.canWrite !== false });
+    }
     store.touchShare(token);
     let payload;
     try {
@@ -853,18 +938,55 @@ async function handleShare(req, res, tokenPart, action) {
 
   if (req.method === 'POST' && (action === 'expense' || action === 'item')) {
     if (!limitShareWrite(`${token}|${ip}`)) return fail(res, 429, 'too many writes', { retryAfterMs: 60_000 });
+    // 唯讀連結：看得到、記不了（文案要有「唯讀」，前端的錯誤分流靠它）
+    if (share.canWrite === false) return fail(res, 403, '這條分享連結是唯讀的，只能看不能記', { readOnly: true });
     let body = null;
     try {
       body = await readJsonBody(req, MAX_SHARE_BODY);
     } catch (err) {
       return fail(res, err.status ?? 400, err.message, {});
     }
+    // PIN 可以打在標頭或表單裡：行動裝置的鍵盤常常只給一個欄位，兩條路都留著
+    if (!store.sharePinOk(token, readPin(req) || String(body?.pin ?? ''))) {
+      if (!limitPinTry(`${token}|${ip}`)) return fail(res, 429, 'PIN 試太多次，請一分鐘後再試', { retryAfterMs: 60_000 });
+      return fail(res, 401, '訪客 PIN 不對（或還沒填）', { needPin: true });
+    }
+    // 訪客的名字：只用來記「最後是誰用這條連結」；寫進記錄本身的署名由表單帶（payee／note）
+    const who = visitorName(body?.who);
     const out = sharedAppend(res, { snapshot, tripId: share.tripId, uid: share.uid, action, body, source: 'share' });
-    if (out === true) store.touchShare(token, { write: true });
+    if (out === true) store.touchShare(token, { write: true, who });
     return out;
   }
 
   return fail(res, 405, 'method not allowed', {});
+}
+
+/**
+ * 訪客 PIN 的形狀：4–8 位數字。留空＝不設（回 null），形狀不對回 false 讓路由層講清楚。
+ * 不限制重複或順序：這道門的目的是「LINE Grupo 以外的人按到連結也記不進去」，
+ * 不是帳號密碼——真要擋兇手，作廢連結才是對的手段。
+ */
+const PIN_MIN = 4;
+const PIN_MAX = 8;
+function normalizePin(input) {
+  if (input === undefined || input === null) return null;
+  const s = String(input).replace(/[\s-]/g, '');
+  if (!s) return null;
+  return s.length >= PIN_MIN && s.length <= PIN_MAX && /^[0-9]+$/.test(s) ? s : false;
+}
+
+/** PIN 從標頭或表單進來都行：手機鍵盤常常只給一個欄位，別逼人多開一個 */
+function readPin(req) {
+  return String(req.headers['x-triplog-pin'] ?? '').slice(0, 16);
+}
+
+/**
+ * 給擁有者的連結視圖：內部身分（哪個分帳簽的）不跟著出去。
+ * PIN 雜湊本來就離開不了資料層——`shareView` 只放一個 hasPin 旗標。
+ */
+function pubShare(s) {
+  const { uid, ...rest } = s;
+  return rest;
 }
 
 /**
