@@ -3,7 +3,8 @@ import { Link } from 'react-router-dom';
 import { Field } from '../../components/Controls';
 import { useUi } from '../../app/ui';
 import { useI18n } from '../../i18n';
-import { categoryLabel } from '../../lib/labels';
+import type { DayItem, Trip } from '../../db/types';
+import { builtinKindLabel, categoryLabel } from '../../lib/labels';
 import { today } from '../../lib/dates';
 import { loadSyncConfig } from '../../lib/sync';
 import { loadAccount } from '../../lib/account';
@@ -14,6 +15,7 @@ import {
   leaveInvite,
   myInvites,
   pushSharedExpense,
+  pushSharedItem,
   type InviteRow,
   type SharedTripView,
 } from '../../lib/invites';
@@ -133,7 +135,7 @@ export function SharedTripsPage() {
   );
 }
 
-/** 金額顯示：共筆只看這一趟，所以用旅行自己的帳號當預設單位 */
+/** 金額顯示：共筆只看這一趟，所以用這趟自己的基準幣別當預設單位 */
 function money(v: number, currency: string, locale: string): string {
   try {
     return new Intl.NumberFormat(locale, { style: 'currency', currency }).format(v);
@@ -142,16 +144,46 @@ function money(v: number, currency: string, locale: string): string {
   }
 }
 
+/** 內建行程類型（伺服器 share.js 的 ITEM_KINDS）：邀請人還沒推分類清單時用這組兜底 */
+const FALLBACK_KIND_KEYS = ['transport', 'stay', 'food', 'sight', 'activity', 'other'];
+
+/** 共筆表單的預設日期：今天落在這趟裡就用今天，否則回到第一天（就算填了範圍外，伺服器也會自己夾回來） */
+function sharedDate(trip: Trip): string {
+  const now = today();
+  return now >= trip.startDate && now <= trip.endDate ? now : trip.startDate;
+}
+
+/** 行程清單：伺服器的 items 已按「日期＋order」排好，這裡只把同一天併成一組 */
+function groupByDay(items: DayItem[]): Array<{ date: string; list: DayItem[] }> {
+  const days: Array<{ date: string; list: DayItem[] }> = [];
+  for (const it of items) {
+    const last = days[days.length - 1];
+    if (last && last.date === it.date) last.list.push(it);
+    else days.push({ date: it.date, list: [it] });
+  }
+  return days;
+}
+
 function SharedTripView({ tripId, onBack }: { tripId: string; onBack: () => void }) {
   const { toast } = useUi();
   const { t, locale } = useI18n();
-  const cfg = loadSyncConfig()!;
+  // 只讀一次：loadSyncConfig() 每次回的是新解析出來的物件，放進 useEffect 的依賴迴圈
+  // 就變成「渲染 → fetch → setView → 渲染」的無限迴路（實測把 /shared 打到 429）。
+  const cfg = useMemo(() => loadSyncConfig()!, []);
   const [view, setView] = useState<SharedTripView | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
   const [category, setCategory] = useState('');
+  // 行程表單收在一個按鈕後面：手機上五個欄位同時展開，這一頁就變成一長條輸入框
+  const [addingItem, setAddingItem] = useState(false);
+  const [itemBusy, setItemBusy] = useState(false);
+  const [iDate, setIDate] = useState('');
+  const [iKind, setIKind] = useState('');
+  const [iTitle, setITitle] = useState('');
+  const [iStart, setIStart] = useState('');
+  const [iLoc, setILoc] = useState('');
 
   const load = useCallback(async () => {
     try {
@@ -185,6 +217,17 @@ function SharedTripView({ tripId, onBack }: { tripId: string; onBack: () => void
 
   const canWrite = view.grant?.role !== 'read';
   const expenseCategories = view.categories.filter((c) => c.kind === 'expense');
+  const itemCategories = view.categories.filter((c) => c.kind === 'item');
+  const kindOptions = itemCategories.length
+    ? itemCategories.map((c) => ({ value: String(c.key ?? c.id), label: categoryLabel(c) }))
+    : FALLBACK_KIND_KEYS.map((k) => ({ value: k, label: builtinKindLabel('item', k) }));
+  const kindDefault = kindOptions[0]?.value ?? 'other';
+  /** 一個行程項的類型該怎麼唸：有分類列就用它（含擁有者改過的名字），否則回到內建文案 */
+  const kindLabel = (it: DayItem): string => {
+    const c = itemCategories.find((x) => x.key === it.kind || x.id === it.kind);
+    return c ? categoryLabel(c) : builtinKindLabel('item', it.kind);
+  };
+  const days = groupByDay(view.items);
 
   async function save() {
     const value = Number(amount.replace(/,/g, ''));
@@ -213,6 +256,38 @@ function SharedTripView({ tripId, onBack }: { tripId: string; onBack: () => void
     }
   }
 
+  async function saveItem() {
+    const title = iTitle.trim();
+    if (!title) {
+      toast(t('item.titleRequired'), { kind: 'error' });
+      return;
+    }
+    const acct = loadAccount()?.user;
+    const who = acct?.name || acct?.email || '';
+    setItemBusy(true);
+    try {
+      await pushSharedItem(cfg, tripId, {
+        date: iDate || sharedDate(view!.trip),
+        kind: iKind || kindDefault,
+        title,
+        startTime: iStart || null,
+        location: iLoc.trim() || undefined,
+        // 備註是這一趟裡「誰排的」唯一留痕的地方：支出有代墊人可填，行程項沒有那個欄位
+        note: who ? t('invite.addedBy', { name: who }) : undefined,
+      });
+      toast(t('share.sent'));
+      setITitle('');
+      setIStart('');
+      setILoc('');
+      setAddingItem(false);
+      await load();
+    } catch (err) {
+      toast(describeInviteError(err, t), { kind: 'error' });
+    } finally {
+      setItemBusy(false);
+    }
+  }
+
   return (
     <div className="card">
       <h3>{view.trip.name}</h3>
@@ -225,8 +300,85 @@ function SharedTripView({ tripId, onBack }: { tripId: string; onBack: () => void
       </p>
       <p className="tiny">{t('invite.sharedNote')}</p>
 
+      {/* ------------------------------------------------------------ 行程 */}
+      <div className="row" style={{ justifyContent: 'space-between', alignItems: 'baseline', marginTop: 16, gap: 8 }}>
+        <h4 style={{ margin: 0 }}>{t('invite.itineraryTitle')}</h4>
+        {canWrite ? (
+          <button className="btn btn-sm" onClick={() => setAddingItem((v) => !v)} aria-expanded={addingItem}>
+            {t('invite.addItem')}
+          </button>
+        ) : null}
+      </div>
+
+      {canWrite && addingItem ? (
+        <div className="stack-s" style={{ marginTop: 8 }}>
+          <div className="row wrap" style={{ gap: 8, alignItems: 'flex-end' }}>
+            <Field label={t('common.date')}>
+              <input type="date" value={iDate || sharedDate(view.trip)} onChange={(e) => setIDate(e.target.value)} />
+            </Field>
+            <Field label={t('item.kind')}>
+              <select value={iKind || kindDefault} onChange={(e) => setIKind(e.target.value)}>
+                {kindOptions.map((k) => (
+                  <option key={k.value} value={k.value}>
+                    {k.label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label={t('item.start')}>
+              <input type="time" value={iStart} onChange={(e) => setIStart(e.target.value)} />
+            </Field>
+          </div>
+          <Field label={t('item.title')}>
+            <input
+              value={iTitle}
+              onChange={(e) => setITitle(e.target.value)}
+              maxLength={160}
+              autoFocus
+              placeholder={t('item.titlePlaceholder')}
+            />
+          </Field>
+          <div className="row wrap" style={{ gap: 8, alignItems: 'flex-end' }}>
+            <Field label={t('item.location')}>
+              <input className="grow" value={iLoc} onChange={(e) => setILoc(e.target.value)} maxLength={200} placeholder={t('item.locationPlaceholder')} />
+            </Field>
+            <button className="btn btn-primary btn-sm" onClick={() => void saveItem()} disabled={itemBusy}>
+              {itemBusy ? t('share.sending') : t('invite.addItemSave')}
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {days.length === 0 ? (
+        <p className="tiny">{t('invite.itemEmpty')}</p>
+      ) : (
+        days.map((day) => (
+          <div key={day.date} style={{ marginTop: 8 }}>
+            <p className="tiny" style={{ margin: '0 0 2px' }}>
+              <strong>{day.date}</strong> · {t('invite.dayCount', { n: day.list.length })}
+            </p>
+            <ul className="list">
+              {day.list.map((it) => (
+                <li key={it.id}>
+                  <span className="tiny" style={{ display: 'inline-block', minWidth: '3.6em', marginRight: 6 }}>
+                    {it.startTime || '—'}
+                  </span>
+                  {it.title}
+                  <span className="tiny">
+                    {' · '}
+                    {kindLabel(it)}
+                    {it.location ? ` · ${it.location}` : ''}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))
+      )}
+
+      {/* ------------------------------------------------------------ 支出 */}
       {canWrite ? (
-        <div className="row wrap" style={{ gap: 8, alignItems: 'flex-end' }}>
+        <div className="row wrap" style={{ gap: 8, alignItems: 'flex-end', marginTop: 16 }}>
           <Field label={t('common.amount')} hint={view.trip.baseCurrency}>
             <input value={amount} onChange={(e) => setAmount(e.target.value)} inputMode="decimal" placeholder={t('share.amountPlaceholder')} />
           </Field>
@@ -248,7 +400,7 @@ function SharedTripView({ tripId, onBack }: { tripId: string; onBack: () => void
           </button>
         </div>
       ) : (
-        <p className="tiny">{t('invite.errReadonly')}</p>
+        <p className="tiny" style={{ marginTop: 16 }}>{t('invite.errReadonly')}</p>
       )}
 
       <h4 style={{ marginTop: 16 }}>{t('invite.recentTitle')}</h4>

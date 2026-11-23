@@ -181,10 +181,22 @@ export function pushSharedExpense(
   return call<{ expense: Expense }>(cfg, `/api/trips/${encodeURIComponent(tripId)}/shared/expense`, { body: { id: newId('exp'), ...draft } });
 }
 
+/**
+ * 代排一個行程項。時間與備註留空就是不填——伺服器自己認 `HH:MM` 形狀、
+ * 把日期夾進這趟的範圍、order 接在最後面，所以客戶端不需要知道現有的排序。
+ */
 export function pushSharedItem(
   cfg: SyncConfig,
   tripId: string,
-  draft: { date: string; kind: string; title: string; location?: string },
+  draft: {
+    date: string;
+    kind: string;
+    title: string;
+    startTime?: string | null;
+    endTime?: string | null;
+    location?: string;
+    note?: string;
+  },
 ): Promise<{ item: DayItem }> {
   return call<{ item: DayItem }>(cfg, `/api/trips/${encodeURIComponent(tripId)}/shared/item`, { body: { id: newId('item'), ...draft } });
 }

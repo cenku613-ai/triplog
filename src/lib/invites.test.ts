@@ -9,6 +9,7 @@ import {
   looksLikeEmail,
   myInvites,
   pushSharedExpense,
+  pushSharedItem,
   revokeInvite,
   InviteError,
   type InviteRow,
@@ -113,7 +114,7 @@ describe('邀請的呼叫', () => {
     expect(JSON.parse(String(calls[0].init.body))).toEqual({ id: 'g_1' });
   });
 
-  it('受邀者那一側用 mine 問「誰邀过我」', async () => {
+  it('受邀者那一側用 mine 問「誰邀了我」', async () => {
     const calls = stubFetch({ email: 'bo@example.com', invites: [invite()] });
     const r = await myInvites(cfg);
     expect(r.email).toBe('bo@example.com');
@@ -127,6 +128,24 @@ describe('邀請的呼叫', () => {
     const body = JSON.parse(String(calls[0].init.body)) as { id: string; amount: number };
     expect(body.id.startsWith('exp_')).toBe(true);
     expect(body.amount).toBe(120);
+  });
+
+  it('共筆排行程：走的是同一趟的 /shared/item，沒填的時間照 UI 那樣送 null', async () => {
+    const calls = stubFetch({ item: { id: 'item_x' } });
+    await pushSharedItem(cfg, 'trip_a', {
+      date: '2026-03-02',
+      kind: 'sight',
+      title: '伏見稻荷大社',
+      startTime: null,
+      location: '京都市伏見區',
+      note: '由阿雲加入',
+    });
+    expect(calls[0].url).toBe('https://triplog.example/api/trips/trip_a/shared/item');
+    const body = JSON.parse(String(calls[0].init.body)) as Record<string, unknown>;
+    expect(String(body.id).startsWith('item_')).toBe(true);
+    expect(body.kind).toBe('sight');
+    expect(body.startTime).toBe(null);
+    expect(body.location).toBe('京都市伏見區');
   });
 
   it('共筆讀取走的是邀請人那一趟的路徑', async () => {
