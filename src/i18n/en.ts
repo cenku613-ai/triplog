@@ -269,6 +269,27 @@ export const en: Dict = {
   'item.moveDown': 'Move down',
   'item.unlinked': 'not linked to an item',
 
+  /* -------------------------------------------------------- checklist */
+  'tab.checklist': 'Checklist',
+  'checklist.title': 'Before and during the trip',
+  'checklist.description': 'Keep luggage, tickets and to-dos with this trip. Completion syncs too.',
+  'checklist.placeholder': 'e.g. Confirm flights, pack passport, buy transit passes',
+  'checklist.add': 'Add item',
+  'checklist.emptyTitle': 'No checklist items yet',
+  'checklist.emptyBody': 'Note what to prepare before departure or remember while travelling.',
+  'checklist.progress': '{done} / {total} done',
+  'checklist.required': 'Enter a checklist item',
+  'checklist.added': 'Checklist item added',
+  'checklist.updated': 'Checklist item updated',
+  'checklist.deleted': 'Checklist item deleted',
+  'checklist.deleteQ': 'Delete “{text}”?',
+  'checklist.editAria': 'Edit “{text}”',
+  'checklist.deleteAria': 'Delete “{text}”',
+  'checklist.markDone': 'Mark “{text}” as done',
+  'checklist.markOpen': 'Mark “{text}” as not done',
+  'checklist.saveFailed': 'Could not save the checklist. Please try again.',
+  'detail.checklistTile': 'Checklist done',
+
   /* -------------------------------------------------------------- expenses */
   'expense.title': 'Add expense',
   'expense.editTitle': 'Edit expense',

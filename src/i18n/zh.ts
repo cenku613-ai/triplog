@@ -263,6 +263,27 @@ export const zh = {
   'item.moveDown': '下移',
   'item.unlinked': '未關聯行程',
 
+  /* -------------------------------------------------------- checklist */
+  'tab.checklist': '勾選清單',
+  'checklist.title': '出發前與旅途中',
+  'checklist.description': '把行李、票券與待辦記在這一趟，完成狀態會跟著同步。',
+  'checklist.placeholder': '例如：確認機票、帶護照、買交通票券',
+  'checklist.add': '新增事項',
+  'checklist.emptyTitle': '還沒有清單事項',
+  'checklist.emptyBody': '先記下出發前要準備的事，或旅途中別忘了做的小提醒。',
+  'checklist.progress': '{done} / {total} 已完成',
+  'checklist.required': '請填清單內容',
+  'checklist.added': '已新增清單事項',
+  'checklist.updated': '已更新清單事項',
+  'checklist.deleted': '已刪除清單事項',
+  'checklist.deleteQ': '要刪除「{text}」嗎？',
+  'checklist.editAria': '編輯「{text}」',
+  'checklist.deleteAria': '刪除「{text}」',
+  'checklist.markDone': '標記「{text}」為完成',
+  'checklist.markOpen': '標記「{text}」為未完成',
+  'checklist.saveFailed': '清單儲存失敗，請再試一次',
+  'detail.checklistTile': '清單完成',
+
   /* ----------------------------------------------------------- expenses */
   'expense.title': '記一筆支出',
   'expense.editTitle': '編輯支出',

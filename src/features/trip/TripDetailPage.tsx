@@ -2,9 +2,10 @@ import { Suspense, lazy, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useLive } from '../../db/live';
 import { db } from '../../db/db';
-import { listCategories } from '../../db/repo';
-import type { Category, DayItem, Expense, Trip } from '../../db/types';
+import { listCategories, listCheckItems } from '../../db/repo';
+import type { Category, ChecklistItem, DayItem, Expense, Trip } from '../../db/types';
 import { ItineraryTab } from '../itinerary/ItineraryTab';
+import { ChecklistTab } from './ChecklistTab';
 import { ExpensesTab } from '../expenses/ExpensesTab';
 import { StatsTab } from '../stats/StatsTab';
 /** Leaflet 約 40 KB gzip，沒開地圖頁就不必跟著首頻一起載 */
@@ -24,13 +25,15 @@ import { summarize } from '../../lib/stats';
 import { useUi } from '../../app/ui';
 import { useI18n } from '../../i18n';
 
-type Tab = 'plan' | 'money' | 'stats' | 'map';
+type Tab = 'plan' | 'checklist' | 'money' | 'stats' | 'map';
+const TAB_IDS: Tab[] = ['plan', 'checklist', 'money', 'stats', 'map'];
 
 export function TripDetailPage() {
   const { tripId = '' } = useParams();
   const nav = useNavigate();
   const [params, setParams] = useSearchParams();
-  const tab = (params.get('tab') as Tab) ?? 'plan';
+  const requestedTab = params.get('tab') as Tab | null;
+  const tab = requestedTab && TAB_IDS.includes(requestedTab) ? requestedTab : 'plan';
   const { toast, ask } = useUi();
   const { t, lang } = useI18n();
   const [editing, setEditing] = useState<null | 'trip' | 'item' | 'expense'>(null);
@@ -43,6 +46,7 @@ export function TripDetailPage() {
 
   const TABS: { id: Tab; label: string }[] = [
     { id: 'plan', label: t('tab.plan') },
+    { id: 'checklist', label: t('tab.checklist') },
     { id: 'money', label: t('tab.money') },
     { id: 'stats', label: t('tab.stats') },
     { id: 'map', label: t('tab.map') },
@@ -59,6 +63,7 @@ export function TripDetailPage() {
     [tripId],
     [],
   );
+  const checkItems = useLive<ChecklistItem[]>(() => listCheckItems(tripId), [tripId], []);
   const categories = useLive<Category[]>(() => listCategories('expense'), [], []);
   const trips = useLive<Trip[]>(() => db.trips.toArray(), [], []);
 
@@ -186,6 +191,7 @@ export function TripDetailPage() {
               onAddExpense={(itemId, date) => openExpense({ itemId, date })}
             />
           ) : null}
+          {tab === 'checklist' ? <ChecklistTab tripId={trip.id} items={checkItems} /> : null}
           {tab === 'money' ? (
             <ExpensesTab
               trip={trip}
@@ -256,6 +262,10 @@ export function TripDetailPage() {
               <div className="tile">
                 <div className="k">{t('detail.expensesTile')}</div>
                 <div className="v">{expenses.length}</div>
+              </div>
+              <div className="tile">
+                <div className="k">{t('detail.checklistTile')}</div>
+                <div className="v">{checkItems.filter((item) => item.done).length}/{checkItems.length}</div>
               </div>
               <div className="tile">
                 <div className="k">{t('detail.perDayTile')}</div>

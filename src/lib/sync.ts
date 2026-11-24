@@ -33,11 +33,11 @@ export type SyncConfig = {
 
 export type SyncReport = {
   at: string;
-  pulled: { trips: number; dayItems: number; expenses: number; photos: number };
-  pushed: { trips: number; dayItems: number; expenses: number };
+  pulled: { trips: number; dayItems: number; expenses: number; photos: number; checkItems: number };
+  pushed: { trips: number; dayItems: number; expenses: number; checkItems: number };
   photosDownloaded: number;
   remoteBytes: number;
-  /** 這次照刪除記號從本機清掉幾列（包含連動刪掉的行程項／支出／照片） */
+  /** 這次照刪除記號從本機清掉幾列（包含連動刪掉的行程項／支出／照片／勾選清單） */
   deleted: number;
 };
 
@@ -170,6 +170,7 @@ function snapshotOf(data: BackupLike): BackupFile {
     expenses: data.expenses ?? [],
     categories: data.categories ?? [],
     photos: [],
+    checkItems: data.checkItems ?? [],
     tombstones: data.tombstones ?? [],
     meta: data.meta ?? [],
   };
@@ -194,18 +195,22 @@ async function removeDeleted(doc: BackupLike): Promise<number> {
   removed += await db.expenses.where('id').anyOf(idsOf('expenses')).count();
   removed += await db.photos.where('id').anyOf(idsOf('photos')).count();
   removed += await db.dayItems.where('id').anyOf(items).count();
+  removed += await db.checkItems.where('id').anyOf(idsOf('checkItems')).count();
   await db.trips.bulkDelete(idsOf('trips'));
   await db.expenses.bulkDelete(idsOf('expenses'));
   await db.photos.bulkDelete(idsOf('photos'));
   await db.dayItems.bulkDelete(items);
+  await db.checkItems.bulkDelete(idsOf('checkItems'));
   if (trips.length) {
     // 連動：本機可能還留著那一趟的子列（它們在基準裡已被濾掉，不會出現在 doc 中）
     removed += await db.dayItems.where('tripId').anyOf(trips).count();
     removed += await db.expenses.where('tripId').anyOf(trips).count();
     removed += await db.photos.where('tripId').anyOf(trips).count();
+    removed += await db.checkItems.where('tripId').anyOf(trips).count();
     await db.dayItems.where('tripId').anyOf(trips).delete();
     await db.expenses.where('tripId').anyOf(trips).delete();
     await db.photos.where('tripId').anyOf(trips).delete();
+    await db.checkItems.where('tripId').anyOf(trips).delete();
   }
   if (items.length) {
     removed += await db.photos.where('dayItemId').anyOf(items).count();
@@ -220,7 +225,7 @@ async function applySnapshot(snap: BackupFile): Promise<number> {
   const markers = snap.tombstones ?? [];
   return db.transaction(
     'rw',
-    [db.trips, db.dayItems, db.expenses, db.categories, db.meta, db.photos, db.tombstones],
+    [db.trips, db.dayItems, db.expenses, db.categories, db.meta, db.photos, db.checkItems, db.tombstones],
     async () => {
       // 記號先落地：之後的推送要繼續帶著它們，別人才不會把同一筆又長回來
       if (markers.length) await db.tombstones.bulkPut(markers);
@@ -229,6 +234,7 @@ async function applySnapshot(snap: BackupFile): Promise<number> {
       if (snap.trips.length) await db.trips.bulkPut(snap.trips);
       if (snap.dayItems.length) await db.dayItems.bulkPut(snap.dayItems);
       if (snap.expenses.length) await db.expenses.bulkPut(snap.expenses);
+      if (snap.checkItems?.length) await db.checkItems.bulkPut(snap.checkItems);
       return removeDeleted(snap);
     },
   );
@@ -275,7 +281,7 @@ export async function pullFromServer(cfg: SyncConfig): Promise<SyncReport> {
   return {
     at,
     pulled: countsOf(remote.base),
-    pushed: { trips: 0, dayItems: 0, expenses: 0 },
+    pushed: { trips: 0, dayItems: 0, expenses: 0, checkItems: 0 },
     photosDownloaded: photosWritten,
     remoteBytes: remote.bytes ?? 0,
     deleted,
@@ -294,11 +300,12 @@ export async function pushToServer(cfg: SyncConfig): Promise<SyncReport> {
   setLastSyncAt(at);
   return {
     at,
-    pulled: { trips: 0, dayItems: 0, expenses: 0, photos: 0 },
+    pulled: { trips: 0, dayItems: 0, expenses: 0, photos: 0, checkItems: 0 },
     pushed: {
       trips: local.trips.length,
       dayItems: local.dayItems.length,
       expenses: local.expenses.length,
+      checkItems: local.checkItems?.length ?? 0,
     },
     photosDownloaded: 0,
     remoteBytes: res.bytes ?? 0,
@@ -332,6 +339,7 @@ export async function syncNow(cfg: SyncConfig): Promise<SyncReport> {
       trips: push.trips.length,
       dayItems: push.dayItems.length,
       expenses: push.expenses.length,
+      checkItems: push.checkItems?.length ?? 0,
     },
     photosDownloaded,
     remoteBytes: res.bytes ?? remote.bytes ?? 0,
@@ -365,14 +373,14 @@ async function fetchMissingPhotos(cfg: SyncConfig, merged: BackupFile): Promise<
 }
 
 /** 只抓某一趟（含照片）併進本機，不動其他旅行 */
-export async function pullTrip(cfg: SyncConfig, tripId: string): Promise<{ name: string; items: number; expenses: number; photos: number }> {
+export async function pullTrip(cfg: SyncConfig, tripId: string): Promise<{ name: string; items: number; expenses: number; photos: number; checkItems: number }> {
   const res = await api<{ backup: BackupFile }>(cfg, `/api/trips/${encodeURIComponent(tripId)}/export`);
   const snap = res.backup;
   const trip = snap.trips[0] as Trip | undefined;
   const photos = (snap.photos ?? []).map(toPhoto);
   await db.transaction(
     'rw',
-    [db.trips, db.dayItems, db.expenses, db.categories, db.photos, db.tombstones],
+    [db.trips, db.dayItems, db.expenses, db.categories, db.photos, db.checkItems, db.tombstones],
     async () => {
       const markers = snap.tombstones ?? [];
       if (markers.length) await db.tombstones.bulkPut(markers);
@@ -380,6 +388,7 @@ export async function pullTrip(cfg: SyncConfig, tripId: string): Promise<{ name:
       if (snap.trips.length) await db.trips.bulkPut(snap.trips);
       if (snap.dayItems.length) await db.dayItems.bulkPut(snap.dayItems);
       if (snap.expenses.length) await db.expenses.bulkPut(snap.expenses);
+      if (snap.checkItems?.length) await db.checkItems.bulkPut(snap.checkItems);
       if (photos.length) await db.photos.bulkPut(photos);
       // 這趟的刪除記號也要落到本機：對方在別台刪掉的行程項，不能因為「只拉這趟」而留著
       await removeDeleted(snap);
@@ -391,6 +400,7 @@ export async function pullTrip(cfg: SyncConfig, tripId: string): Promise<{ name:
     items: snap.dayItems.length,
     expenses: snap.expenses.length,
     photos: photos.length,
+    checkItems: snap.checkItems?.length ?? 0,
   };
 }
 
@@ -410,12 +420,17 @@ export async function testConnection(
 
 export async function listRemoteTrips(
   cfg: SyncConfig,
-): Promise<{ id: string; name: string; startDate: string; endDate: string; items: number; expenses: number }[]> {
-  const res = await api<{ trips: { id: string; name: string; startDate: string; endDate: string }[]; counts: Record<string, { items: number; expenses: number }> }>(
+): Promise<{ id: string; name: string; startDate: string; endDate: string; items: number; expenses: number; checkItems: number }[]> {
+  const res = await api<{ trips: { id: string; name: string; startDate: string; endDate: string }[]; counts: Record<string, { items: number; expenses: number; checkItems?: number }> }>(
     cfg,
     '/api/trips',
   );
-  return res.trips.map((t) => ({ ...t, ...(res.counts?.[t.id] ?? { items: 0, expenses: 0 }) }));
+  return res.trips.map((t) => ({
+    ...t,
+    items: res.counts?.[t.id]?.items ?? 0,
+    expenses: res.counts?.[t.id]?.expenses ?? 0,
+    checkItems: res.counts?.[t.id]?.checkItems ?? 0,
+  }));
 }
 
 export function describeSyncError(err: unknown): string {

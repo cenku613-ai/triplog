@@ -119,13 +119,14 @@ function counts(snapshot) {
   const perTrip = {};
   const bump = (id, field) => {
     if (!id) return;
-    perTrip[id] ??= { items: 0, expenses: 0, photos: 0 };
+    perTrip[id] ??= { items: 0, expenses: 0, photos: 0, checkItems: 0 };
     perTrip[id][field] += 1;
   };
   for (const i of snapshot.dayItems ?? []) bump(i.tripId, 'items');
   for (const e of snapshot.expenses ?? []) bump(e.tripId, 'expenses');
   for (const p of snapshot.photos ?? []) bump(p.tripId, 'photos');
-  for (const t of snapshot.trips ?? []) perTrip[t.id] ??= { items: 0, expenses: 0, photos: 0 };
+  for (const c of snapshot.checkItems ?? []) bump(c.tripId, 'checkItems');
+  for (const t of snapshot.trips ?? []) perTrip[t.id] ??= { items: 0, expenses: 0, photos: 0, checkItems: 0 };
   return perTrip;
 }
 
@@ -200,9 +201,18 @@ const SCHEMA_HINT = {
     createdAt: 'ISO',
     updatedAt: 'ISO',
   },
+  checklistItem: {
+    id: 'check_<uuid>',
+    tripId: 'string',
+    text: 'string',
+    done: 'boolean',
+    order: 'number',
+    createdAt: 'ISO',
+    updatedAt: 'ISO',
+  },
   tombstone: {
-    id: 'the id that was deleted (trip_/item_/exp_/photo_ prefix says which table)',
-    kind: 'trips|dayItems|expenses|photos',
+    id: 'the id that was deleted (trip_/item_/exp_/photo_/check_ prefix says which table)',
+    kind: 'trips|dayItems|expenses|photos|checkItems',
     deletedAt: 'ISO',
     note: 'this is how deletion reaches the server: there is no delete endpoint, only these markers, honoured for 365 days',
   },
@@ -241,7 +251,7 @@ const SCHEMA_HINT = {
   },
   notes: [
     'Write via POST /api/backup with a full triplog-backup document; the server merges by id and keeps the newest updatedAt.',
-    'Prefer POST /api/sync with a partial document {trips: [], dayItems?, expenses?, categories?, photos?, tombstones?, meta?} so you never overwrite rows you did not read; the arrays you leave out must be [] (missing trips is treated as a malformed upload, not as an empty one).',
+    'Prefer POST /api/sync with a partial document {trips: [], dayItems?, expenses?, categories?, photos?, checkItems?, tombstones?, meta?} so you never overwrite rows you did not read; the arrays you leave out must be [] (missing trips is treated as a malformed upload, not as an empty one).',
     'There is no delete endpoint by design. Deleting a trip or a row is done by the client that owns it: it removes the row locally and adds {"id","kind","deletedAt"} to tombstones, which merges like any other data — the server then drops that row (plus the children of a deleted trip) from every read, and history snapshots keep the bytes. Markers older than 365 days stop suppressing. To hide a trip without deleting it, set archived=true.',
     'Amounts stay in the original currency; baseAmount is what statistics use.',
     'Sharing: POST /api/shares {tripId,expiresInDays} (needs the key) mints a trip-scoped token; GET /api/share/<token> reads that trip only and POST /api/share/<token>/expense|item appends to it without any key. POST /api/shares/revoke {token} kills a link; it revokes a grant, not data.',
@@ -372,6 +382,7 @@ async function route(req, res) {
           trip,
           items: (snapshot.dayItems ?? []).filter((x) => x.tripId === id),
           expenses: (snapshot.expenses ?? []).filter((x) => x.tripId === id),
+          checkItems: checklistOf(snapshot, id),
           photos: pickPhotos(snapshot, { tripIds: [id], limit: 400, includeData: false }),
           categories: snapshot.categories ?? [],
         },
@@ -398,6 +409,7 @@ async function route(req, res) {
           trip,
           items: (snapshot.dayItems ?? []).filter((x) => x.tripId === trip.id).length,
           expenses: expenses.length,
+          checkItems: (snapshot.checkItems ?? []).filter((c) => c.tripId === trip.id).length,
           totalBase: round2(expenses.reduce((s, e) => s + (e.baseAmount ?? 0), 0)),
           budget: trip.budget ?? null,
           byCategory: groupSum(expenses, 'category'),
@@ -1159,6 +1171,12 @@ function snapshotRows(snapshot, tripId) {
   };
 }
 
+function checklistOf(snapshot, tripId) {
+  return (snapshot.checkItems ?? [])
+    .filter((c) => c.tripId === tripId)
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? '')) || String(a.id).localeCompare(String(b.id)));
+}
+
 function slice(snapshot, tripId, { photos = true } = {}) {
   const items = (snapshot.dayItems ?? []).filter((x) => x.tripId === tripId);
   const itemIds = new Set(items.map((x) => x.id));
@@ -1174,6 +1192,7 @@ function slice(snapshot, tripId, { photos = true } = {}) {
     expenses,
     categories: (snapshot.categories ?? []).filter((c) => used.has(c.id) || used.has(c.key)),
     photos: photos ? rows : rows.map(({ data, thumbData, ...p }) => p),
+    checkItems: checklistOf(snapshot, tripId),
     meta: (snapshot.meta ?? []).filter((m) => m.key === 'rates'),
     relatedItemIds: [...itemIds],
   };

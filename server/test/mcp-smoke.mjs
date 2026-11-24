@@ -178,11 +178,15 @@ await check('tools/list 列出全部讀寫工具', async () => {
     'triplog_add_items',
     'triplog_add_expenses',
     'triplog_archive_trip',
+    'triplog_add_check_items',
+    'triplog_update_check_item',
+    'triplog_move_check_item',
+    'triplog_delete_check_item',
     'triplog_delete_help',
   ]) {
     assert.ok(toolNames.includes(want), `缺少 ${want}`);
   }
-  assert.equal(tools.length, 14, `工具數對不上：${tools.length}`);
+  assert.equal(tools.length, 18, `工具數對不上：${tools.length}`);
   // 每個工具都要有 description 與 object schema，否則 agent 不會用
   for (const t of tools) {
     assert.ok(t.description && t.description.length > 10, `${t.name} 沒有說明`);
@@ -302,12 +306,84 @@ await check('triplog_list_trips 看得到 agent 自己寫的那趟', async () =>
   assert.ok(hit, '列表裡找不到剛建的旅行');
   assert.equal(hit.items, 2);
   assert.equal(hit.expenses, 4);
+  assert.equal(hit.checkItems, 0);
 });
 
 await check('triplog_add_companions 同名會略過', async () => {
   const r = await client.call('triplog_add_companions', { tripId, names: ['小安', '小明'] });
   assert.deepEqual(r.data.added, ['小明']);
   assert.deepEqual(r.data.companions, ['小安', '小明']);
+});
+
+await check('勾選清單拒絕空白文字', async () => {
+  const r = await client.call('triplog_add_check_items', { tripId, items: [{ text: '   ' }] });
+  assert.ok(r.isError, '空白事項居然接受了');
+  assert.match(String(r.data), /不能是空字串/);
+  const detail = await http(`/api/trips/${tripId}`);
+  assert.equal(detail.json.checkItems.length, 0);
+});
+
+let checkIds = [];
+await check('triplog_add_check_items 批次寫入、去空白並自動排 order', async () => {
+  const r = await client.call('triplog_add_check_items', {
+    tripId,
+    items: [{ text: '  確認護照  ' }, { text: '整理行李', done: true }],
+  });
+  assert.ok(!r.isError, String(r.data));
+  assert.equal(r.data.created.length, 2);
+  checkIds = r.data.created.map((c) => c.id);
+  assert.ok(checkIds.every((id) => id.startsWith('check_')), `id 前綴不對：${checkIds}`);
+  assert.equal(r.data.created[0].text, '確認護照');
+  assert.equal(r.data.created[0].done, false);
+  assert.equal(r.data.created[1].done, true);
+  assert.equal(r.data.created[0].order + 10, r.data.created[1].order, '同一批沒有往後排');
+  const detail = await http(`/api/trips/${tripId}`);
+  assert.deepEqual(detail.json.checkItems.map((c) => c.id), checkIds, 'get_trip 的勾選清單排序不對');
+  const list = await client.call('triplog_list_trips', {});
+  assert.equal(list.data.trips.find((t) => t.id === tripId).checkItems, 2);
+});
+
+await check('triplog_update_check_item 只改指定欄位並保留 createdAt', async () => {
+  const before = (await http(`/api/trips/${tripId}`)).json.checkItems.find((c) => c.id === checkIds[0]);
+  const r = await client.call('triplog_update_check_item', {
+    checkItemId: checkIds[0],
+    patch: { text: '確認護照與機票', done: true, order: 25 },
+  });
+  assert.ok(!r.isError, String(r.data));
+  assert.equal(r.data.checkItem.text, '確認護照與機票');
+  assert.equal(r.data.checkItem.done, true);
+  assert.equal(r.data.checkItem.order, 25);
+  assert.equal(r.data.checkItem.createdAt, before.createdAt, 'createdAt 不該被改掉');
+  const after = (await http(`/api/trips/${tripId}`)).json.checkItems.find((c) => c.id === checkIds[0]);
+  assert.equal(after.text, '確認護照與機票');
+});
+
+await check('triplog_move_check_item 與鄰居交換 order，邊界不重複寫入', async () => {
+  const r = await client.call('triplog_move_check_item', { checkItemId: checkIds[0], direction: -1 });
+  assert.ok(!r.isError, String(r.data));
+  assert.equal(r.data.moved, true);
+  assert.equal(r.data.checkItem.order, 20);
+  assert.equal(r.data.swappedWith.order, 25);
+  const detail = await http(`/api/trips/${tripId}`);
+  assert.deepEqual(detail.json.checkItems.map((c) => c.id), [checkIds[0], checkIds[1]], '移動後順序不對');
+  const edge = await client.call('triplog_move_check_item', { checkItemId: checkIds[0], direction: -1 });
+  assert.ok(!edge.isError, String(edge.data));
+  assert.equal(edge.data.moved, false);
+  assert.match(String(edge.data.note), /最上面/);
+});
+
+await check('triplog_delete_check_item 移除該筆並留下 checkItems tombstone', async () => {
+  const r = await client.call('triplog_delete_check_item', { checkItemId: checkIds[1] });
+  assert.ok(!r.isError, String(r.data));
+  assert.equal(r.data.deleted.id, checkIds[1]);
+  assert.equal(r.data.tombstone.kind, 'checkItems');
+  const detail = await http(`/api/trips/${tripId}`);
+  assert.deepEqual(detail.json.checkItems.map((c) => c.id), [checkIds[0]], '刪除後清單還留著該筆');
+  const snapshot = await http('/api/base');
+  const marker = snapshot.json.base.tombstones.find((x) => x.id === checkIds[1]);
+  assert.equal(marker?.kind, 'checkItems', '基準檔沒有收到刪除記號');
+  const missing = await client.call('triplog_delete_check_item', { checkItemId: checkIds[1] });
+  assert.ok(missing.isError, '同一筆不應被重複刪除');
 });
 
 await check('triplog_archive_trip 歸檔後預設列表不再顯示它', async () => {
@@ -322,7 +398,9 @@ await check('triplog_archive_trip 歸檔後預設列表不再顯示它', async (
 await check('triplog_delete_help 只給說明，不動任何資料', async () => {
   const r = await client.call('triplog_delete_help', { tripId });
   assert.equal(r.data.allowed, false);
+  assert.equal(r.data.scope, 'trip');
   assert.match(String(r.data.doInstead), /triplog_archive_trip/);
+  assert.match(String(r.data.doInstead), /triplog_delete_check_item/);
   const still = await http(`/api/trips/${tripId}`);
   assert.equal(still.json.expenses.length, 4, '刪除說明這動作居然改到了資料');
 });
@@ -350,6 +428,14 @@ await check('TRIPLOG_ALLOW_WRITE=0 時不註冊寫入工具', async () => {
   assert.ok(names.includes('triplog_list_trips'), '讀取工具應該還在');
   assert.ok(!names.includes('triplog_create_trip'), '唯讀模式還露出建立工具');
   assert.ok(!names.includes('triplog_add_expenses'), '唯讀模式還露出記帳工具');
+  for (const write of [
+    'triplog_add_check_items',
+    'triplog_update_check_item',
+    'triplog_move_check_item',
+    'triplog_delete_check_item',
+  ]) {
+    assert.ok(!names.includes(write), `唯讀模式還露出 ${write}`);
+  }
   assert.equal(names.length, 7, `唯讀模式工具數不對：${names.length}`);
 });
 await check('唯讀金鑰仍能讀到資料', async () => {

@@ -6,7 +6,7 @@
  * 全部走 https://<你的網域>/api/*，所以：
  * - 手機／筆電／agent 看到的是同一份「基準檔」，不會各寫各的
  * - 沒有 TRIPLOG_API_KEY 就打不到任何東西
- * - 刻意不做刪除：所有寫入都是新增或覆寫，要刪請在使用者面前手動做
+ * - 不提供旅行／行程項／支出的刪除；只有勾選清單可刪單筆，並以 tombstone 同步
  *
  * 環境變數：
  *   TRIPLOG_URL        預設 https://triplogmo.duckdns.org
@@ -100,7 +100,19 @@ async function base() {
 }
 
 function empty() {
-  return { format: 'triplog-backup', version: 1, exportedAt: new Date().toISOString(), trips: [], dayItems: [], expenses: [], categories: [], photos: [], meta: [] };
+  return {
+    format: 'triplog-backup',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    trips: [],
+    dayItems: [],
+    expenses: [],
+    categories: [],
+    photos: [],
+    checkItems: [],
+    tombstones: [],
+    meta: [],
+  };
 }
 
 /** 把動過的列送回去；後端以 id 併入基準，不覆蓋沒送的部分 */
@@ -259,6 +271,47 @@ function buildItem(doc: any, tripId: string, input: any, id?: string, createdAt?
   };
 }
 
+/** 和 app 端一致的清單排序：order → createdAt → id。 */
+function checkItemsOf(doc: any, tripId: string): any[] {
+  return (doc.checkItems ?? [])
+    .filter((c: any) => c.tripId === tripId)
+    .sort(
+      (a: any, b: any) =>
+        (a.order ?? 0) - (b.order ?? 0) ||
+        String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? '')) ||
+        String(a.id).localeCompare(String(b.id)),
+    );
+}
+
+function nextCheckOrder(doc: any, tripId: string, earlier: any[] = []): number {
+  return [...(doc.checkItems ?? []), ...earlier].reduce(
+    (max: number, c: any) => (c.tripId === tripId ? Math.max(max, c.order ?? 0) : max),
+    0,
+  ) + 10;
+}
+
+function checkText(value: unknown): string {
+  const text = String(value ?? '').trim();
+  need(text.length > 0, '勾選事項 text 不能是空字串');
+  need(text.length <= 300, '勾選事項 text 不能超過 300 個字元');
+  return text;
+}
+
+function buildCheckItem(doc: any, tripId: string, input: any, id?: string, createdAt?: string, earlier: any[] = []) {
+  findTrip(doc, tripId);
+  if (input.done !== undefined) need(typeof input.done === 'boolean', 'done 必須是 boolean');
+  if (input.order !== undefined) need(typeof input.order === 'number' && Number.isFinite(input.order), 'order 必須是有限數字');
+  return {
+    id: id ?? rid('check'),
+    tripId,
+    text: checkText(input.text),
+    done: input.done === true,
+    order: input.order ?? nextCheckOrder(doc, tripId, earlier),
+    createdAt: createdAt ?? now(),
+    updatedAt: now(),
+  };
+}
+
 /* ------------------------------------------------------------ 工具定義 */
 
 const TRIP_PROPS = {
@@ -286,6 +339,12 @@ const ITEM_PROPS = {
   order: { type: 'number', description: '同日排序，小的在前；不給就排最後' },
 };
 
+const CHECK_PROPS = {
+  text: { type: 'string', description: '勾選事項，會去掉頭尾空白；不可空白，最多 300 字元' },
+  done: { type: 'boolean', description: '是否已完成；新增時預設 false' },
+  order: { type: 'number', description: '清單排序，小的在前；不給就排最後' },
+};
+
 const EXPENSE_PROPS = {
   date: { type: 'string' },
   amount: { type: 'number', description: '以原始幣別計' },
@@ -310,7 +369,7 @@ const TOOLS = [
   },
   {
     name: 'triplog_list_trips',
-    description: '列出伺服器上所有旅行（含每趟的行程項／支出／照片數量）。寫入前請先叫這個拿到 tripId。',
+    description: '列出伺服器上所有旅行（含每趟的行程項／支出／照片／勾選清單數量）。寫入前請先叫這個拿到 tripId。',
     inputSchema: {
       type: 'object',
       properties: { archived: { type: 'boolean', description: 'true=只列歸檔的；預設只列未歸檔' } },
@@ -336,6 +395,7 @@ const TOOLS = [
             archived: !!t.archived,
             items: itemIds.size,
             expenses: mine.length,
+            checkItems: (doc.checkItems ?? []).filter((c: any) => c.tripId === t.id).length,
             photos: (doc.photos ?? []).filter((p: any) => p.tripId === t.id || (p.dayItemId && itemIds.has(p.dayItemId))).length,
             totalBase: round2(mine.reduce((s: number, e: any) => s + (e.baseAmount ?? 0), 0)),
           };
@@ -345,7 +405,7 @@ const TOOLS = [
   },
   {
     name: 'triplog_get_trip',
-    description: '讀一趟旅行完整內容：行程項、支出、分類（照片只給 metadata，不含 base64）。',
+    description: '讀一趟旅行完整內容：行程項、支出、勾選清單、分類（照片只給 metadata，不含 base64）。',
     inputSchema: {
       type: 'object',
       properties: { tripId: { type: 'string' } },
@@ -464,6 +524,122 @@ const TOOLS = [
     },
   },
   {
+    name: 'triplog_add_check_items',
+    description: '批次新增一趟旅行的勾選清單（行李、票券、待辦）。文字不可空白；不給 order 就接在最後。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tripId: { type: 'string' },
+        items: { type: 'array', items: { type: 'object', properties: CHECK_PROPS, required: ['text'], additionalProperties: false }, minItems: 1 },
+      },
+      required: ['tripId', 'items'],
+      additionalProperties: false,
+    },
+    handler: async ({ tripId, items }) => {
+      const doc = await base();
+      findTrip(doc, String(tripId));
+      need(Array.isArray(items) && items.length > 0, 'items 至少要有一筆');
+      const created: any[] = [];
+      for (const input of items as any[]) {
+        created.push(buildCheckItem(doc, String(tripId), input, undefined, undefined, created));
+      }
+      const saved = await push({ trips: [touched(doc, String(tripId))].filter(Boolean), checkItems: created });
+      return { created: created.map((c) => ({ id: c.id, text: c.text, done: c.done, order: c.order })), saved };
+    },
+  },
+  {
+    name: 'triplog_update_check_item',
+    description: '改一筆勾選事項的文字、完成狀態或排序（只蓋有送的欄位）。id 從 triplog_get_trip 的 checkItems 讀。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        checkItemId: { type: 'string' },
+        patch: { type: 'object', properties: CHECK_PROPS, additionalProperties: false },
+      },
+      required: ['checkItemId', 'patch'],
+      additionalProperties: false,
+    },
+    handler: async ({ checkItemId, patch }) => {
+      const doc = await base();
+      const existing = (doc.checkItems ?? []).find((c: any) => c.id === checkItemId);
+      need(existing, `找不到勾選事項 ${checkItemId}`);
+      const cleanPatch = patch && typeof patch === 'object' ? patch : {};
+      need(
+        ['text', 'done', 'order'].some((key) => Object.prototype.hasOwnProperty.call(cleanPatch, key)),
+        'patch 至少要包含 text、done 或 order 其中一個欄位',
+      );
+      const next = buildCheckItem(doc, existing.tripId, { ...existing, ...cleanPatch }, String(checkItemId), existing.createdAt);
+      const saved = await push({ trips: [touched(doc, existing.tripId)].filter(Boolean), checkItems: [next] });
+      return { checkItem: next, saved };
+    },
+  },
+  {
+    name: 'triplog_move_check_item',
+    description: '把一筆勾選事項往上或往下移一格，和相鄰那筆交換 order。direction=-1 往上、1 往下；已在邊界時不會寫入。',
+    inputSchema: {
+      type: 'object',
+      properties: { checkItemId: { type: 'string' }, direction: { type: 'number', enum: [-1, 1] } },
+      required: ['checkItemId', 'direction'],
+      additionalProperties: false,
+    },
+    handler: async ({ checkItemId, direction }) => {
+      const doc = await base();
+      const existing = (doc.checkItems ?? []).find((c: any) => c.id === checkItemId);
+      need(existing, `找不到勾選事項 ${checkItemId}`);
+      need(direction === -1 || direction === 1, 'direction 只能是 -1（往上）或 1（往下）');
+      const siblings = checkItemsOf(doc, existing.tripId);
+      const index = siblings.findIndex((c: any) => c.id === checkItemId);
+      const swapWith = siblings[index + direction];
+      if (!swapWith) {
+        return {
+          moved: false,
+          direction,
+          note: index === 0 && direction === -1 ? '已經在最上面了。' : '已經在最下面了。',
+          checkItems: siblings,
+        };
+      }
+      const ts = now();
+      const next = { ...existing, order: swapWith.order ?? 0, updatedAt: ts };
+      const swapped = { ...swapWith, order: existing.order ?? 0, updatedAt: ts };
+      const saved = await push({
+        trips: [touched(doc, existing.tripId)].filter(Boolean),
+        checkItems: [next, swapped],
+      });
+      return {
+        moved: true,
+        direction,
+        checkItem: next,
+        swappedWith: swapped,
+        checkItems: [next, swapped, ...siblings.filter((c: any) => c.id !== next.id && c.id !== swapped.id)].sort(
+          (a: any, b: any) => a.order - b.order || String(a.createdAt).localeCompare(String(b.createdAt)) || String(a.id).localeCompare(String(b.id)),
+        ),
+        saved,
+      };
+    },
+  },
+  {
+    name: 'triplog_delete_check_item',
+    description: '刪除一筆勾選事項，並留下 tombstone 讓其他裝置同步時也移除。只在使用者明確要求時呼叫；這不是 HTTP DELETE。',
+    inputSchema: {
+      type: 'object',
+      properties: { checkItemId: { type: 'string' } },
+      required: ['checkItemId'],
+      additionalProperties: false,
+    },
+    handler: async ({ checkItemId }) => {
+      const doc = await base();
+      const existing = (doc.checkItems ?? []).find((c: any) => c.id === checkItemId);
+      need(existing, `找不到勾選事項 ${checkItemId}`);
+      const tombstone = { id: existing.id, kind: 'checkItems', deletedAt: now() };
+      const saved = await push({
+        trips: [touched(doc, existing.tripId)].filter(Boolean),
+        checkItems: [],
+        tombstones: [tombstone],
+      });
+      return { deleted: { id: existing.id, tripId: existing.tripId, text: existing.text }, tombstone, saved };
+    },
+  },
+  {
     name: 'triplog_add_expenses',
     description: '批次記支出。金額以原始幣別存，外幣必須給 rateToBase（1 外幣 = ? 主幣別）；不會自己查匯率。',
     inputSchema: {
@@ -561,7 +737,7 @@ const TOOLS = [
   },
   {
     name: 'triplog_delete_help',
-    description: '沒有刪除工具。叫這個會拿到「該怎麼刪」的說明（歸檔取代刪除、以及要在 app 端刪的理由）。',
+    description: '刪除政策說明：MCP 只允許刪單筆勾選事項，不提供旅行／行程項／支出的刪除。',
     inputSchema: {
       type: 'object',
       properties: { tripId: { type: 'string' } },
@@ -573,9 +749,10 @@ const TOOLS = [
       const trip = findTrip(doc, String(tripId));
       return {
         allowed: false,
-        reason: 'MCP 端刻意不提供刪除：刪除在這一系統是會跟著同步的資料（刪除記號），不該由 agent 替每一台裝置決定。',
+        scope: 'trip',
+        reason: 'MCP 不替裝置刪除整趟旅行、行程項或支出；勾選清單的單筆刪除除外。',
         doInstead:
-          '用 triplog_archive_trip 把這趟歸檔（資料留著、清單裡收起來），或由使用者自己在 app 裡刪除——app 刪掉會留下 tombstone，別台裝置下次同步就跟著清掉。',
+          '結束旅行請用 triplog_archive_trip 歸檔；要刪整趟或其中的行程／支出，請由使用者在 app 裡操作，讓 tombstone 跟著同步。若只是移除一筆勾選事項，先用 triplog_get_trip 找 checkItemId，再呼叫 triplog_delete_check_item。',
         trip: { id: trip.id, name: trip.name },
       };
     },
@@ -603,6 +780,10 @@ const WRITE_TOOLS = new Set([
   'triplog_create_trip',
   'triplog_add_items',
   'triplog_update_item',
+  'triplog_add_check_items',
+  'triplog_update_check_item',
+  'triplog_move_check_item',
+  'triplog_delete_check_item',
   'triplog_add_expenses',
   'triplog_update_expense',
   'triplog_add_companions',
@@ -640,9 +821,10 @@ const server = new Server(
     capabilities: { tools: {}, resources: {} },
     instructions: [
       'TripLog 是一個離線優先的旅行記錄 app，這裡是它的同步後端。',
-      '寫入流程：triplog_list_trips → triplog_get_trip（看既有 id 與分類）→ triplog_add_items / triplog_add_expenses。',
+      '寫入流程：triplog_list_trips → triplog_get_trip（看既有 id、勾選清單與分類）→ triplog_add_items / triplog_add_expenses / triplog_add_check_items。',
+      '勾選清單可用 triplog_update_check_item 改文字或完成狀態、triplog_move_check_item 上下移動；只有使用者明確要求時才用 triplog_delete_check_item 刪單筆。',
       '金額一律以原始幣別記錄，外幣一定要使用者確認匯率（rateToBase），不要猜。',
-      '沒有刪除 API。結束的旅行用 triplog_archive_trip 歸檔。',
+      '沒有 HTTP DELETE API。MCP 不刪旅行、行程項或支出；結束旅行用 triplog_archive_trip，勾選清單的單筆刪除則以 tombstone 同步。',
       '寫進去後，使用者的裝置要在 app「設定 → 跨裝置同步」按一次同步才會看到。',
     ].join(' '),
   },
@@ -660,7 +842,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const why = !ALLOW_WRITE && TOOLS.some((t) => t.name === name) ? '這個 MCP server 跑在唯讀模式（TRIPLOG_ALLOW_WRITE=0）' : '這裡沒有這個工具';
     return {
       isError: true,
-      content: [{ type: 'text', text: `${name} 無法執行：${why}。寫入請用 triplog_add_items／triplog_add_expenses，結束的旅行請用 triplog_archive_trip 歸檔；本 MCP 不提供刪除。` }],
+      content: [{ type: 'text', text: `${name} 無法執行：${why}。寫入請用 triplog_add_items／triplog_add_expenses／triplog_add_check_items，結束旅行請用 triplog_archive_trip 歸檔；MCP 只允許用 triplog_delete_check_item 刪單筆勾選事項，沒有 HTTP DELETE。` }],
     };
   }
   try {

@@ -53,6 +53,18 @@ export interface DayItem {
   updatedAt: ISODateTime;
 }
 
+/** 一趟旅行裡的勾選事項，例如行李、票券、出發前待辦 */
+export interface ChecklistItem {
+  id: ID;
+  tripId: ID;
+  text: string;
+  done: boolean;
+  /** 手動排序，數值小的在前 */
+  order: number;
+  createdAt: ISODateTime;
+  updatedAt: ISODateTime;
+}
+
 /** 一筆支出 */
 export interface Expense {
   id: ID;
@@ -137,9 +149,9 @@ export interface CurrencyDef {
  * 還會留下這一筆，跟著每次同步推出去。合併時照它把列從結果裡濾掉，
  * 「一端刪掉、另一端下次同步又帶回來」這件事才不會再發生。
  *
- * kind 只涵蓋會隨旅行增刪的四張表；分類與 meta 不參與（見 merge-core.js 頂端的說明）。
+ * kind 只涵蓋會隨旅行增刪的五張表；分類與 meta 不參與（見 merge-core.js 頂端的說明）。
  */
-export type TombKind = 'trips' | 'dayItems' | 'expenses' | 'photos';
+export type TombKind = 'trips' | 'dayItems' | 'expenses' | 'photos' | 'checkItems';
 
 export interface Tombstone {
   /** 被刪掉的那一列的 id（跨表唯一，前綴就看得出是哪張表） */
@@ -159,6 +171,8 @@ export interface BackupFile {
   expenses: Expense[];
   categories: Category[];
   photos?: BackupPhoto[];
+  /** 勾選清單；舊備份沒有這個欄位，讀取端一律當空陣列 */
+  checkItems?: ChecklistItem[];
   /** 刪除記號。舊備份檔沒這個欄位，讀取端一律要當空陣列 */
   tombstones?: Tombstone[];
   meta: MetaEntry[];

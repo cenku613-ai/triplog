@@ -20,14 +20,14 @@
  * 不想為了共用而幫後端也拉一套編譯流程。
  */
 
-/** @typedef {'trips' | 'dayItems' | 'expenses' | 'categories' | 'photos'} MergeTable */
+/** @typedef {'trips' | 'dayItems' | 'expenses' | 'categories' | 'photos' | 'checkItems'} MergeTable */
 
 /** 會記刪除記號的表（categories/meta 刻意排除，理由見檔案頂端） */
-/** @typedef {'trips' | 'dayItems' | 'expenses' | 'photos'} TombKind */
+/** @typedef {'trips' | 'dayItems' | 'expenses' | 'photos' | 'checkItems'} TombKind */
 
 /** @typedef {{ id: string, kind: TombKind, deletedAt: string }} Tombstone */
 
-/** @typedef {{ format?: string, version?: 1 | 2, exportedAt?: string, trips?: any[], dayItems?: any[], expenses?: any[], categories?: any[], photos?: any[], meta?: any[], tombstones?: any[] }} BackupLike */
+/** @typedef {{ format?: string, version?: 1 | 2, exportedAt?: string, trips?: any[], dayItems?: any[], expenses?: any[], categories?: any[], photos?: any[], checkItems?: any[], meta?: any[], tombstones?: any[] }} BackupLike */
 
 /** 有 updatedAt 的表用 updatedAt，照片只有 createdAt；兩者都缺就當作最舊 */
 /** @param {any} row @returns {string} */
@@ -80,7 +80,7 @@ function mergeMeta(rows) {
 }
 
 /** @type {MergeTable[]} */
-const TABLES = ['trips', 'dayItems', 'expenses', 'categories', 'photos'];
+const TABLES = ['trips', 'dayItems', 'expenses', 'categories', 'photos', 'checkItems'];
 
 /* -------------------------------------------------------------- 刪除記號 */
 
@@ -93,6 +93,7 @@ const KIND_BY_PREFIX = [
   ['item_', 'dayItems'],
   ['exp_', 'expenses'],
   ['photo_', 'photos'],
+  ['check_', 'checkItems'],
 ];
 
 /**
@@ -131,7 +132,7 @@ export function collectTombstones(sources, opts = {}) {
           : '';
       if (!deletedAt) continue;
       const kind =
-        raw?.kind === 'trips' || raw?.kind === 'dayItems' || raw?.kind === 'expenses' || raw?.kind === 'photos'
+        raw?.kind === 'trips' || raw?.kind === 'dayItems' || raw?.kind === 'expenses' || raw?.kind === 'photos' || raw?.kind === 'checkItems'
           ? /** @type {TombKind} */ (raw.kind)
           : kindFromId(id);
       if (!kind) continue;
@@ -149,7 +150,7 @@ export function collectTombstones(sources, opts = {}) {
 
 /**
  * 照刪除記號過濾一份文件（**不改動傳進去的那份**，回傳新的陣列）。
- * 除了記號本身指向的那一列，還會往下連動：旅行沒了，它底下的行程項／支出／照片也不會有人看到，
+ * 除了記號本身指向的那一列，還會往下連動：旅行沒了，它底下的行程項／支出／照片／勾選清單也不會有人看到，
  * 留在文件裡只是孤兒資料（統計與 `/api/trips/<id>` 仍會讀到它們）。
  *
  * @param {BackupLike} src
@@ -172,6 +173,7 @@ function dropDeleted(src, kinds) {
     dayItems: keep(src.dayItems, 'dayItems'),
     expenses: keep(src.expenses, 'expenses'),
     photos: keep(src.photos, 'photos'),
+    checkItems: keep(src.checkItems, 'checkItems'),
   };
 }
 
@@ -232,6 +234,7 @@ export function mergeSources(sources) {
       dayItems: [...acc.dayItems.values()],
       expenses: [...acc.expenses.values()],
       photos: [...acc.photos.values()],
+      checkItems: [...acc.checkItems.values()],
     },
     kinds,
   );
@@ -245,6 +248,7 @@ export function mergeSources(sources) {
     expenses: alive.expenses,
     categories: [...acc.categories.values()],
     photos,
+    checkItems: alive.checkItems,
     tombstones: list,
     meta: mergeMeta(sources.map((s) => s.meta ?? [])),
   };
@@ -272,6 +276,7 @@ export function sliceTrip(src, tripId) {
   const dayItems = (clean.dayItems ?? []).filter((r) => r.tripId === tripId);
   const itemIds = new Set(dayItems.map((r) => r.id));
   const expenses = (clean.expenses ?? []).filter((e) => e.tripId === tripId);
+  const checkItems = (clean.checkItems ?? []).filter((c) => c.tripId === tripId);
   const photos = (clean.photos ?? []).filter(
     (p) => p.tripId === tripId || (p.dayItemId && itemIds.has(p.dayItemId)),
   );
@@ -282,6 +287,7 @@ export function sliceTrip(src, tripId) {
     tripId,
     ...(src.dayItems ?? []).filter((r) => r && r.tripId === tripId).map((r) => r.id),
     ...(src.expenses ?? []).filter((r) => r && r.tripId === tripId).map((r) => r.id),
+    ...(src.checkItems ?? []).filter((r) => r && r.tripId === tripId).map((r) => r.id),
     ...(src.photos ?? []).filter((r) => r && (r.tripId === tripId || (r.dayItemId && (src.dayItems ?? []).some((i) => i.id === r.dayItemId && i.tripId === tripId)))).map((r) => r.id),
   ]);
   const tombstones = (clean.tombstones ?? []).filter((t) => t && sliceIds.has(t.id));
@@ -294,6 +300,7 @@ export function sliceTrip(src, tripId) {
     expenses,
     categories: (clean.categories ?? []).filter((c) => usedCats.has(c.id) || usedCats.has(c.key)),
     photos,
+    checkItems,
     tombstones,
     meta: (clean.meta ?? []).filter((m) => m.key === 'rates'),
   };
@@ -310,5 +317,6 @@ export function countsOf(src) {
     expenses: (src.expenses ?? []).length,
     categories: (src.categories ?? []).length,
     photos: (src.photos ?? []).length,
+    checkItems: (src.checkItems ?? []).length,
   };
 }

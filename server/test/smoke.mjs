@@ -132,6 +132,11 @@ function fixture() {
     photos: [
       { id: 'photo_a1', tripId: 'trip_a', dayItemId: 'item_a1', width: 1600, height: 900, mime: 'image/jpeg', source: 'commons', artist: 'Someone', license: 'CC BY-SA 4.0', caption: 'Station', createdAt: iso(0), data: bigData, thumbData: bigData },
     ],
+    checkItems: [
+      { id: 'check_a2', tripId: 'trip_a', text: 'Buy tickets', done: false, order: 20, createdAt: iso(0), updatedAt: iso(0) },
+      { id: 'check_a1', tripId: 'trip_a', text: 'Pack passport', done: true, order: 10, createdAt: iso(0), updatedAt: iso(0) },
+      { id: 'check_b1', tripId: 'trip_b', text: 'Other trip', done: false, order: 10, createdAt: iso(0), updatedAt: iso(0) },
+    ],
     meta: [{ key: 'rates', value: { 'TWD>JPY': 0.21 } }],
   };
 }
@@ -181,7 +186,9 @@ await check('GET /api/base 回基準（照片無 base64）', async () => {
   assert.equal(r.json.base.photos.length, 1);
   assert.equal(r.json.base.photos[0].data, undefined);
   assert.ok(r.json.base.photoBytes > 1000);
+  assert.equal(r.json.base.checkItems.length, 3);
   assert.equal(r.json.counts.trip_a.items, 1);
+  assert.equal(r.json.counts.trip_a.checkItems, 2);
 });
 await check('GET /api/trips 列表與計數', async () => {
   const r = await api('/api/trips');
@@ -194,16 +201,19 @@ await check('GET /api/trips/:id 明細', async () => {
   assert.equal(r.json.trip.name, 'Kyoto');
   assert.equal(r.json.items.length, 1);
   assert.equal(r.json.expenses.length, 1);
+  assert.deepEqual(r.json.checkItems.map((c) => c.id), ['check_a1', 'check_a2']);
   assert.equal(r.json.photos[0].artist, 'Someone');
 });
 await check('GET /api/trips/:id/export 含照片', async () => {
   const r = await api('/api/trips/trip_a/export');
   assert.equal(r.json.backup.photos[0].data.length, bigData.length);
   assert.equal(r.json.backup.version, 2);
+  assert.deepEqual(r.json.backup.checkItems.map((c) => c.id), ['check_a1', 'check_a2']);
 });
 await check('GET /api/summary 統計', async () => {
   const r = await api('/api/summary?tripId=trip_a');
   assert.equal(r.json.totalBase, 882);
+  assert.equal(r.json.checkItems, 2);
   assert.equal(r.json.byPayee.Me, 882);
 });
 await check('404 找不到的旅行', async () => assert.equal((await api('/api/trips/trip_zzz')).status, 404));
@@ -252,6 +262,11 @@ await check('拒絕缺少 trips 的 payload', async () => {
   const r = await api('/api/backup', { method: 'POST', body: { format: 'triplog-backup' } });
   assert.equal(r.status, 400);
 });
+await check('拒絕不是陣列的 checkItems', async () => {
+  const r = await api('/api/backup', { method: 'POST', body: { format: 'triplog-backup', trips: [], checkItems: {} } });
+  assert.equal(r.status, 400);
+  assert.match(r.json.error, /checkItems must be an array/);
+});
 
 // —— 刪除記號（tombstone）——
 // 合併規則本身在 merge-core 的單元測試裡驗過了，這裡要驗的是「帳本」那一層：
@@ -270,6 +285,7 @@ const doomed = {
   expenses: [{ id: 'exp_d1', tripId: 'trip_d1', dayItemId: 'item_d1', date: '2026-06-01', amount: 100, currency: 'TWD', rateToBase: 1, baseAmount: 100, category: 'cat-transport', payee: '', createdAt: iso(0), updatedAt: iso(0) }],
   categories: [],
   photos: [],
+  checkItems: [{ id: 'check_d1', tripId: 'trip_d1', text: 'Pack', done: false, order: 10, createdAt: iso(0), updatedAt: iso(0) }],
   meta: [],
 };
 
@@ -288,6 +304,7 @@ await check('推送帶著記號時，基準檔把那趟連同底下的列一起�
   // 只壓旅行自己不夠：另一端推上來的是並集，孤兒列會以「看不見的資料」繼續佔著統計
   assert.equal(b.dayItems.some((i) => i.id === 'item_d1'), false, '記號要往下連動：行程項也跟著消失');
   assert.equal(b.expenses.some((e) => e.id === 'exp_d1'), false, '支出也跟著');
+  assert.equal(b.checkItems.some((c) => c.id === 'check_d1'), false, '勾選清單也跟著');
   assert.ok(b.tombstones.some((m) => m.id === 'trip_d1' && m.kind === 'trips'), '記號本身要留在基準裡，下一台推上來才壓得住');
 });
 await check('另一端推上來的舊並集，不會把刪掉的那趟復活', async () => {
@@ -298,7 +315,8 @@ await check('另一端推上來的舊並集，不會把刪掉的那趟復活', a
   const base = await api('/api/base');
   assert.equal(base.json.base.trips.some((t) => t.id === 'trip_d1'), false, '舊快照又把那一趟帶回來了');
   assert.equal(base.json.base.expenses.some((e) => e.id === 'exp_d1'), false);
-  assert.equal((await api('/api/trips/trip_d1')).status, 404, '單趟讀取也要跟著看不见');
+  assert.equal(base.json.base.checkItems.some((c) => c.id === 'check_d1'), false);
+  assert.equal((await api('/api/trips/trip_d1')).status, 404, '單趟讀取也要跟著看不見');
 });
 await check('沒送 kind 時由 id 前綴推（舊客戶端只送 id）', async () => {
   const r = await api('/api/sync', { method: 'POST', body: { trips: [], tombstones: [{ id: 'item_d1', deletedAt: fresh(1) }] } });
@@ -306,6 +324,22 @@ await check('沒送 kind 時由 id 前綴推（舊客戶端只送 id）', async 
   const marker = (await api('/api/base')).json.base.tombstones.find((m) => m.id === 'item_d1');
   assert.equal(marker?.kind, 'dayItems');
   assert.equal((await api('/api/base')).json.base.dayItems.some((i) => i.id === 'item_d1'), false);
+});
+await check('清單記號可由 check_ 前綴補 kind，只刪指定事項', async () => {
+  const body = {
+    format: 'triplog-backup', version: 1, exportedAt: iso(1),
+    trips: [{ id: 'trip_check', name: 'Checklist', startDate: '2026-06-01', endDate: '2026-06-02', baseCurrency: 'TWD', archived: true, createdAt: iso(0), updatedAt: iso(0) }],
+    checkItems: [
+      { id: 'check_keep', tripId: 'trip_check', text: 'Keep', done: false, order: 10, createdAt: iso(0), updatedAt: iso(0) },
+      { id: 'check_drop', tripId: 'trip_check', text: 'Drop', done: false, order: 20, createdAt: iso(0), updatedAt: iso(0) },
+    ],
+  };
+  assert.equal((await api('/api/backup', { method: 'POST', body })).status, 200);
+  const r = await api('/api/sync', { method: 'POST', body: { trips: [], tombstones: [{ id: 'check_drop', deletedAt: fresh(1) }] } });
+  assert.equal(r.status, 200, r.text);
+  const base = (await api('/api/base')).json.base;
+  assert.deepEqual(base.checkItems.filter((c) => c.tripId === 'trip_check').map((c) => c.id), ['check_keep']);
+  assert.equal(base.tombstones.find((m) => m.id === 'check_drop')?.kind, 'checkItems');
 });
 await check('髒記號（缺 id、時間看不懂、推不出表名）丟掉，也不影響好的那幾筆', async () => {
   const r = await api('/api/sync', {
@@ -446,6 +480,9 @@ await check('GET /api/share/:token 只回這一趟，也不帶照片內容', asy
   assert.ok(r.json.items.length >= 1 && r.json.items.every((x) => x.tripId === 'trip_a'), '只該看到 trip_a 的行程');
   assert.ok(!r.json.items.some((x) => x.id === 'item_b1'), 'trip_b 的行程項不能漏出去');
   assert.ok(!r.json.expenses.some((e) => e.tripId !== 'trip_a'));
+  assert.deepEqual(r.json.checkItems.map((c) => c.id), ['check_a1', 'check_a2']);
+  assert.equal(r.json.totals.checkItems, 2);
+  assert.equal(r.json.totals.checkItemsDone, 1);
   assert.ok(r.json.categories.some((c) => c.id === 'cat-transport'), '同行者要知道分類叫什麼');
   assert.equal(r.json.photos, undefined, '回應裡不該出現照片欄位');
   beforeShared = { expenses: r.json.expenses.length, base: r.json.totals.baseAmount };
@@ -602,9 +639,10 @@ await check('期限與生死的純函式', async () => {
   assert.throws(() => expiresAtFrom(9999), /365/);
   // 共筆那條路只追加：tombstones 一定是空陣列，這條路生不出刪除記號
   assert.deepEqual(Object.keys(partial('expenses', { id: 'exp_x' })), [
-    'format', 'version', 'exportedAt', 'trips', 'dayItems', 'expenses', 'categories', 'photos', 'tombstones', 'meta',
+    'format', 'version', 'exportedAt', 'trips', 'dayItems', 'expenses', 'categories', 'photos', 'checkItems', 'tombstones', 'meta',
   ]);
   assert.deepEqual(partial('expenses', { id: 'exp_x' }).tombstones, []);
+  assert.deepEqual(partial('expenses', { id: 'exp_x' }).checkItems, []);
   assert.equal(partial('dayItems', { id: 'item_x' }).expenses.length, 0);
 });
 await check('API token 的純函式：形勢判斷、層級、生死', async () => {

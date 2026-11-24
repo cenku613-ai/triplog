@@ -1,6 +1,6 @@
 import type { BackupFile, TombKind, Tombstone } from '../db/types';
 
-export type MergeTable = 'trips' | 'dayItems' | 'expenses' | 'categories' | 'photos';
+export type MergeTable = 'trips' | 'dayItems' | 'expenses' | 'categories' | 'photos' | 'checkItems';
 export type BackupLike = Partial<BackupFile> & { format?: string };
 
 /** 刪除記號保留多久（超過就放手，讓一年沒開的裝置不會永遠壓著別人刪掉的東西） */
@@ -30,4 +30,5 @@ export function countsOf(src: BackupLike): {
   expenses: number;
   categories: number;
   photos: number;
+  checkItems: number;
 };

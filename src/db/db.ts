@@ -1,6 +1,7 @@
 import Dexie, { type Table } from 'dexie';
 import type {
   Category,
+  ChecklistItem,
   DayItem,
   Expense,
   MetaEntry,
@@ -19,7 +20,8 @@ export class TripLogDB extends Dexie {
   categories!: Table<Category, string>;
   meta!: Table<MetaEntry, string>;
   photos!: Table<Photo, string>;
-  /** 刪除記號：id 是「被刪掉的那一列」的 id，跨表唯一（前綴 trip_/item_/exp_/photo_ 已分開） */
+  checkItems!: Table<ChecklistItem, string>;
+  /** 刪除記號：id 是「被刪掉的那一列」的 id，跨表唯一（前綴 trip_/item_/exp_/photo_/check_ 已分開） */
   tombstones!: Table<Tombstone, string>;
   /** 自己記一份名字：切換帳號時要知道現在開的是誰的庫，不去依賴 Dexie 內部的 name 欄位 */
   readonly dbName: string;
@@ -42,6 +44,10 @@ export class TripLogDB extends Dexie {
     // 免得備份檔外洩時連同使用者已經刪掉的紀錄一起被讀出來。
     this.version(3).stores({
       tombstones: 'id, kind, deletedAt',
+    });
+    // v4：每趟旅行自己的勾選清單。與日期無關，所以不塞進行程項表。
+    this.version(4).stores({
+      checkItems: 'id, tripId, [tripId+order], updatedAt',
     });
   }
 }
@@ -104,7 +110,7 @@ export function bootstrap(): Promise<void> {
       }
       await db.meta.put({
         key: 'app',
-        value: { schemaVersion: 3, installedAt: new Date().toISOString() },
+        value: { schemaVersion: 4, installedAt: new Date().toISOString() },
       });
     })().catch((err) => {
       bootstrapped.delete(name);
@@ -122,7 +128,7 @@ export function forgetBootstrap(name?: string): void {
 }
 
 function allTables(d: TripLogDB) {
-  return [d.trips, d.dayItems, d.expenses, d.categories, d.meta, d.photos, d.tombstones];
+  return [d.trips, d.dayItems, d.expenses, d.categories, d.meta, d.photos, d.checkItems, d.tombstones];
 }
 
 /** 舊庫被誰接走的標記：同一份「制度前的資料」只認領一次 */
@@ -141,18 +147,19 @@ export const CLAIMED_KEY = 'claimedBy';
  */
 async function copyLegacyInto(target: TripLogDB, legacy: TripLogDB, userId: string): Promise<number> {
   if (target === legacy) return 0;
-  if ((await target.trips.count()) + (await target.expenses.count()) > 0) return 0;
+  if ((await target.trips.count()) + (await target.expenses.count()) + (await target.checkItems.count()) > 0) return 0;
   if (await legacy.meta.get(CLAIMED_KEY)) return 0;
-  const [trips, dayItems, expenses, categories, photos, meta, tombstones] = await Promise.all([
+  const [trips, dayItems, expenses, categories, photos, checkItems, meta, tombstones] = await Promise.all([
     legacy.trips.toArray(),
     legacy.dayItems.toArray(),
     legacy.expenses.toArray(),
     legacy.categories.toArray(),
     legacy.photos.toArray(),
+    legacy.checkItems.toArray(),
     legacy.meta.toArray(),
     legacy.tombstones.toArray(),
   ]);
-  const moved = trips.length + dayItems.length + expenses.length + photos.length;
+  const moved = trips.length + dayItems.length + expenses.length + photos.length + checkItems.length;
   if (!moved) return 0;
   await target.transaction('rw', allTables(target), async () => {
     if (categories.length) await target.categories.bulkPut(categories);
@@ -162,6 +169,7 @@ async function copyLegacyInto(target: TripLogDB, legacy: TripLogDB, userId: stri
     if (dayItems.length) await target.dayItems.bulkPut(dayItems);
     if (expenses.length) await target.expenses.bulkPut(expenses);
     if (photos.length) await target.photos.bulkPut(photos);
+    if (checkItems.length) await target.checkItems.bulkPut(checkItems);
     // 刪除記號也要搬過去：它們指的列本來就不在搬移清單裡，留下的用意只有一個——
     // 新帳號第一次推送時別把使用者在舊庫刪掉的東西又帶回伺服器。
     if (tombstones.length) await target.tombstones.bulkPut(tombstones);

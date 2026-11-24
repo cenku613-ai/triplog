@@ -5,21 +5,26 @@ import {
   addPhotos,
   buildExpense,
   clearAll,
+  createCheckItem,
   createDayItem,
   createExpense,
   createTrip,
   deleteDayItem,
+  deleteCheckItem,
   deleteExpense,
   deleteTrip,
   exportBackup,
   importBackup,
   listCategories,
+  listCheckItems,
   listPhotosOfDayItem,
+  moveCheckItem,
   nextOrder,
   parseBackup,
   removePhotos,
   setRate,
   lookupRate,
+  updateCheckItem,
 } from './repo';
 
 async function reset() {
@@ -276,7 +281,7 @@ const raster = {
   mime: 'image/jpeg',
 };
 
-/** 湊一趟有行程項、支出與照片的旅行，回四個 id，刪除記號的測試全靠它 */
+/** 湊一趟有行程項、支出、照片與清單的旅行，回五個 id，刪除記號的測試全靠它 */
 async function seeded() {
   const tripId = await createTrip(tripSeed);
   const itemId = await createDayItem({
@@ -296,28 +301,102 @@ async function seeded() {
     category: 'food',
   });
   const [photoId] = await addPhotos([{ tripId, dayItemId: itemId, raster, source: 'device' }]);
-  return { tripId, itemId, expenseId, photoId };
+  const checkId = await createCheckItem(tripId, '帶護照');
+  return { tripId, itemId, expenseId, photoId, checkId };
 }
 
+describe('勾選清單', () => {
+  it('新增時去掉頭尾空白，並用 10 為間隔排在手動順序後面', async () => {
+    const tripId = await createTrip(tripSeed);
+    const first = await createCheckItem(tripId, '  帶護照  ');
+    await createCheckItem(tripId, '確認機票');
+
+    expect(first).toMatch(/^check_/);
+    const rows = await listCheckItems(tripId);
+    expect(rows.map((r) => [r.text, r.order, r.done])).toEqual([
+      ['帶護照', 10, false],
+      ['確認機票', 20, false],
+    ]);
+    expect(rows[0]).toMatchObject({ tripId, createdAt: expect.any(String), updatedAt: expect.any(String) });
+    await expect(createCheckItem(tripId, '   ')).rejects.toThrow();
+  });
+
+  it('可以改名、勾選與取消，並可上移下移', async () => {
+    const tripId = await createTrip(tripSeed);
+    const a = await createCheckItem(tripId, 'A');
+    const b = await createCheckItem(tripId, 'B');
+    const c = await createCheckItem(tripId, 'C');
+
+    await updateCheckItem(c, { text: '買票', done: true });
+    expect(await db.checkItems.get(c)).toMatchObject({ text: '買票', done: true, updatedAt: expect.any(String) });
+    await updateCheckItem(c, { done: false });
+    expect((await db.checkItems.get(c))?.done).toBe(false);
+
+    await moveCheckItem(c, -1);
+    expect((await listCheckItems(tripId)).map((r) => r.id)).toEqual([a, c, b]);
+    await moveCheckItem(a, 1);
+    expect((await listCheckItems(tripId)).map((r) => r.id)).toEqual([c, a, b]);
+  });
+
+  it('刪單筆清單會留下 checkItems 記號', async () => {
+    const tripId = await createTrip(tripSeed);
+    const id = await createCheckItem(tripId, '帶充電器');
+    await deleteCheckItem(id);
+
+    expect(await db.checkItems.count()).toBe(0);
+    expect(await db.tombstones.get(id)).toMatchObject({ id, kind: 'checkItems', deletedAt: expect.any(String) });
+  });
+
+  it('備份帶得出清單，取代與合併還原都不會重複插入', async () => {
+    const tripId = await createTrip(tripSeed);
+    await createCheckItem(tripId, '預訂飯店');
+    await updateCheckItem((await listCheckItems(tripId))[0].id, { done: true });
+    const dump = await exportBackup();
+    expect(dump.checkItems).toHaveLength(1);
+    expect(dump.checkItems?.[0].done).toBe(true);
+
+    await clearAll();
+    const replaced = await importBackup(dump, 'replace');
+    expect(replaced.checkItems).toBe(1);
+    expect(await listCheckItems(tripId)).toHaveLength(1);
+
+    await importBackup(dump, 'merge');
+    await importBackup(dump, 'merge');
+    expect(await db.checkItems.count()).toBe(1);
+  });
+
+  it('舊備份沒有 checkItems 也能還原，視為空清單', async () => {
+    const tripId = await createTrip(tripSeed);
+    await createCheckItem(tripId, '舊裝置不認得的欄位');
+    const dump = await exportBackup();
+    delete dump.checkItems;
+    await importBackup(dump, 'replace');
+    expect(await db.trips.count()).toBe(1);
+    expect(await db.checkItems.count()).toBe(0);
+  });
+});
+
 describe('刪除記號（tombstone）', () => {
-  it('刪掉旅行會替四張表各留一筆記號，並跟著匯出檔走出去', async () => {
-    const { tripId, itemId, expenseId, photoId } = await seeded();
+  it('刪掉旅行會替五張表各留一筆記號，並跟著匯出檔走出去', async () => {
+    const { tripId, itemId, expenseId, photoId, checkId } = await seeded();
     await deleteTrip(tripId);
 
     const markers = await db.tombstones.toArray();
     const byId = new Map(markers.map((m) => [m.id, m.kind]));
-    expect([...byId.keys()].sort()).toEqual([expenseId, itemId, photoId, tripId].sort());
+    expect([...byId.keys()].sort()).toEqual([expenseId, itemId, photoId, tripId, checkId].sort());
     expect(byId.get(tripId)).toBe('trips');
     expect(byId.get(itemId)).toBe('dayItems');
     expect(byId.get(expenseId)).toBe('expenses');
     expect(byId.get(photoId)).toBe('photos');
+    expect(byId.get(checkId)).toBe('checkItems');
+    expect(await db.checkItems.count()).toBe(0);
     for (const m of markers) expect(Date.parse(m.deletedAt)).not.toBeNaN();
 
     // 匯出（同步推的就是這份）要帶著記號，否則另一端下次推並集就又長回來
     const dump = await exportBackup();
     expect(dump.tombstones?.map((m) => m.id).sort()).toEqual([...byId.keys()].sort());
     // 只推不含照片的那份也要有
-    expect((await exportBackup({ excludePhotos: true })).tombstones).toHaveLength(4);
+    expect((await exportBackup({ excludePhotos: true })).tombstones).toHaveLength(5);
   });
 
   it('刪行程項只替「真的消失的」記號：改掛到旅行的支出不算', async () => {
@@ -393,7 +472,7 @@ describe('刪除記號（tombstone）', () => {
     const { tripId } = await seeded();
     await deleteTrip(tripId);
     const n = await db.tombstones.count();
-    expect(n).toBe(4);
+    expect(n).toBe(5);
 
     await clearAll();
     expect(await db.trips.count()).toBe(0);

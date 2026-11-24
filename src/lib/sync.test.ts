@@ -11,7 +11,7 @@
 import 'fake-indexeddb/auto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_CATEGORIES, db } from '../db/db';
-import { addPhotos, createDayItem, createExpense, createTrip, deleteTrip, exportBackup } from '../db/repo';
+import { addPhotos, createCheckItem, createDayItem, createExpense, createTrip, deleteTrip, exportBackup } from '../db/repo';
 import { pullFromServer, syncNow, type SyncConfig } from './sync';
 
 const cfg: SyncConfig = { baseUrl: 'http://127.0.0.1:9999', apiKey: 'tlk_test', auto: false };
@@ -59,7 +59,7 @@ const raster = {
   mime: 'image/jpeg',
 };
 
-/** 造一趟有行程項／支出／照片的旅行，回四個 id */
+/** 造一趟有行程項／支出／照片／清單的旅行，回五個 id */
 async function seeded() {
   const tripId = await createTrip(tripSeed);
   const itemId = await createDayItem({ tripId, date: '2026-11-02', kind: 'food', title: '拉麵', order: 10 });
@@ -73,11 +73,12 @@ async function seeded() {
     category: 'food',
   });
   const [photoId] = await addPhotos([{ tripId, dayItemId: itemId, raster, source: 'device' }]);
-  return { tripId, itemId, expenseId, photoId };
+  const checkId = await createCheckItem(tripId, '帶護照');
+  return { tripId, itemId, expenseId, photoId, checkId };
 }
 
 /** 把一份「伺服器的基準檔」擺成遠端樣子：只有列，沒有照片 base64 */
-function remoteBase(rows: { trips?: unknown[]; dayItems?: unknown[]; expenses?: unknown[]; tombstones?: unknown[] }) {
+function remoteBase(rows: { trips?: unknown[]; dayItems?: unknown[]; expenses?: unknown[]; checkItems?: unknown[]; tombstones?: unknown[] }) {
   server.base = {
     format: 'triplog-backup',
     version: 1,
@@ -87,6 +88,7 @@ function remoteBase(rows: { trips?: unknown[]; dayItems?: unknown[]; expenses?: 
     expenses: [],
     categories: [],
     photos: [],
+    checkItems: [],
     meta: [],
     tombstones: [],
     ...rows,
@@ -112,14 +114,43 @@ describe('同步套用刪除記號', () => {
     remoteBase({ tombstones: [{ id: tripId, kind: 'trips', deletedAt: stamp() }] });
 
     const r = await pullFromServer(cfg);
-    // 記號只寫了旅行那一筆，但連動要把行程項、支出、照片一起算進去
-    expect(r.deleted).toBe(4);
+    // 記號只寫了旅行那一筆，但連動要把行程項、支出、照片與清單一起算進去
+    expect(r.deleted).toBe(5);
     expect(await db.trips.count()).toBe(0);
     expect(await db.dayItems.count()).toBe(0);
     expect(await db.expenses.count()).toBe(0);
     expect(await db.photos.count()).toBe(0);
+    expect(await db.checkItems.count()).toBe(0);
     // 記號本身要落地：之後每次推送都帶著它，別人才不會又長回來
     expect((await db.tombstones.toArray()).map((m) => m.id)).toEqual([tripId]);
+  });
+
+  it('遠端清單會拉進本機，完成狀態與排序一起帶過來', async () => {
+    const { tripId } = await seeded();
+    await db.checkItems.clear();
+    remoteBase({
+      checkItems: [
+        { id: 'check_remote', tripId, text: '買票', done: true, order: 20, createdAt: stamp(2), updatedAt: stamp() },
+        { id: 'check_first', tripId, text: '帶護照', done: false, order: 10, createdAt: stamp(2), updatedAt: stamp() },
+      ],
+    });
+
+    const r = await pullFromServer(cfg);
+    expect(r.pulled.checkItems).toBe(2);
+    expect((await db.checkItems.where('tripId').equals(tripId).sortBy('order')).map((c) => [c.text, c.done])).toEqual([
+      ['帶護照', false],
+      ['買票', true],
+    ]);
+  });
+
+  it('遠端單筆清單記號只刪那一筆，同一趟的其他事項照留', async () => {
+    const { tripId, checkId } = await seeded();
+    const keepId = await createCheckItem(tripId, '確認機票');
+    remoteBase({ tombstones: [{ id: checkId, kind: 'checkItems', deletedAt: stamp() }] });
+
+    const r = await pullFromServer(cfg);
+    expect(r.deleted).toBe(1);
+    expect((await db.checkItems.where('tripId').equals(tripId).primaryKeys()).map(String)).toEqual([keepId]);
   });
 
   it('遠端「沒有這一筆」不等於要刪：本機資料照留', async () => {
@@ -148,12 +179,23 @@ describe('同步套用刪除記號', () => {
     // 遠端那份舊基準還帶著那一趟，合併完要照本機記號把它壓掉
     expect(await db.trips.count()).toBe(0);
     expect(r.pushed.trips).toBe(0);
+    expect(r.pushed.checkItems).toBe(0);
     const pushed = server.pushes[server.pushes.length - 1];
     expect(pushed).toBeTruthy();
     expect(pushed?.trips.map((t: { id: string }) => t.id)).not.toContain(tripId);
     expect(pushed?.tombstones?.map((m: { id: string }) => m.id)).toContain(tripId);
     // 推上去的那份也要有記號，否則下一台裝置的歷史快照又能把那筆帶回來
     expect((await exportBackup({ excludePhotos: true })).tombstones?.map((m) => m.id)).toContain(tripId);
+  });
+
+  it('一般雙向同步會把本機清單推到伺服器', async () => {
+    const { tripId, checkId } = await seeded();
+    remoteBase({ trips: [{ ...tripSeed, id: tripId, updatedAt: stamp(9) }] });
+
+    const r = await syncNow(cfg);
+    expect(r.pushed.checkItems).toBe(1);
+    const pushed = server.pushes[server.pushes.length - 1];
+    expect(pushed?.checkItems.map((c: { id: string }) => c.id)).toEqual([checkId]);
   });
 
   it('只推不拉的那顆鈕不會清任何東西：本機列照樣留著', async () => {

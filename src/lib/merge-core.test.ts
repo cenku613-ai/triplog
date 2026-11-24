@@ -24,6 +24,7 @@ type LooseBackup = {
   expenses?: Loose[];
   categories?: Loose[];
   photos?: Loose[];
+  checkItems?: Loose[];
   tombstones?: Loose[];
   meta?: Loose[];
 };
@@ -90,6 +91,17 @@ describe('merge-core 合併規則', () => {
     expect(merged.meta).toEqual([{ key: 'rates', value: { 'TWD>JPY': 0.22, 'TWD>USD': 32 } }]);
   });
 
+  it('清單同樣取並集，同 id 由 updatedAt 較新者勝', () => {
+    const older = row('check_a', '2026-01-01T00:00:00.000Z', { tripId: 't1', text: '帶護照', done: false });
+    const newer = row('check_a', '2026-03-01T00:00:00.000Z', { tripId: 't1', text: '帶護照', done: true });
+    const merged = mergeBackupObjects(
+      backup({ checkItems: [older] }),
+      backup({ checkItems: [newer, row('check_b', '2026-03-02T00:00:00.000Z', { tripId: 't1', text: '買票' })] }),
+    );
+    expect(merged.checkItems).toHaveLength(2);
+    expect(merged.checkItems?.find((c) => c.id === 'check_a')?.done).toBe(true);
+  });
+
   it('沒有 id 的髒資料直接丟掉，不會讓合併炸掉', () => {
     const merged = mergeBackupObjects(
       backup({ trips: [row('t1', '2026-01-01T00:00:00.000Z')] }),
@@ -134,6 +146,10 @@ describe('merge-core 合併規則', () => {
         { id: 'p1', tripId: 't1', dayItemId: 'i1', createdAt: '2026-01-01T00:00:00.000Z' },
         { id: 'p2', tripId: 't2', createdAt: '2026-01-01T00:00:00.000Z' },
       ],
+      checkItems: [
+        row('check_1', '2026-01-01T00:00:00.000Z', { tripId: 't1', text: '帶護照' }),
+        row('check_2', '2026-01-01T00:00:00.000Z', { tripId: 't2', text: '別帶' }),
+      ],
       meta: [
         { key: 'rates', value: { 'TWD>JPY': 0.22 } },
         { key: 'app', value: { lang: 'zh-Hant' } },
@@ -145,17 +161,19 @@ describe('merge-core 合併規則', () => {
     expect(slice.expenses?.map((e) => e.id)).toEqual(['e1']);
     expect(slice.categories?.map((c) => c.id)).toEqual(['c-food']);
     expect(slice.photos?.map((p) => p.id)).toEqual(['p1']);
+    expect(slice.checkItems?.map((c) => c.id)).toEqual(['check_1']);
     expect(slice.meta).toEqual([{ key: 'rates', value: { 'TWD>JPY': 0.22 } }]);
     expect(slice.version).toBe(2);
   });
 
   it('countsOf 給出各表筆數', () => {
-    expect(countsOf(backup({ trips: [{ id: 't1' }], expenses: [{ id: 'e1' }, { id: 'e2' }] }))).toEqual({
+    expect(countsOf(backup({ trips: [{ id: 't1' }], expenses: [{ id: 'e1' }, { id: 'e2' }], checkItems: [{ id: 'check_1' }] }))).toEqual({
       trips: 1,
       dayItems: 0,
       expenses: 2,
       categories: 0,
       photos: 0,
+      checkItems: 1,
     });
   });
 });
@@ -182,13 +200,14 @@ describe('merge-core 刪除記號（tombstone）', () => {
     expect(mergeBackupObjects(killer, staleEdit).trips).toEqual([]);
   });
 
-  it('刪掉旅行時連同底下的行程項、支出、照片一起消失', () => {
+  it('刪掉旅行時連同底下的行程項、支出、照片與清單一起消失', () => {
     const merged = mergeSources([
       backup({
         trips: [row('t1', '2026-01-01T00:00:00.000Z')],
         dayItems: [row('i1', '2026-01-01T00:00:00.000Z', { tripId: 't1' })],
         expenses: [row('e1', '2026-01-01T00:00:00.000Z', { tripId: 't1' })],
         photos: [row('p1', '2026-01-01T00:00:00.000Z', { tripId: 't1' })],
+        checkItems: [row('check_1', '2026-01-01T00:00:00.000Z', { tripId: 't1' })],
       }),
       backup({ trips: [], tombstones: [{ id: 't1', kind: 'trips', deletedAt: recent() }] }),
       // 另一台還帶著那些列（它還沒同步），以及另一趟的資料要毫髮無傷
@@ -197,12 +216,23 @@ describe('merge-core 刪除記號（tombstone）', () => {
         dayItems: [row('i9', '2026-01-02T00:00:00.000Z', { tripId: 't2' })],
         expenses: [row('e9', '2026-01-02T00:00:00.000Z', { tripId: 't2' })],
         photos: [row('p9', '2026-01-02T00:00:00.000Z', { tripId: 't2' })],
+        checkItems: [row('check_9', '2026-01-02T00:00:00.000Z', { tripId: 't2' })],
       }),
     ]);
     expect(merged.trips?.map((t) => t.id)).toEqual(['t2']);
     expect(merged.dayItems?.map((i) => i.id)).toEqual(['i9']);
     expect(merged.expenses?.map((e) => e.id)).toEqual(['e9']);
     expect(merged.photos?.map((p) => p.id)).toEqual(['p9']);
+    expect(merged.checkItems?.map((c) => c.id)).toEqual(['check_9']);
+  });
+
+  it('單筆清單的記號會壓過舊快照，缺 kind 時也能由 check_ 前綴補上', () => {
+    const merged = mergeBackupObjects(
+      backup({ checkItems: [row('check_1', '2026-01-01T00:00:00.000Z', { tripId: 't1', text: '帶護照' })] }),
+      backup({ tombstones: [{ id: 'check_1', deletedAt: recent() }] }),
+    );
+    expect(merged.checkItems).toEqual([]);
+    expect(merged.tombstones).toEqual([{ id: 'check_1', kind: 'checkItems', deletedAt: expect.any(String) }]);
   });
 
   it('行程項的記號只帶走它的照片，改掛到旅行的照樣活', () => {
@@ -220,11 +250,12 @@ describe('merge-core 刪除記號（tombstone）', () => {
     expect(merged.expenses?.map((e) => e.id)).toEqual(['e1']);
   });
 
-  it('kindFromId：四種前綴都推得出來，字串長度不一樣也不影響', () => {
+  it('kindFromId：五種前綴都推得出來，字串長度不一樣也不影響', () => {
     expect(kindFromId('trip_a1')).toBe('trips');
     expect(kindFromId('item_a1')).toBe('dayItems');
     expect(kindFromId('exp_a1')).toBe('expenses');
     expect(kindFromId('photo_a1')).toBe('photos');
+    expect(kindFromId('check_a1')).toBe('checkItems');
     expect(kindFromId('c-food')).toBeNull();
     expect(kindFromId('')).toBeNull();
     expect(kindFromId(undefined as unknown as string)).toBeNull();
@@ -308,6 +339,7 @@ describe('merge-core 刪除記號（tombstone）', () => {
       deletedAt: '2026-01-01T00:00:00.000Z',
     });
     expect(tombstone('photo_x', 'photos').kind).toBe('photos');
+    expect(tombstone('check_x', undefined, '2026-01-01T00:00:00.000Z').kind).toBe('checkItems');
     expect(() => tombstone('c1')).toThrow();
   });
 
@@ -320,17 +352,24 @@ describe('merge-core 刪除記號（tombstone）', () => {
       ],
       expenses: [row('e1', '2026-01-01T00:00:00.000Z', { tripId: 't1', category: 'food' })],
       photos: [row('p1', '2026-01-01T00:00:00.000Z', { tripId: 't1', dayItemId: 'i1' })],
+      checkItems: [
+        row('check_1', '2026-01-01T00:00:00.000Z', { tripId: 't1', text: '保留' }),
+        row('check_2', '2026-01-01T00:00:00.000Z', { tripId: 't1', text: '刪掉' }),
+        row('check_9', '2026-01-01T00:00:00.000Z', { tripId: 't2', text: '別趟' }),
+      ],
       categories: [{ id: 'c-food', key: 'food' }],
       meta: [{ key: 'rates', value: {} }],
       tombstones: [
         { id: 'i2', kind: 'dayItems', deletedAt: recent() },
+        { id: 'check_2', kind: 'checkItems', deletedAt: recent() },
         { id: 't9', kind: 'trips', deletedAt: recent() },
       ],
     });
     const slice = sliceTrip(src, 't1');
     expect(slice.dayItems?.map((i) => i.id)).toEqual(['i1']);
     expect(slice.photos?.map((p) => p.id)).toEqual(['p1']);
-    expect(slice.tombstones?.map((t) => t.id)).toEqual(['i2']);
+    expect(slice.checkItems?.map((c) => c.id)).toEqual(['check_1']);
+    expect(slice.tombstones?.map((t) => t.id)).toEqual(['i2', 'check_2']);
     // 整趟被刪時，單趟匯出不會把它復活
     expect(sliceTrip(src, 't9').trips).toEqual([]);
   });

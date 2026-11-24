@@ -52,31 +52,35 @@ npm run mcp:build          # 打包成單一檔 mcp/dist/index.mjs（不入版�
 
 唯讀 agent 的建議組合是 `TRIPLOG_READ_KEY` + `TRIPLOG_ALLOW_WRITE=0`：既然後端金鑰只有讀權限，工具列表也別再留一堆它用不到的寫入選項。
 
-## 4. 14 個工具
+## 4. 18 個工具
 
 讀（7 個，唯讀模式會全留）：
 
 | 工具 | 用途 |
 | --- | --- |
 | `triplog_health` | 連通性、快照數量與體積 |
-| `triplog_list_trips` | 所有旅行與每趟的行程項／支出／照片數、主幣別合計 |
-| `triplog_get_trip` | 一趟的完整內容（照片只有 metadata，不會拖 base64） |
+| `triplog_list_trips` | 所有旅行與每趟的行程項／支出／照片／勾選清單數、主幣別合計 |
+| `triplog_get_trip` | 一趟的完整內容，含勾選清單（照片只有 metadata，不會拖 base64） |
 | `triplog_summary` | 支出統計：合計、預算、依分類／付款人／幣別分組 |
 | `triplog_list_expenses` | 列支出，可按日期區間、付款人、分類篩 |
 | `triplog_history` | 後端留了哪幾份歷史快照、誰在何時推的 |
-| `triplog_delete_help` | 沒有刪除工具；叫它會拿到「該怎麼刪」的說明（歸檔，或在 app 裡刪、讓記號跟著同步） |
+| `triplog_delete_help` | 刪除政策說明：只能刪單筆勾選事項；整趟旅行、行程項與支出請在 app 刪，或用歸檔取代刪旅行 |
 
-寫（7 個，`TRIPLOG_ALLOW_WRITE=0` 時不註冊）：
+寫（11 個，`TRIPLOG_ALLOW_WRITE=0` 時不註冊）：
 
 | 工具 | 用途 |
 | --- | --- |
 | `triplog_create_trip` | 建立旅行（名稱、日期區間、主幣別、預算、同行者） |
 | `triplog_add_items` | 批次加行程項，同一天會自動往後排 order |
 | `triplog_update_item` | 改行程項，只蓋有送的欄位 |
+| `triplog_add_check_items` | 批次加勾選事項，文字會去空白，不給 order 就排最後 |
+| `triplog_update_check_item` | 改勾選事項的文字、完成狀態或 order |
+| `triplog_move_check_item` | 把勾選事項往上或往下移一格，與鄰居交換 order |
+| `triplog_delete_check_item` | 刪單筆勾選事項，並以 tombstone 同步到其他裝置 |
 | `triplog_add_expenses` | 批次記支出，外幣要自己給匯率 |
 | `triplog_update_expense` | 改支出，含事後補匯率重算 |
 | `triplog_add_companions` | 加同行者名單（付款人選項用） |
-| `triplog_archive_trip` | 歸檔／取消歸檔，取代刪除 |
+| `triplog_archive_trip` | 歸檔／取消歸檔，取代刪除整趟旅行 |
 
 另有兩個 resources：`triplog://schema`（欄位定義與寫入規則，建議 agent 第一次操作前先讀）與 `triplog://trips`（旅行索引）。
 
@@ -94,9 +98,9 @@ API 是「兩端各自推送、伺服器合併」，agent 推完不等於裝置�
 
 ## 7. 安全邊界
 
-刪除不存在。所有寫入都是新增或依 id 覆寫，`triplog_delete_help` 之外沒有任何路徑能移除資料；要真的刪，請在使用者面前於 app 內手動做。
+刪除的邊界是「只刪單筆勾選事項」。`triplog_delete_check_item` 會送一筆 `kind: "checkItems"` 的 tombstone 到 `/api/sync`，其他裝置下次同步就會移除同一筆；整趟旅行、行程項與支出仍只能由使用者在 app 裡刪。`triplog_delete_help` 是政策說明，不會動資料；要收起整趟旅行請用 `triplog_archive_trip`。沒有 HTTP DELETE 端點。
 
-app 那一側的刪除現在會同步：刪一筆時本機留一筆 `{id, kind, deletedAt}`（文件的 `tombstones` 陣列），合併端——瀏覽器與後端共用同一份 `merge-core`——照它把那列連同它底下的行程項、支出、照片一起濾掉，另一端下次同步也會把它清掉。這套機制刻意不給 agent 用：MCP 的七個寫入工具生不出記號，`push()` 送出去的部分文件從來不帶 `tombstones` 這欄（後端把缺欄位當成空集合）。拿可寫金鑰直接打 `POST /api/sync` 的人推得動記號，但那個人本來就能覆寫這份帳本的任何一列，風險跟推送同一等級。記號保留 365 天後放手，別台的編輯不會讓已刪的復活（刪除獲勝）；要把整台裝置以某份檔案為準，用 app 的「匯入備份（取代）」。
+app 那一側的刪除會同步：刪一筆時本機留一筆 `{id, kind, deletedAt}`（文件的 `tombstones` 陣列），合併端——瀏覽器與後端共用同一份 `merge-core`——照它把那列連同它底下的行程項、支出、照片一起濾掉，另一端下次同步也會把它清掉。MCP 的 11 個寫入工具中，只有 `triplog_delete_check_item` 會產生刪除記號，而且只能指向 `checkItems`。拿可寫金鑰直接打 `POST /api/sync` 的人仍可推各種記號，但那個人本來就能覆寫這份帳本的任何一列，風險跟推送同一等級。記號保留 365 天後放手，別台的編輯不會讓已刪的復活（刪除獲勝）；要把整台裝置以某份檔案為準，用 app 的「匯入備份（取代）」。
 
 金鑰就是資料庫密碼。`TRIPLOG_API_KEY` 洩了等於整個資料庫可被讀寫，請只放在 `.env` 與 MCP 客戶端設定，不要貼進 issue、chat 或 commit。後端只對 443 開放，API 容器不綁 port，公網看不到它；沒帶金鑰的請求一律 401。
 
@@ -121,5 +125,5 @@ app 那一側的刪除現在會同步：刪一筆時本機留一筆 `{id, kind, 
 驗收（會自己起一個暫存資料庫的 API，再真的用 JSON-RPC 打過去）：
 
 ```bash
-npm run mcp:test     # = mcp:build + 21 項 MCP 檢查
+npm run mcp:test     # = mcp:build + 26 項 MCP 檢查
 ```

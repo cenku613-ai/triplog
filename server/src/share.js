@@ -134,11 +134,15 @@ export function sharePayload(snapshot, tripId, share) {
   const expenses = (snapshot.expenses ?? [])
     .filter((e) => e.tripId === tripId)
     .sort((a, b) => (a.date === b.date ? String(a.createdAt).localeCompare(String(b.createdAt)) : String(a.date).localeCompare(String(b.date))));
+  const checkItems = (snapshot.checkItems ?? [])
+    .filter((c) => c.tripId === tripId)
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || String(a.createdAt).localeCompare(String(b.createdAt)) || String(a.id).localeCompare(String(b.id)));
   const used = new Set(expenses.map((e) => e.category));
   return {
     trip,
     items,
     expenses,
+    checkItems,
     // 內建分類是共用的，送出去不洩漏什麼；擁有者自訂的分類只送這一趟用過的，
     // 不然同行者要選「餐飲」時會看到一張空清單（這一趟還沒有任何支出時）。
     categories: (snapshot.categories ?? []).filter(
@@ -147,9 +151,11 @@ export function sharePayload(snapshot, tripId, share) {
     totals: {
       items: items.length,
       expenses: expenses.length,
+      checkItems: checkItems.length,
+      checkItemsDone: checkItems.filter((c) => c.done).length,
       baseAmount: Math.round(expenses.reduce((s, e) => s + Number(e.baseAmount ?? 0), 0) * 100) / 100,
       byCurrency: byCurrency(expenses),
-      lastWrite: expenses.concat(items).reduce((m, r) => (String(r.updatedAt) > m ? String(r.updatedAt) : m), ''),
+      lastWrite: expenses.concat(items, checkItems).reduce((m, r) => (String(r.updatedAt) > m ? String(r.updatedAt) : m), ''),
     },
     share: {
       label: share?.label ?? '',
@@ -278,6 +284,7 @@ export function partialOf(table, row) {
     expenses: table === 'expenses' ? [row] : [],
     categories: [],
     photos: [],
+    checkItems: [],
     // 共筆與訪客連結只追加，永不宣佈刪除：留空陣列是故意的，
     // 讓這條路不可能透過 tombstone 動到別人的記錄（合併端把缺欄位當空集合）
     tombstones: [],

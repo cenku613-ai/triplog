@@ -3,6 +3,7 @@ import type {
   BackupFile,
   BackupPhoto,
   Category,
+  ChecklistItem,
   DayItem,
   Expense,
   Photo,
@@ -50,29 +51,32 @@ export async function updateTrip(id: string, patch: Partial<Trip>): Promise<void
 }
 
 /**
- * 刪掉一趟旅行，連同它底下的行程項、支出、照片。
- * 四張表都要記刪除記號：只有旅行記號的話，另一端推上來的並集仍會把那些列帶回來，
+ * 刪掉一趟旅行，連同它底下的行程項、支出、照片與勾選清單。
+ * 五張表都要記刪除記號：只有旅行記號的話，另一端推上來的並集仍會把那些列帶回來，
  * 變成「旅行不見了但它的支出又長出來」這種最難解釋的狀態。
  */
 export async function deleteTrip(id: string): Promise<void> {
   await db.transaction(
     'rw',
-    [db.trips, db.dayItems, db.expenses, db.photos, db.tombstones],
+    [db.trips, db.dayItems, db.expenses, db.photos, db.checkItems, db.tombstones],
     async () => {
-      const [itemIds, expenseIds, photoIds] = await Promise.all([
+      const [itemIds, expenseIds, photoIds, checkIds] = await Promise.all([
         db.dayItems.where('tripId').equals(id).primaryKeys(),
         db.expenses.where('tripId').equals(id).primaryKeys(),
         db.photos.where('tripId').equals(id).primaryKeys(),
+        db.checkItems.where('tripId').equals(id).primaryKeys(),
       ]);
       await db.dayItems.where('tripId').equals(id).delete();
       await db.expenses.where('tripId').equals(id).delete();
       await db.photos.where('tripId').equals(id).delete();
+      await db.checkItems.where('tripId').equals(id).delete();
       await db.trips.delete(id);
       await markDeleted([
         { id, kind: 'trips' },
         ...itemIds.map((i) => ({ id: String(i), kind: 'dayItems' as const })),
         ...expenseIds.map((e) => ({ id: String(e), kind: 'expenses' as const })),
         ...photoIds.map((p) => ({ id: String(p), kind: 'photos' as const })),
+        ...checkIds.map((c) => ({ id: String(c), kind: 'checkItems' as const })),
       ]);
     },
   );
@@ -205,6 +209,66 @@ export async function photosByItem(tripId: string): Promise<Map<string, Photo[]>
   }
   for (const arr of map.values()) arr.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   return map;
+}
+
+/* ----------------------------------------------------------- checklists */
+
+function checkText(text: string): string {
+  const value = text.trim();
+  if (!value) throw new Error('Checklist text is required');
+  return value;
+}
+
+export async function listCheckItems(tripId: string): Promise<ChecklistItem[]> {
+  const rows = await db.checkItems.where('tripId').equals(tripId).toArray();
+  return rows.sort(
+    (a, b) => a.order - b.order || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
+  );
+}
+
+export async function createCheckItem(tripId: string, text: string): Promise<string> {
+  const rows = await listCheckItems(tripId);
+  const id = newId('check');
+  const ts = now();
+  await db.checkItems.add({
+    id,
+    tripId,
+    text: checkText(text),
+    done: false,
+    order: rows.reduce((max, row) => Math.max(max, row.order), 0) + 10,
+    createdAt: ts,
+    updatedAt: ts,
+  });
+  return id;
+}
+
+export type CheckItemPatch = Partial<Pick<ChecklistItem, 'text' | 'done' | 'order'>>;
+
+export async function updateCheckItem(id: string, patch: CheckItemPatch): Promise<void> {
+  const clean: CheckItemPatch = { ...patch };
+  if (patch.text !== undefined) clean.text = checkText(patch.text);
+  await db.checkItems.update(id, { ...clean, updatedAt: now() });
+}
+
+export async function deleteCheckItem(id: string): Promise<void> {
+  await db.transaction('rw', [db.checkItems, db.tombstones], async () => {
+    await db.checkItems.delete(id);
+    await markDeleted([{ id, kind: 'checkItems' }]);
+  });
+}
+
+export async function moveCheckItem(id: string, direction: -1 | 1): Promise<void> {
+  const item = await db.checkItems.get(id);
+  if (!item) return;
+  const siblings = await listCheckItems(item.tripId);
+  const idx = siblings.findIndex((row) => row.id === id);
+  const swapWith = siblings[idx + direction];
+  if (!swapWith) return;
+  const ts = now();
+  await db.checkItems.bulkPut([
+    { ...item, order: swapWith.order, updatedAt: ts },
+    { ...swapWith, order: item.order, updatedAt: ts },
+  ]);
 }
 
 /* --------------------------------------------------------------- expenses */
@@ -365,13 +429,14 @@ export async function setMeta<T>(key: string, value: T): Promise<void> {
  * 會讓請求膨到幾 MB，所以照片改由 `/api/photos` 單獨按需下載。
  */
 export async function exportBackup(opts: { excludePhotos?: boolean } = {}): Promise<BackupFile> {
-  const [trips, dayItems, expenses, categories, metaRows, photoRows, tombstones] = await Promise.all([
+  const [trips, dayItems, expenses, categories, metaRows, photoRows, checkItems, tombstones] = await Promise.all([
     db.trips.toArray(),
     db.dayItems.toArray(),
     db.expenses.toArray(),
     db.categories.toArray(),
     db.meta.toArray(),
     opts.excludePhotos ? Promise.resolve([] as Photo[]) : db.photos.toArray(),
+    db.checkItems.toArray(),
     db.tombstones.toArray(),
   ]);
   // Blob 進不了 JSON，逐張轉 base64。照片多時會慢幾秒，但只在按匯出時跑一次。
@@ -393,6 +458,7 @@ export async function exportBackup(opts: { excludePhotos?: boolean } = {}): Prom
     expenses,
     categories,
     photos,
+    checkItems,
     // 記號要跟著每次匯出走（同步推的也是這份），否則另一端下次推並集就又長回來
     tombstones,
     meta: metaRows.filter((m) => m.key !== 'app'),
@@ -425,11 +491,11 @@ export type ImportMode = 'merge' | 'replace';
 export async function importBackup(
   data: BackupFile,
   mode: ImportMode,
-): Promise<{ trips: number; expenses: number; items: number; photos: number }> {
-  const counts = { trips: 0, expenses: 0, items: 0, photos: 0 };
+): Promise<{ trips: number; expenses: number; items: number; photos: number; checkItems: number }> {
+  const counts = { trips: 0, expenses: 0, items: 0, photos: 0, checkItems: 0 };
   await db.transaction(
     'rw',
-    [db.trips, db.dayItems, db.expenses, db.categories, db.meta, db.photos, db.tombstones],
+    [db.trips, db.dayItems, db.expenses, db.categories, db.meta, db.photos, db.checkItems, db.tombstones],
     async () => {
       const markers = data.tombstones ?? [];
       // 本機那些記號也要算進來（merge 模式）：它們代表這台已經刪掉、而舊檔還不知道的事
@@ -441,16 +507,19 @@ export async function importBackup(
       let dayItems = clean.dayItems ?? [];
       let expenses = clean.expenses ?? [];
       let photos = (clean.photos ?? []).map(photoFromBackup);
+      let checkItems = clean.checkItems ?? [];
       counts.trips = trips.length;
       counts.items = dayItems.length;
       counts.expenses = expenses.length;
       counts.photos = photos.length;
+      counts.checkItems = checkItems.length;
       if (mode === 'replace') {
         await Promise.all([
           db.trips.clear(),
           db.dayItems.clear(),
           db.expenses.clear(),
           db.photos.clear(),
+          db.checkItems.clear(),
           db.categories.clear(),
           db.tombstones.clear(),
           db.meta.where('key')
@@ -471,11 +540,14 @@ export async function importBackup(
         expenses = expenses.filter((e) => !knownExp.has(e.id));
         const knownPhotos = new Set((await db.photos.toArray()).map((p) => p.id));
         photos = photos.filter((p) => !knownPhotos.has(p.id));
+        const knownChecks = new Set((await db.checkItems.toArray()).map((c) => c.id));
+        checkItems = checkItems.filter((c) => !knownChecks.has(c.id));
       }
       await db.trips.bulkPut(trips);
       await db.dayItems.bulkPut(dayItems);
       await db.expenses.bulkPut(expenses);
       if (photos.length) await db.photos.bulkPut(photos);
+      if (checkItems.length) await db.checkItems.bulkPut(checkItems);
     },
   );
   return counts;
@@ -489,10 +561,11 @@ export async function importBackup(
  * 那個模式會連記號一起清（見 importBackup）。
  */
 export async function clearAll(): Promise<void> {
-  await db.transaction('rw', [db.trips, db.dayItems, db.expenses, db.photos], async () => {
+  await db.transaction('rw', [db.trips, db.dayItems, db.expenses, db.photos, db.checkItems], async () => {
     await db.expenses.clear();
     await db.dayItems.clear();
     await db.photos.clear();
+    await db.checkItems.clear();
     await db.trips.clear();
   });
 }

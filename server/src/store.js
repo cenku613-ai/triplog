@@ -33,10 +33,10 @@ export const MAX_SNAPSHOT_PHOTOS = 120;
 /** 保留幾份歷史快照 */
 export const DEFAULT_KEEP = 20;
 
-const TABLES = ['trips', 'dayItems', 'expenses', 'categories', 'photos'];
+const TABLES = ['trips', 'dayItems', 'expenses', 'categories', 'photos', 'checkItems'];
 const ARRAY_FIELDS = [...TABLES, 'meta'];
 /** 刪除記號允許的 kind：與 merge-core 的 TombKind 同一組，分類與 meta 不在內 */
-const TOMB_KINDS = ['trips', 'dayItems', 'expenses', 'photos'];
+const TOMB_KINDS = ['trips', 'dayItems', 'expenses', 'photos', 'checkItems'];
 /** 記號上限：一個帳號的刪除次數撐不到這裡；真到就丟最舊的，避免有人拿它塞爆基準檔 */
 const MAX_TOMBSTONES = 5000;
 
@@ -77,7 +77,7 @@ function normalizeTombstones(input) {
 export function normalizeSnapshot(body) {
   if (!body || typeof body !== 'object') throw new BadPayload('body must be a JSON object');
   if (body.format !== 'triplog-backup') throw new BadPayload('format must be "triplog-backup"');
-  for (const field of ['trips', 'dayItems', 'expenses']) {
+  for (const field of ['trips', 'dayItems', 'expenses', 'checkItems']) {
     if (body[field] !== undefined && !Array.isArray(body[field])) {
       throw new BadPayload(`${field} must be an array`);
     }
@@ -255,6 +255,7 @@ const emptySnapshot = () => ({
   expenses: [],
   categories: [],
   photos: [],
+  checkItems: [],
   tombstones: [],
   meta: [],
 });
