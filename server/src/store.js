@@ -11,13 +11,19 @@
  * 金鑰那條路（主金鑰／tlk_ 憑證）保留給救援與 agent，它們看的是 '' 那個分帳。
  *
  * 依然刻意不做任何刪除資料的 API：沒有 DELETE 端點，也沒有「撤銷邀請就順手刪資料」
- * 這種事——邀請只收權限，動不到內容。誤刪的風險留給本機（有備份檔）而不是伺服器。
+ * 這種事——邀請只收權限，動不到內容。
+ *
+ * 那「刪除怎麼會同步」？刪除在這一層只是一件普通資料：客戶端把 `{id, kind, deletedAt}`
+ * 放進文件的 tombstones 陣列一起推上來，`base()` 合併時（merge-core）照它把列從結果裡拿掉，
+ * 所以上下端看到的基準都不再有那一筆。代價是歷史快照裡位元組還在（要真的清掉是
+ * `/api/admin/clear` 或 SSH），好處是任何一台裝置都「叫不動」別人的資料——它只能宣布
+ * 「我刪了這一筆」，而這件事本來就會跟著備份檔四處走。
  */
 import { mkdirSync, readFileSync, existsSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { mergeSources } from '../../src/lib/merge-core.js';
+import { kindFromId, mergeSources } from '../../src/lib/merge-core.js';
 import { newToken } from './share.js';
 
 /** 基準檔上限：60 張照片約 15 MB，留一倍餘量 */
@@ -29,9 +35,39 @@ export const DEFAULT_KEEP = 20;
 
 const TABLES = ['trips', 'dayItems', 'expenses', 'categories', 'photos'];
 const ARRAY_FIELDS = [...TABLES, 'meta'];
+/** 刪除記號允許的 kind：與 merge-core 的 TombKind 同一組，分類與 meta 不在內 */
+const TOMB_KINDS = ['trips', 'dayItems', 'expenses', 'photos'];
+/** 記號上限：一個帳號的刪除次數撐不到這裡；真到就丟最舊的，避免有人拿它塞爆基準檔 */
+const MAX_TOMBSTONES = 5000;
 
 export class PayloadTooLarge extends Error {}
 export class BadPayload extends Error {}
+
+/** 前綴對照表與推法都沿用 merge-core，兩端才不會對同一個 id 講出不一樣的 kind */
+
+/**
+ * 刪除記號的清洗：留 id/kind/deletedAt 三個欄位，其餘一律丟掉。
+ * 沒有 kind 也推不出 kind 的（例如有人自己亂編 id）直接無視——它壓不住任何一列，
+ * 留著只會讓基準檔變大。
+ */
+function normalizeTombstones(input) {
+  if (!Array.isArray(input)) return [];
+  const out = [];
+  for (const raw of input) {
+    const id = typeof raw?.id === 'string' ? raw.id.slice(0, 80) : '';
+    if (!id) continue;
+    const deletedAt =
+      typeof raw?.deletedAt === 'string' && !Number.isNaN(Date.parse(raw.deletedAt))
+        ? raw.deletedAt
+        : '';
+    if (!deletedAt) continue;
+    const kind = TOMB_KINDS.includes(raw?.kind) ? raw.kind : kindFromId(id);
+    if (!kind) continue;
+    out.push({ id, kind, deletedAt });
+  }
+  out.sort((a, b) => String(b.deletedAt).localeCompare(String(a.deletedAt)));
+  return out.slice(0, MAX_TOMBSTONES);
+}
 
 /**
  * 檢查並標準化上傳的備份檔。回傳清洗過的副本，不修改輸入。
@@ -54,6 +90,8 @@ export function normalizeSnapshot(body) {
     const rows = Array.isArray(body[field]) ? body[field] : [];
     clean[field] = field === 'meta' ? rows.filter((r) => r && typeof r.key === 'string') : rows.filter((r) => r && typeof r.id === 'string');
   }
+  // 刪除記號不是「一列資料」，欄位校驗另寫一支（缺 kind/deletedAt 的那幾筆留下來也沒用）
+  clean.tombstones = normalizeTombstones(body.tombstones);
   clean.exportedAt =
     typeof body.exportedAt === 'string' && !Number.isNaN(Date.parse(body.exportedAt))
       ? body.exportedAt
@@ -217,6 +255,7 @@ const emptySnapshot = () => ({
   expenses: [],
   categories: [],
   photos: [],
+  tombstones: [],
   meta: [],
 });
 

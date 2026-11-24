@@ -466,6 +466,7 @@ export const zh = {
   'sync.lastAt': '上次同步：{when}',
   'sync.never': '還沒同步過',
   'sync.report': '拉回 {pTrips} 趟／{pItems} 項／{pExp} 筆，推上 {nTrips} 趟，照片下載 {photos} 張',
+  'sync.deletedRows': '照刪除記號清掉 {n} 列',
   'sync.needSetup': '先在設定填好伺服器網址與金鑰。',
   'sync.photoWarn': '推上去會把照片（含 Commons 授權資訊）一起存到伺服器；抓下來時同一把金鑰看得到全部資料。',
   'sync.remoteTrips': '伺服器上的旅行',

@@ -5,15 +5,18 @@
  * 合併規則放在 merge-core.js，瀏覽器與伺服器共用，所以兩端算法不會分岔。
  *
  * 關鍵取捨（寫下來，避免以後驚訝）：
- * - 沒有刪除語意：一端刪掉的東西，下次同步會被另一端帶回來。
+ * - 刪除會同步：刪掉一列時本機留一筆刪除記號（tombstones），它跟著每次推送走，
+ *   合併端照它把列從基準裡拿掉，本機則在套用時真的清掉（見 removeDeleted）。
+ *   代碼裡「檔案沒有這一筆」永遠不等於「請刪掉它」——只有記號才算數。
+ * - 記號保留一年（merge-core 的 TOMBSTONE_DAYS）：超過一年沒開的裝置仍可能把舊紀錄帶回來。
  * - 照片只在「本機還沒有」時才下載，而且一次最多 150 張，行動裝置才不會一口氣吃掉流量。
  * - 每次同步都會用本機資料把基準檔重寫一次，所以後端永遠是兩端的並集。
  */
 import { db } from '../db/db';
 import { exportBackup } from '../db/repo';
-import type { BackupFile, Photo, Trip } from '../db/types';
+import type { BackupFile, Photo, TombKind, Trip } from '../db/types';
 import { dataUrlToBlob } from './images';
-import { countsOf, mergeBackupObjects, type BackupLike } from './merge-core';
+import { collectTombstones, countsOf, mergeBackupObjects, type BackupLike } from './merge-core';
 
 export const SYNC_STORAGE_KEY = 'triplog:sync';
 /** 一次同步最多抓幾張照片（150 張約 15 MB） */
@@ -34,6 +37,8 @@ export type SyncReport = {
   pushed: { trips: number; dayItems: number; expenses: number };
   photosDownloaded: number;
   remoteBytes: number;
+  /** 這次照刪除記號從本機清掉幾列（包含連動刪掉的行程項／支出／照片） */
+  deleted: number;
 };
 
 export class SyncError extends Error {
@@ -165,22 +170,66 @@ function snapshotOf(data: BackupLike): BackupFile {
     expenses: data.expenses ?? [],
     categories: data.categories ?? [],
     photos: [],
+    tombstones: data.tombstones ?? [],
     meta: data.meta ?? [],
   };
 }
 
-/** 把合併後的快照寫回 IndexedDB（只覆寫同 id，不做任何刪除） */
-async function applySnapshot(snap: BackupFile): Promise<void> {
+/**
+ * 照刪除記號把本機那幾列真的清掉，回傳清了幾列。
+ *
+ * 傳進來的通常是合併後的基準：裡面那些列已經由 merge-core 濾掉了，所以「檔案裡沒有」這件事
+ * 在本機推不出任何東西——離線裝置推來的一份舊並集同樣子會少了別人的紀錄。
+ * 只有 tombstones 寫著的那幾個 id 才算已刪，並且往下連動（旅行沒了，它的列也不會留在本機）。
+ */
+async function removeDeleted(doc: BackupLike): Promise<number> {
+  const { kinds } = collectTombstones([doc]);
+  if (!kinds.size) return 0;
+  const idsOf = (kind: TombKind): string[] =>
+    [...kinds.entries()].filter(([, k]) => k === kind).map(([id]) => id);
+  const trips = idsOf('trips');
+  const items = idsOf('dayItems');
+  let removed = 0;
+  removed += await db.trips.where('id').anyOf(idsOf('trips')).count();
+  removed += await db.expenses.where('id').anyOf(idsOf('expenses')).count();
+  removed += await db.photos.where('id').anyOf(idsOf('photos')).count();
+  removed += await db.dayItems.where('id').anyOf(items).count();
+  await db.trips.bulkDelete(idsOf('trips'));
+  await db.expenses.bulkDelete(idsOf('expenses'));
+  await db.photos.bulkDelete(idsOf('photos'));
+  await db.dayItems.bulkDelete(items);
+  if (trips.length) {
+    // 連動：本機可能還留著那一趟的子列（它們在基準裡已被濾掉，不會出現在 doc 中）
+    removed += await db.dayItems.where('tripId').anyOf(trips).count();
+    removed += await db.expenses.where('tripId').anyOf(trips).count();
+    removed += await db.photos.where('tripId').anyOf(trips).count();
+    await db.dayItems.where('tripId').anyOf(trips).delete();
+    await db.expenses.where('tripId').anyOf(trips).delete();
+    await db.photos.where('tripId').anyOf(trips).delete();
+  }
+  if (items.length) {
+    removed += await db.photos.where('dayItemId').anyOf(items).count();
+    await db.photos.where('dayItemId').anyOf(items).delete();
+  }
+  return removed;
+}
+
+/** 把合併後的快照寫回 IndexedDB：同 id 覆寫，並照刪除記號清掉已刪的那些 */
+async function applySnapshot(snap: BackupFile): Promise<number> {
   const meta = snap.meta.filter((m) => m.key !== 'app');
-  await db.transaction(
+  const markers = snap.tombstones ?? [];
+  return db.transaction(
     'rw',
-    [db.trips, db.dayItems, db.expenses, db.categories, db.meta],
+    [db.trips, db.dayItems, db.expenses, db.categories, db.meta, db.photos, db.tombstones],
     async () => {
+      // 記號先落地：之後的推送要繼續帶著它們，別人才不會把同一筆又長回來
+      if (markers.length) await db.tombstones.bulkPut(markers);
       if (snap.categories.length) await db.categories.bulkPut(snap.categories);
       if (meta.length) await db.meta.bulkPut(meta);
       if (snap.trips.length) await db.trips.bulkPut(snap.trips);
       if (snap.dayItems.length) await db.dayItems.bulkPut(snap.dayItems);
       if (snap.expenses.length) await db.expenses.bulkPut(snap.expenses);
+      return removeDeleted(snap);
     },
   );
 }
@@ -220,7 +269,7 @@ export async function pullFromServer(cfg: SyncConfig): Promise<SyncReport> {
   const local = await localSnapshot();
   const merged = mergeBackupObjects(local, remote.base);
   const photosWritten = await fetchMissingPhotos(cfg, merged);
-  await applySnapshot(merged);
+  const deleted = await applySnapshot(merged);
   const at = new Date().toISOString();
   setLastSyncAt(at);
   return {
@@ -229,6 +278,7 @@ export async function pullFromServer(cfg: SyncConfig): Promise<SyncReport> {
     pushed: { trips: 0, dayItems: 0, expenses: 0 },
     photosDownloaded: photosWritten,
     remoteBytes: remote.bytes ?? 0,
+    deleted,
   };
 }
 
@@ -252,6 +302,8 @@ export async function pushToServer(cfg: SyncConfig): Promise<SyncReport> {
     },
     photosDownloaded: 0,
     remoteBytes: res.bytes ?? 0,
+    // 只推不拉，本機自然不會清掉任何東西
+    deleted: 0,
   };
 }
 
@@ -265,7 +317,7 @@ export async function syncNow(cfg: SyncConfig): Promise<SyncReport> {
   const local = await localSnapshot();
   const merged = mergeBackupObjects(remote.base, local);
   const photosDownloaded = await fetchMissingPhotos(cfg, merged);
-  await applySnapshot(merged);
+  const deleted = await applySnapshot(merged);
   const push = await exportBackup();
   const res = await api<{ savedAt: string; bytes: number }>(cfg, '/api/backup', {
     method: 'POST',
@@ -283,6 +335,7 @@ export async function syncNow(cfg: SyncConfig): Promise<SyncReport> {
     },
     photosDownloaded,
     remoteBytes: res.bytes ?? remote.bytes ?? 0,
+    deleted,
   };
 }
 
@@ -319,13 +372,17 @@ export async function pullTrip(cfg: SyncConfig, tripId: string): Promise<{ name:
   const photos = (snap.photos ?? []).map(toPhoto);
   await db.transaction(
     'rw',
-    [db.trips, db.dayItems, db.expenses, db.categories, db.photos],
+    [db.trips, db.dayItems, db.expenses, db.categories, db.photos, db.tombstones],
     async () => {
+      const markers = snap.tombstones ?? [];
+      if (markers.length) await db.tombstones.bulkPut(markers);
       if (snap.categories.length) await db.categories.bulkPut(snap.categories);
       if (snap.trips.length) await db.trips.bulkPut(snap.trips);
       if (snap.dayItems.length) await db.dayItems.bulkPut(snap.dayItems);
       if (snap.expenses.length) await db.expenses.bulkPut(snap.expenses);
       if (photos.length) await db.photos.bulkPut(photos);
+      // 這趟的刪除記號也要落到本機：對方在別台刪掉的行程項，不能因為「只拉這趟」而留著
+      await removeDeleted(snap);
     },
   );
   setLastSyncAt(new Date().toISOString());

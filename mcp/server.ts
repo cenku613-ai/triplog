@@ -573,8 +573,9 @@ const TOOLS = [
       const trip = findTrip(doc, String(tripId));
       return {
         allowed: false,
-        reason: 'MCP 端刻意不提供刪除：刪除不可逆，而且要同步回每一台裝置。',
-        doInstead: '用 triplog_archive_trip 把這趟歸檔（資料留著、清單裡收起來），或由使用者自己在 app 裡刪除。',
+        reason: 'MCP 端刻意不提供刪除：刪除在這一系統是會跟著同步的資料（刪除記號），不該由 agent 替每一台裝置決定。',
+        doInstead:
+          '用 triplog_archive_trip 把這趟歸檔（資料留著、清單裡收起來），或由使用者自己在 app 裡刪除——app 刪掉會留下 tombstone，別台裝置下次同步就跟著清掉。',
         trip: { id: trip.id, name: trip.name },
       };
     },

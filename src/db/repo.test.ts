@@ -9,6 +9,7 @@ import {
   createExpense,
   createTrip,
   deleteDayItem,
+  deleteExpense,
   deleteTrip,
   exportBackup,
   importBackup,
@@ -16,6 +17,7 @@ import {
   listPhotosOfDayItem,
   nextOrder,
   parseBackup,
+  removePhotos,
   setRate,
   lookupRate,
 } from './repo';
@@ -263,5 +265,139 @@ describe('照片', () => {
     expect(rows[0].source).toBe('commons');
     // 照片要能重新掛回原本的行程項
     expect(await listPhotosOfDayItem(rows[0].dayItemId as string)).toHaveLength(1);
+  });
+});
+
+const raster = {
+  blob: new Blob(['原圖'], { type: 'image/jpeg' }),
+  thumb: new Blob(['縮圖'], { type: 'image/jpeg' }),
+  width: 1600,
+  height: 900,
+  mime: 'image/jpeg',
+};
+
+/** 湊一趟有行程項、支出與照片的旅行，回四個 id，刪除記號的測試全靠它 */
+async function seeded() {
+  const tripId = await createTrip(tripSeed);
+  const itemId = await createDayItem({
+    tripId,
+    date: '2026-11-02',
+    kind: 'food',
+    title: '拉麵',
+    order: 10,
+  });
+  const expenseId = await createExpense({
+    tripId,
+    dayItemId: itemId,
+    date: '2026-11-02',
+    amount: 900,
+    currency: 'JPY',
+    rateToBase: 0.235,
+    category: 'food',
+  });
+  const [photoId] = await addPhotos([{ tripId, dayItemId: itemId, raster, source: 'device' }]);
+  return { tripId, itemId, expenseId, photoId };
+}
+
+describe('刪除記號（tombstone）', () => {
+  it('刪掉旅行會替四張表各留一筆記號，並跟著匯出檔走出去', async () => {
+    const { tripId, itemId, expenseId, photoId } = await seeded();
+    await deleteTrip(tripId);
+
+    const markers = await db.tombstones.toArray();
+    const byId = new Map(markers.map((m) => [m.id, m.kind]));
+    expect([...byId.keys()].sort()).toEqual([expenseId, itemId, photoId, tripId].sort());
+    expect(byId.get(tripId)).toBe('trips');
+    expect(byId.get(itemId)).toBe('dayItems');
+    expect(byId.get(expenseId)).toBe('expenses');
+    expect(byId.get(photoId)).toBe('photos');
+    for (const m of markers) expect(Date.parse(m.deletedAt)).not.toBeNaN();
+
+    // 匯出（同步推的就是這份）要帶著記號，否則另一端下次推並集就又長回來
+    const dump = await exportBackup();
+    expect(dump.tombstones?.map((m) => m.id).sort()).toEqual([...byId.keys()].sort());
+    // 只推不含照片的那份也要有
+    expect((await exportBackup({ excludePhotos: true })).tombstones).toHaveLength(4);
+  });
+
+  it('刪行程項只替「真的消失的」記號：改掛到旅行的支出不算', async () => {
+    const { tripId, itemId, expenseId, photoId } = await seeded();
+    await deleteDayItem(itemId);
+
+    const markers = await db.tombstones.toArray();
+    expect(markers.map((m) => m.id).sort()).toEqual([itemId, photoId].sort());
+    expect(markers.find((m) => m.id === itemId)?.kind).toBe('dayItems');
+    expect(markers.find((m) => m.id === photoId)?.kind).toBe('photos');
+    // 支出還在、而且不記刪除記號：它只是改掛到那趟旅行下面
+    expect(await db.expenses.get(expenseId)).toBeTruthy();
+    expect(await db.expenses.get(expenseId)).toHaveProperty('dayItemId', null);
+    expect(await db.trips.get(tripId)).toBeTruthy();
+  });
+
+  it('刪單筆支出與刪照片都留下對應記號', async () => {
+    const { expenseId, photoId } = await seeded();
+    await deleteExpense(expenseId);
+    await removePhotos([photoId]);
+
+    const markers = await db.tombstones.toArray();
+    expect(markers.map((m) => `${m.kind}:${m.id}`).sort()).toEqual(
+      [`expenses:${expenseId}`, `photos:${photoId}`].sort(),
+    );
+  });
+
+  it('合併匯入時，本機已有的記號會擋住備份檔帶回來的舊紀錄', async () => {
+    const { tripId } = await seeded();
+    const before = await exportBackup(); // 刪之前先存一份「舊檔」
+    await deleteTrip(tripId);
+    expect(await db.trips.count()).toBe(0);
+
+    // 拿舊檔合併回來：那一趟與它的行程項不該復活
+    await importBackup(JSON.parse(JSON.stringify({ ...before, tombstones: [] })) as typeof before, 'merge');
+    expect(await db.trips.count()).toBe(0);
+    expect(await db.dayItems.count()).toBe(0);
+  });
+
+  it('檔案自己帶著記號時，換一台什麼都還沒記的裝置也擋得住', async () => {
+    const { tripId } = await seeded();
+    // 另一台裝置推上來的文件：那一趟還寫在列裡，但它已經記下這筆被刪了
+    const withMarker = {
+      ...(await exportBackup()),
+      tombstones: [{ id: tripId, kind: 'trips' as const, deletedAt: new Date().toISOString() }],
+    };
+    await reset(); // 本機假裝是剛拿到的新裝置：沒那些列，也沒有記號
+    await importBackup(withMarker, 'merge');
+    expect(await db.trips.count()).toBe(0);
+    expect(await db.dayItems.count()).toBe(0); // 連動：旅行沒了，它底下的列也不會進來
+    expect(await db.expenses.count()).toBe(0);
+    expect(await db.photos.count()).toBe(0);
+    expect((await db.tombstones.toArray()).map((m) => m.id)).toEqual([tripId]);
+  });
+
+  it('取代模式以檔案為全部事實：連本機記號一起清掉，資料回得來', async () => {
+    const { tripId } = await seeded();
+    const dump = await exportBackup();
+    await deleteTrip(tripId);
+
+    // 檔案裡那一趟還在、記號卻不在：靠本機那四筆記號把它擋在門外
+    await importBackup(dump, 'merge');
+    expect(await db.trips.count()).toBe(0);
+
+    // 換成「取代」：這台裝置決定以那份檔案為全部事實，記號一併清空，資料就回來了
+    await importBackup(dump, 'replace');
+    expect(await db.trips.count()).toBe(1);
+    expect(await db.dayItems.count()).toBe(1);
+    expect(await db.tombstones.count()).toBe(0); // 那份檔案是刪除之前存的，裡面本來就沒有記號
+  });
+
+  it('清空裝置不會把刪除記號一起清掉', async () => {
+    const { tripId } = await seeded();
+    await deleteTrip(tripId);
+    const n = await db.tombstones.count();
+    expect(n).toBe(4);
+
+    await clearAll();
+    expect(await db.trips.count()).toBe(0);
+    // 記號留著：不然下次同步會把使用者刪過的東西從歷史快照裡帶回來
+    expect(await db.tombstones.count()).toBe(n);
   });
 });

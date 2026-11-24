@@ -165,6 +165,11 @@ export function SyncCard() {
     }
   }
 
+  /** 這次有沒有清掉已刪的列：0 就閉嘴，不然使用者會以為同步把自己的東西吃掉了 */
+  function deletedNote(r: SyncReport): string {
+    return r.deleted > 0 ? ` · ${t('sync.deletedRows', { n: r.deleted })}` : '';
+  }
+
   function showReport(r: SyncReport, label: string) {
     setReport(r);
     setAt(r.at);
@@ -175,7 +180,7 @@ export function SyncCard() {
         pExp: r.pulled.expenses,
         nTrips: r.pushed.trips,
         photos: r.photosDownloaded,
-      })}`,
+      })}${deletedNote(r)}`,
     );
   }
 
@@ -392,6 +397,7 @@ export function SyncCard() {
             nTrips: report.pushed.trips,
             photos: report.photosDownloaded,
           })}
+          {deletedNote(report)}
           {' · '}
           {kb(report.remoteBytes)} KB
         </p>

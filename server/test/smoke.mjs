@@ -253,6 +253,106 @@ await check('拒絕缺少 trips 的 payload', async () => {
   assert.equal(r.status, 400);
 });
 
+// —— 刪除記號（tombstone）——
+// 合併規則本身在 merge-core 的單元測試裡驗過了，這裡要驗的是「帳本」那一層：
+// 基準檔是 20 份歷史快照的並集，所以記號一定要能壓住**歷史裡**的那些列，
+// 而且壓住的範圍要往下連動。這一節自己開 id（trip_d*），不去動 trip_a/trip_b，
+// 免得後面那些照片張數、列表計數的斷言跟著變。
+// 記號的效期用現在的時間算，不用上面那條 anchored 在 2026-01-01 的 iso()：
+// 後者跑著跑著就會自己過期，斷言會變成跟「哪天執行測試」有關。
+const fresh = (daysAgo = 0) => new Date(Date.now() - daysAgo * 86400000).toISOString();
+const doomed = {
+  format: 'triplog-backup',
+  version: 1,
+  exportedAt: iso(1),
+  trips: [{ id: 'trip_d1', name: 'Delete me', startDate: '2026-06-01', endDate: '2026-06-02', baseCurrency: 'TWD', archived: false, createdAt: iso(0), updatedAt: iso(0) }],
+  dayItems: [{ id: 'item_d1', tripId: 'trip_d1', date: '2026-06-01', kind: 'food', title: 'Dinner', order: 10, createdAt: iso(0), updatedAt: iso(0) }],
+  expenses: [{ id: 'exp_d1', tripId: 'trip_d1', dayItemId: 'item_d1', date: '2026-06-01', amount: 100, currency: 'TWD', rateToBase: 1, baseAmount: 100, category: 'cat-transport', payee: '', createdAt: iso(0), updatedAt: iso(0) }],
+  categories: [],
+  photos: [],
+  meta: [],
+};
+
+console.log('\n— 刪除記號：刪掉的不會被歷史快照帶回來');
+await check('推送帶著記號時，基準檔把那趟連同底下的列一起拿掉', async () => {
+  assert.equal((await api('/api/backup', { method: 'POST', body: doomed })).status, 200);
+  assert.equal((await api('/api/trips/trip_d1')).status, 200, '先確認推得進去');
+  const r = await api('/api/sync', {
+    method: 'POST',
+    body: { trips: [], tombstones: [{ id: 'trip_d1', kind: 'trips', deletedAt: fresh(1) }] },
+  });
+  assert.equal(r.status, 200, r.text);
+  const base = await api('/api/base');
+  const b = base.json.base;
+  assert.equal(b.trips.some((t) => t.id === 'trip_d1'), false, '那一趟還留在基準裡');
+  // 只壓旅行自己不夠：另一端推上來的是並集，孤兒列會以「看不見的資料」繼續佔著統計
+  assert.equal(b.dayItems.some((i) => i.id === 'item_d1'), false, '記號要往下連動：行程項也跟著消失');
+  assert.equal(b.expenses.some((e) => e.id === 'exp_d1'), false, '支出也跟著');
+  assert.ok(b.tombstones.some((m) => m.id === 'trip_d1' && m.kind === 'trips'), '記號本身要留在基準裡，下一台推上來才壓得住');
+});
+await check('另一端推上來的舊並集，不會把刪掉的那趟復活', async () => {
+  // simulate device B：它手上還是刪除之前的整份備份，連記號都不知道
+  const stale = JSON.parse(JSON.stringify(doomed));
+  const r = await api('/api/backup', { method: 'POST', body: stale });
+  assert.equal(r.status, 200, r.text);
+  const base = await api('/api/base');
+  assert.equal(base.json.base.trips.some((t) => t.id === 'trip_d1'), false, '舊快照又把那一趟帶回來了');
+  assert.equal(base.json.base.expenses.some((e) => e.id === 'exp_d1'), false);
+  assert.equal((await api('/api/trips/trip_d1')).status, 404, '單趟讀取也要跟著看不见');
+});
+await check('沒送 kind 時由 id 前綴推（舊客戶端只送 id）', async () => {
+  const r = await api('/api/sync', { method: 'POST', body: { trips: [], tombstones: [{ id: 'item_d1', deletedAt: fresh(1) }] } });
+  assert.equal(r.status, 200, r.text);
+  const marker = (await api('/api/base')).json.base.tombstones.find((m) => m.id === 'item_d1');
+  assert.equal(marker?.kind, 'dayItems');
+  assert.equal((await api('/api/base')).json.base.dayItems.some((i) => i.id === 'item_d1'), false);
+});
+await check('髒記號（缺 id、時間看不懂、推不出表名）丟掉，也不影響好的那幾筆', async () => {
+  const r = await api('/api/sync', {
+    method: 'POST',
+    body: {
+      trips: [],
+      tombstones: [
+        { kind: 'trips', deletedAt: fresh(1) }, // 沒有 id
+        { id: 'trip_d2' }, // 沒有 deletedAt
+        { id: 'wat_1', kind: 'nope', deletedAt: fresh(1) }, // 推不出表名
+        'not-an-object',
+      ],
+    },
+  });
+  assert.equal(r.status, 200, r.text);
+  const list = (await api('/api/base')).json.base.tombstones;
+  assert.deepEqual(list.filter((m) => m.id === 'trip_d2' || m.id === 'wat_1' || !m.id), []);
+  assert.ok(list.some((m) => m.id === 'trip_d1'), '髒資料不能把好端端的記號頂掉');
+});
+await check('超過保存期的記號放它過去，也不跟著輸出', async () => {
+  const old = JSON.parse(JSON.stringify(doomed));
+  old.trips[0].id = 'trip_d3';
+  old.trips[0].name = 'Ancient marker';
+  old.dayItems = [];
+  old.expenses = [];
+  assert.equal((await api('/api/backup', { method: 'POST', body: old })).status, 200);
+  const r = await api('/api/sync', {
+    method: 'POST',
+    body: { trips: [], tombstones: [{ id: 'trip_d3', kind: 'trips', deletedAt: fresh(400) }] },
+  });
+  assert.equal(r.status, 200, r.text);
+  const base = await api('/api/base');
+  assert.ok(base.json.base.trips.some((t) => t.id === 'trip_d3'), '一年前的記號不該永久壓著別人的資料');
+  assert.equal(base.json.base.tombstones.some((m) => m.id === 'trip_d3'), false, '過期的記號不必一直帶著走');
+});
+await check('記號上限只管單次上傳：一次推 6000 筆只留最新的 5000 筆', async () => {
+  const many = Array.from({ length: 6000 }, (_, i) => ({ id: `trip_m${i}`, kind: 'trips', deletedAt: fresh(i / 1000) }));
+  const r = await api('/api/sync', { method: 'POST', body: { trips: [], tombstones: many } });
+  assert.equal(r.status, 200, r.text);
+  const list = (await api('/api/base')).json.base.tombstones;
+  // 合併取並集，所以基準可能比單檔上限多幾筆（上一輪那兩個 id 是別次推上來的）
+  assert.equal(list.filter((m) => m.id.startsWith('trip_m')).length, 5000, '裁掉的是最舊的那 1000 筆');
+  assert.ok(list.some((m) => m.id === 'trip_m0'), '最新的要留著');
+  assert.equal(list.some((m) => m.id === 'trip_m5999'), false, '最舊的那筆要被裁掉');
+  assert.ok(list.some((m) => m.id === 'trip_d1' && m.kind === 'trips'), '上限不能把上一輪的記號擠掉');
+});
+
 console.log('\n— 照片下載與裁剪');
 await check('POST /api/photos/get 依 id 回 base64', async () => {
   const r = await api('/api/photos/get', { method: 'POST', body: { photoIds: ['photo_a1'] } });
@@ -452,6 +552,24 @@ await check('同行者寫的會進基準檔，擁有者下次同步讀得到', a
   assert.equal(shared.json.totals.expenses, beforeShared.expenses + 2);
   assert.equal(shared.json.totals.baseAmount, Math.round((beforeShared.base + 180 + 1500) * 100) / 100);
 });
+await check('共筆只追加：同行者硬塞的記號動不到擁有者的資料', async () => {
+  const before = (await api('/api/base')).json.base;
+  const r = await api(`/api/share/${shareToken}/expense`, {
+    key: null,
+    method: 'POST',
+    body: {
+      amount: 100,
+      date: '2026-03-02',
+      currency: 'TWD',
+      // 一把只能記支出的連結，不該有宣布刪除的能力：這欄會被整段忽略
+      tombstones: [{ id: 'trip_a', kind: 'trips', deletedAt: fresh(0) }],
+    },
+  });
+  assert.equal(r.status, 200, r.text);
+  const base = (await api('/api/base')).json.base;
+  assert.ok(base.trips.some((t) => t.id === 'trip_a'), '擁有者那一趟不能因為同行者塞了記號就消失');
+  assert.deepEqual(base.tombstones, before.tombstones, '共筆寫入既不生記號，也不把已有的弄丟');
+});
 await check('GET /api/shares 列出連結與開過/寫過的次數', async () => {
   const r = await api('/api/shares?tripId=trip_a');
   assert.equal(r.status, 200);
@@ -482,9 +600,11 @@ await check('期限與生死的純函式', async () => {
   assert.equal(expiresAtFrom('never'), null);
   assert.ok(expiresAtFrom(undefined) > new Date().toISOString(), '不給值就預設 90 天');
   assert.throws(() => expiresAtFrom(9999), /365/);
+  // 共筆那條路只追加：tombstones 一定是空陣列，這條路生不出刪除記號
   assert.deepEqual(Object.keys(partial('expenses', { id: 'exp_x' })), [
-    'format', 'version', 'exportedAt', 'trips', 'dayItems', 'expenses', 'categories', 'photos', 'meta',
+    'format', 'version', 'exportedAt', 'trips', 'dayItems', 'expenses', 'categories', 'photos', 'tombstones', 'meta',
   ]);
+  assert.deepEqual(partial('expenses', { id: 'exp_x' }).tombstones, []);
   assert.equal(partial('dayItems', { id: 'item_x' }).expenses.length, 0);
 });
 await check('API token 的純函式：形勢判斷、層級、生死', async () => {

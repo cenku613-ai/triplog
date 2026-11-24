@@ -132,6 +132,23 @@ export interface CurrencyDef {
   decimals: number;
 }
 
+/**
+ * 刪除記號（tombstone）：`deleteTrip()` 那些函式除了把列從 IndexedDB 拿掉，
+ * 還會留下這一筆，跟著每次同步推出去。合併時照它把列從結果裡濾掉，
+ * 「一端刪掉、另一端下次同步又帶回來」這件事才不會再發生。
+ *
+ * kind 只涵蓋會隨旅行增刪的四張表；分類與 meta 不參與（見 merge-core.js 頂端的說明）。
+ */
+export type TombKind = 'trips' | 'dayItems' | 'expenses' | 'photos';
+
+export interface Tombstone {
+  /** 被刪掉的那一列的 id（跨表唯一，前綴就看得出是哪張表） */
+  id: string;
+  kind: TombKind;
+  /** 在哪個時間點被刪：比這還舊的編輯不會讓紀錄復活（刪除獲勝） */
+  deletedAt: ISODateTime;
+}
+
 export interface BackupFile {
   format: 'triplog-backup';
   /** 1 = 純文字資料；2 起含照片（base64） */
@@ -142,5 +159,7 @@ export interface BackupFile {
   expenses: Expense[];
   categories: Category[];
   photos?: BackupPhoto[];
+  /** 刪除記號。舊備份檔沒這個欄位，讀取端一律要當空陣列 */
+  tombstones?: Tombstone[];
   meta: MetaEntry[];
 }

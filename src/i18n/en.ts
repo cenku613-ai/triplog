@@ -477,6 +477,7 @@ export const en: Dict = {
   'sync.lastAt': 'Last sync: {when}',
   'sync.never': 'Never synced',
   'sync.report': 'Pulled {pTrips?trip|trips}, {pItems?item|items}, {pExp?expense|expenses} · pushed {nTrips?trip|trips} · {photos?photo|photos} downloaded',
+  'sync.deletedRows': '{n?row|rows} removed by delete markers',
   'sync.needSetup': 'Set the server URL and key in Settings first.',
   'sync.photoWarn': 'Pushing also uploads your photos (with Wikimedia credits), and any key holder can read everything on the server.',
   'sync.remoteTrips': 'Trips on the server',

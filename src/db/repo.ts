@@ -7,12 +7,27 @@ import type {
   Expense,
   Photo,
   RateMap,
+  TombKind,
   Trip,
 } from './types';
 import { currencyDef, rateKey, rememberCurrency, roundTo } from './currency';
 import { t } from '../i18n';
 import { blobToDataUrl, dataUrlToBlob, type Raster } from '../lib/images';
+import { suppressDeleted, tombstone } from '../lib/merge-core';
 import type { ISODate } from './types';
+
+/* ------------------------------------------------------------- 刪除記號 */
+
+/**
+ * 記下「這幾列被刪了」，讓刪除變成會同步的資料，而不只是本機的一次消失。
+ * 一定要在呼叫端的交易裡用：記號與列的消失要同一筆提交，
+ * 否則中途關掉瀏覽器就會留下「列還在、記號也沒記」的狀態，下次同步又會把它復活。
+ */
+async function markDeleted(rows: { id: string; kind: TombKind }[]): Promise<void> {
+  if (!rows.length) return;
+  const at = now();
+  await db.tombstones.bulkPut(rows.map((r) => tombstone(r.id, r.kind, at)));
+}
 
 /* ------------------------------------------------------------------ trips */
 
@@ -34,13 +49,33 @@ export async function updateTrip(id: string, patch: Partial<Trip>): Promise<void
   );
 }
 
+/**
+ * 刪掉一趟旅行，連同它底下的行程項、支出、照片。
+ * 四張表都要記刪除記號：只有旅行記號的話，另一端推上來的並集仍會把那些列帶回來，
+ * 變成「旅行不見了但它的支出又長出來」這種最難解釋的狀態。
+ */
 export async function deleteTrip(id: string): Promise<void> {
-  await db.transaction('rw', [db.trips, db.dayItems, db.expenses, db.photos], async () => {
-    await db.dayItems.where('tripId').equals(id).delete();
-    await db.expenses.where('tripId').equals(id).delete();
-    await db.photos.where('tripId').equals(id).delete();
-    await db.trips.delete(id);
-  });
+  await db.transaction(
+    'rw',
+    [db.trips, db.dayItems, db.expenses, db.photos, db.tombstones],
+    async () => {
+      const [itemIds, expenseIds, photoIds] = await Promise.all([
+        db.dayItems.where('tripId').equals(id).primaryKeys(),
+        db.expenses.where('tripId').equals(id).primaryKeys(),
+        db.photos.where('tripId').equals(id).primaryKeys(),
+      ]);
+      await db.dayItems.where('tripId').equals(id).delete();
+      await db.expenses.where('tripId').equals(id).delete();
+      await db.photos.where('tripId').equals(id).delete();
+      await db.trips.delete(id);
+      await markDeleted([
+        { id, kind: 'trips' },
+        ...itemIds.map((i) => ({ id: String(i), kind: 'dayItems' as const })),
+        ...expenseIds.map((e) => ({ id: String(e), kind: 'expenses' as const })),
+        ...photoIds.map((p) => ({ id: String(p), kind: 'photos' as const })),
+      ]);
+    },
+  );
 }
 
 /* -------------------------------------------------------------- day items */
@@ -60,13 +95,19 @@ export async function updateDayItem(id: string, patch: Partial<DayItem>): Promis
 
 /** 刪行程項，但保留掛在它下面的支出（降為只屬於這趟旅行）；照片跟著刪，不留孤兒 Blob */
 export async function deleteDayItem(id: string): Promise<void> {
-  await db.transaction('rw', [db.dayItems, db.expenses, db.photos], async () => {
+  await db.transaction('rw', [db.dayItems, db.expenses, db.photos, db.tombstones], async () => {
+    const photoIds = await db.photos.where('dayItemId').equals(id).primaryKeys();
     await db.expenses
       .where('dayItemId')
       .equals(id)
       .modify({ dayItemId: null, updatedAt: now() });
     await db.photos.where('dayItemId').equals(id).delete();
     await db.dayItems.delete(id);
+    // 改掛出去的支出並沒有被刪，不記刪除記號；只有真的消失的（這一項與它的照片）才記
+    await markDeleted([
+      { id, kind: 'dayItems' },
+      ...photoIds.map((p) => ({ id: String(p), kind: 'photos' as const })),
+    ]);
   });
 }
 
@@ -133,9 +174,13 @@ export async function addPhotos(inputs: PhotoInput[]): Promise<string[]> {
   return rows.map((r) => r.id);
 }
 
+/** 刪照片（相本牆與單張都走這裡）：Blob 跟著列一起清掉，記號讓它不會被別台帶回來 */
 export async function removePhotos(ids: string[]): Promise<void> {
   if (ids.length === 0) return;
-  await db.photos.bulkDelete(ids);
+  await db.transaction('rw', [db.photos, db.tombstones], async () => {
+    await db.photos.bulkDelete(ids);
+    await markDeleted(ids.map((id) => ({ id, kind: 'photos' as const })));
+  });
 }
 
 export async function listPhotosOfDayItem(dayItemId: string): Promise<Photo[]> {
@@ -216,7 +261,10 @@ export async function updateExpense(id: string, draft: ExpenseDraft): Promise<vo
 
 export async function deleteExpense(id: string): Promise<void> {
   const row = await db.expenses.get(id);
-  await db.expenses.delete(id);
+  await db.transaction('rw', [db.expenses, db.tombstones], async () => {
+    await db.expenses.delete(id);
+    await markDeleted([{ id, kind: 'expenses' }]);
+  });
   if (row) await touchTrip(row.tripId);
 }
 
@@ -317,13 +365,14 @@ export async function setMeta<T>(key: string, value: T): Promise<void> {
  * 會讓請求膨到幾 MB，所以照片改由 `/api/photos` 單獨按需下載。
  */
 export async function exportBackup(opts: { excludePhotos?: boolean } = {}): Promise<BackupFile> {
-  const [trips, dayItems, expenses, categories, metaRows, photoRows] = await Promise.all([
+  const [trips, dayItems, expenses, categories, metaRows, photoRows, tombstones] = await Promise.all([
     db.trips.toArray(),
     db.dayItems.toArray(),
     db.expenses.toArray(),
     db.categories.toArray(),
     db.meta.toArray(),
     opts.excludePhotos ? Promise.resolve([] as Photo[]) : db.photos.toArray(),
+    db.tombstones.toArray(),
   ]);
   // Blob 進不了 JSON，逐張轉 base64。照片多時會慢幾秒，但只在按匯出時跑一次。
   const photos: BackupPhoto[] = [];
@@ -344,6 +393,8 @@ export async function exportBackup(opts: { excludePhotos?: boolean } = {}): Prom
     expenses,
     categories,
     photos,
+    // 記號要跟著每次匯出走（同步推的也是這份），否則另一端下次推並集就又長回來
+    tombstones,
     meta: metaRows.filter((m) => m.key !== 'app'),
   };
 }
@@ -363,20 +414,37 @@ export function parseBackup(text: string): BackupFile {
 
 export type ImportMode = 'merge' | 'replace';
 
+/**
+ * 匯入備份檔。
+ *
+ * 刪除記號在這裡有兩件事要做，缺一不可：
+ * 1. 照記號把「檔內已刪」的列擋在門外——否則還原一份舊檔等於把使用者刪掉的東西又請回來。
+ * 2. 把記號存進本機——之後的推送要繼續帶著它們。
+ * 「取代」模式額外清掉本機記號：那份檔案就是新的全部事實，留著舊記號會去壓到新資料。
+ */
 export async function importBackup(
   data: BackupFile,
   mode: ImportMode,
 ): Promise<{ trips: number; expenses: number; items: number; photos: number }> {
-  const counts = {
-    trips: data.trips.length,
-    expenses: data.expenses?.length ?? 0,
-    items: data.dayItems?.length ?? 0,
-    photos: data.photos?.length ?? 0,
-  };
+  const counts = { trips: 0, expenses: 0, items: 0, photos: 0 };
   await db.transaction(
     'rw',
-    [db.trips, db.dayItems, db.expenses, db.categories, db.meta, db.photos],
+    [db.trips, db.dayItems, db.expenses, db.categories, db.meta, db.photos, db.tombstones],
     async () => {
+      const markers = data.tombstones ?? [];
+      // 本機那些記號也要算進來（merge 模式）：它們代表這台已經刪掉、而舊檔還不知道的事
+      const localMarkers = mode === 'replace' ? [] : await db.tombstones.toArray();
+      // 一律用下面的區域變數，不要把結果寫回 data：那會動到呼叫端那份文件
+      // （例如測試或 UI 想拿同一份匯入檔跑兩次，第二次就只剩空陣列）
+      const clean = suppressDeleted(data, [{ tombstones: localMarkers }]) as BackupFile;
+      let trips = clean.trips ?? [];
+      let dayItems = clean.dayItems ?? [];
+      let expenses = clean.expenses ?? [];
+      let photos = (clean.photos ?? []).map(photoFromBackup);
+      counts.trips = trips.length;
+      counts.items = dayItems.length;
+      counts.expenses = expenses.length;
+      counts.photos = photos.length;
       if (mode === 'replace') {
         await Promise.all([
           db.trips.clear(),
@@ -384,34 +452,42 @@ export async function importBackup(
           db.expenses.clear(),
           db.photos.clear(),
           db.categories.clear(),
+          db.tombstones.clear(),
           db.meta.where('key')
             .notEqual('app')
             .primaryKeys()
             .then((keys) => db.meta.bulkDelete(keys as string[])),
         ]);
       }
-      if (data.categories?.length) await db.categories.bulkPut(data.categories);
-      if (data.meta?.length) await db.meta.bulkPut(data.meta);
-      let photos = (data.photos ?? []).map(photoFromBackup);
+      if (markers.length) await db.tombstones.bulkPut(markers);
+      if (clean.categories?.length) await db.categories.bulkPut(clean.categories);
+      if (clean.meta?.length) await db.meta.bulkPut(clean.meta);
       if (mode === 'merge') {
         const known = new Set((await db.trips.toArray()).map((t) => t.id));
-        data.trips = data.trips.filter((t) => !known.has(t.id));
+        trips = trips.filter((t) => !known.has(t.id));
         const knownItems = new Set((await db.dayItems.toArray()).map((i) => i.id));
-        data.dayItems = (data.dayItems ?? []).filter((i) => !knownItems.has(i.id));
+        dayItems = dayItems.filter((i) => !knownItems.has(i.id));
         const knownExp = new Set((await db.expenses.toArray()).map((e) => e.id));
-        data.expenses = (data.expenses ?? []).filter((e) => !knownExp.has(e.id));
+        expenses = expenses.filter((e) => !knownExp.has(e.id));
         const knownPhotos = new Set((await db.photos.toArray()).map((p) => p.id));
         photos = photos.filter((p) => !knownPhotos.has(p.id));
       }
-      await db.trips.bulkPut(data.trips);
-      await db.dayItems.bulkPut(data.dayItems ?? []);
-      await db.expenses.bulkPut(data.expenses ?? []);
+      await db.trips.bulkPut(trips);
+      await db.dayItems.bulkPut(dayItems);
+      await db.expenses.bulkPut(expenses);
       if (photos.length) await db.photos.bulkPut(photos);
     },
   );
   return counts;
 }
 
+/**
+ * 清空這台裝置的記錄。
+ *
+ * 刻意**不動**刪除記號：它們代表使用者明確刪過的東西，清掉就等於把那些紀錄的死刑改成緩刑，
+ * 下次同步會被歷史快照帶回來。真的想全部要回來請用「匯入備份（取代）」，
+ * 那個模式會連記號一起清（見 importBackup）。
+ */
 export async function clearAll(): Promise<void> {
   await db.transaction('rw', [db.trips, db.dayItems, db.expenses, db.photos], async () => {
     await db.expenses.clear();

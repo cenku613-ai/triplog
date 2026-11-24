@@ -278,6 +278,9 @@ export function partialOf(table, row) {
     expenses: table === 'expenses' ? [row] : [],
     categories: [],
     photos: [],
+    // 共筆與訪客連結只追加，永不宣佈刪除：留空陣列是故意的，
+    // 讓這條路不可能透過 tombstone 動到別人的記錄（合併端把缺欄位當空集合）
+    tombstones: [],
     meta: [],
   };
 }

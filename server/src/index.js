@@ -200,6 +200,12 @@ const SCHEMA_HINT = {
     createdAt: 'ISO',
     updatedAt: 'ISO',
   },
+  tombstone: {
+    id: 'the id that was deleted (trip_/item_/exp_/photo_ prefix says which table)',
+    kind: 'trips|dayItems|expenses|photos',
+    deletedAt: 'ISO',
+    note: 'this is how deletion reaches the server: there is no delete endpoint, only these markers, honoured for 365 days',
+  },
   shareWrite: {
     via: 'POST /api/share/<token>/expense  |  /api/share/<token>/item  (no bearer token needed)',
     expense: {
@@ -235,8 +241,8 @@ const SCHEMA_HINT = {
   },
   notes: [
     'Write via POST /api/backup with a full triplog-backup document; the server merges by id and keeps the newest updatedAt.',
-    'Prefer POST /api/sync with a partial document {trips: [], dayItems?, expenses?, categories?, photos?} so you never overwrite rows you did not read; the arrays you leave out must be [] (missing trips is treated as a malformed upload, not as an empty one).',
-    'There is no delete endpoint by design. To archive a trip set archived=true.',
+    'Prefer POST /api/sync with a partial document {trips: [], dayItems?, expenses?, categories?, photos?, tombstones?, meta?} so you never overwrite rows you did not read; the arrays you leave out must be [] (missing trips is treated as a malformed upload, not as an empty one).',
+    'There is no delete endpoint by design. Deleting a trip or a row is done by the client that owns it: it removes the row locally and adds {"id","kind","deletedAt"} to tombstones, which merges like any other data — the server then drops that row (plus the children of a deleted trip) from every read, and history snapshots keep the bytes. Markers older than 365 days stop suppressing. To hide a trip without deleting it, set archived=true.',
     'Amounts stay in the original currency; baseAmount is what statistics use.',
     'Sharing: POST /api/shares {tripId,expiresInDays} (needs the key) mints a trip-scoped token; GET /api/share/<token> reads that trip only and POST /api/share/<token>/expense|item appends to it without any key. POST /api/shares/revoke {token} kills a link; it revokes a grant, not data.',
     'API tokens: POST /api/tokens {label,scope:read|write,expiresInDays,account?} mints a revocable bearer (shown once, stored hashed); GET /api/tokens lists them and POST /api/tokens/revoke {id} retires one. The master key may mint/list/revoke across the whole server; a signed-in device (tls_ session) may do the same for its own account only, and cannot choose whose ledger the token points at. An issued token can never mint or wipe either way.',
