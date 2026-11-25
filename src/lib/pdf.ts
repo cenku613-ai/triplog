@@ -3,6 +3,7 @@ import type { Category, DayItem, Expense, Trip } from '../db/types';
 import { t, tRaw, lang } from '../i18n';
 import { dayLabel, formatDuration, prettyDate } from './dates';
 import { categoryLabel, expenseLabel } from './labels';
+import { isValidLatLng } from './places';
 import type { TripSummary } from './stats';
 
 /**
@@ -52,6 +53,7 @@ export type PrintInput = {
   sections: PdfSections;
   photos?: PrintPhoto[];
   mapImage?: string | null;
+  itemMaps?: Record<string, string | null>;
 };
 
 export function esc(value: unknown): string {
@@ -87,8 +89,8 @@ a { color: #1d4ed8; text-decoration: none; }
 .metric { flex: 1 1 120px; border: 1px solid #d7dce3; border-radius: 8px; padding: 8px 10px; }
 .metric .k { font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px; color: #5b6674; }
 .metric .v { font-size: 17px; font-weight: 700; margin-top: 2px; }
-.day { margin-top: 16px; break-inside: avoid; }
-.day-head { display: flex; align-items: baseline; gap: 8px; border-left: 4px solid #0f766e; padding-left: 8px; }
+.day { margin-top: 16px; }
+.day-head { display: flex; align-items: baseline; gap: 8px; border-left: 4px solid #0f766e; padding-left: 8px; break-after: avoid; }
 .day-head b { font-size: 14px; }
 .item { padding: 8px 0 8px 12px; border-bottom: 1px dashed #e3e7ec; break-inside: avoid; }
 .item:last-child { border-bottom: 0; }
@@ -107,6 +109,10 @@ figure { margin: 0; break-inside: avoid; }
 .gallery img { width: 100%; height: 118px; object-fit: cover; border-radius: 6px; display: block; }
 figcaption { font-size: 10.5px; color: #5b6674; margin-top: 3px; }
 .mapshot img { width: 100%; border-radius: 8px; display: block; border: 1px solid #d7dce3; }
+.item-map { margin-top: 9px; }
+.item-map img { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border: 1px solid #d7dce3; border-radius: 7px; display: block; }
+.item-map figcaption { display: flex; justify-content: space-between; gap: 8px; }
+.item-map-missing { margin-top: 6px; font-size: 10.5px; color: #5b6674; }
 .legend { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; font-size: 11px; }
 .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 4px; }
 .toolbar {
@@ -198,6 +204,12 @@ function itinerarySection(input: PrintInput): string {
         const when = formatDuration(item.startTime, item.endTime);
         const note = item.note?.trim();
         const place = item.location?.trim();
+        const itemMap = input.sections.map ? input.itemMaps?.[item.id] : undefined;
+        const mapBlock = itemMap
+          ? `<figure class="item-map"><img src="${esc(itemMap)}" alt="${esc(t('print.pointMap', { title: item.title }))}" loading="eager"><figcaption><span>${esc(t('print.mapTitle'))}</span><span>${esc(t('map.attribution'))}</span></figcaption></figure>`
+          : input.sections.map && isValidLatLng(item.lat, item.lng)
+            ? `<div class="item-map-missing">${esc(t('print.pointMapMissing'))}</div>`
+            : '';
         return (
           '<div class="item"><div class="top">' +
           (when ? `<span class="when">${esc(when)}</span>` : '') +
@@ -219,6 +231,7 @@ function itinerarySection(input: PrintInput): string {
                 )
                 .join(' / ')}</div>`
             : '') +
+          mapBlock +
           '</div>'
         );
       })

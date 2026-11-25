@@ -97,18 +97,27 @@ export function PrintDialog({
       }
 
       let mapImage: string | null = null;
+      const itemMaps: Record<string, string | null> = {};
       if (sections.map) {
         setBusy(t('print.mapWorking'));
+        const { captureMap } = await import('../../lib/mapshot');
         const points = geoPoints(items, trip.startDate);
-        if (points.length) {
-          const { captureMap } = await import('../../lib/mapshot');
-          mapImage = (await captureMap(points))?.dataUrl ?? null;
+        if (points.length) mapImage = (await captureMap(points))?.dataUrl ?? null;
+        for (let start = 0; sections.itinerary && start < points.length; start += 3) {
+          const batch = points.slice(start, start + 3);
+          setBusy(t('print.pointMapWorking', { i: start + 1, n: points.length }));
+          await Promise.all(
+            batch.map(async (point) => {
+              const shot = await captureMap([point], { width: 640, height: 360, timeoutMs: 8_000 });
+              itemMaps[point.item.id] = shot?.dataUrl ?? null;
+            }),
+          );
         }
       }
 
       setBusy(t('print.working'));
       setHtml(
-        buildPrintHtml({ trip, items, expenses, categories, summary, sections, photos, mapImage }),
+        buildPrintHtml({ trip, items, expenses, categories, summary, sections, photos, mapImage, itemMaps }),
       );
     } catch (err) {
       toast(`${t('print.working')}：${(err as Error)?.message ?? String(err)}`, { kind: 'error' });

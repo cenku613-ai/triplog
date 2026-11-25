@@ -338,7 +338,7 @@ export async function logout({ baseUrl, token }: Pick<AccountState, 'baseUrl' | 
 
 type GsiCallback = (resp: { credential?: string }) => void;
 
-interface GsiId {
+export interface GsiId {
   initialize: (o: {
     client_id: string;
     ux_mode: 'popup';
@@ -347,7 +347,11 @@ interface GsiId {
     cancel_on_tap_outside?: boolean;
   }) => void;
   renderButton: (parent: HTMLElement, options: Record<string, string | number>) => void;
-  prompt: (listener?: (state: { isNotDisplayed: () => boolean; isSkippedMoment: () => boolean }) => void) => void;
+  prompt: (listener?: (state: {
+    isNotDisplayed: () => boolean;
+    isSkippedMoment: () => boolean;
+    isDismissedMoment: () => boolean;
+  }) => void) => void;
   dismissCancelPrompt: () => void;
 }
 
@@ -409,6 +413,22 @@ export async function mountGoogleButton(
   return () => {
     parent.replaceChildren();
   };
+}
+
+export async function initializeGoogleSignIn(
+  opts: { clientId: string; onCredential: (token: string) => void },
+): Promise<{ prompt: GsiId['prompt'] }> {
+  const gsi = await loadGsi();
+  gsi.initialize({
+    client_id: opts.clientId,
+    ux_mode: 'popup',
+    auto_select: false,
+    cancel_on_tap_outside: true,
+    callback: (resp) => {
+      if (resp?.credential) opts.onCredential(resp.credential);
+    },
+  });
+  return { prompt: (listener) => gsi.prompt(listener) };
 }
 
 /* ------------------------------------------------------------ 登入與登出 */

@@ -6,8 +6,8 @@
  * 2. 離線時有一條生路（`auth.skip`）——這是一個離線先用的記帳 app，沒網路就不給看
  *    自己的筆記，比多按一次登入嚴重太多。
  *
- * Google 那顆按鈕由官方腳本畫（自己畫一顆不能取用它的標誌），我們只接 callback 拿到
- * ID token，再交給後端驗簽換 session。整個過程 app 不經手任何 client_secret。
+ * Google 按鈕使用官方四色 G 標誌與自訂外觀。點擊後仍由 Google Identity 彈窗驗證，
+ * app 只拿 ID token 給後端驗簽換 session，不經手任何 client_secret。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useI18n } from '../../i18n';
@@ -21,9 +21,10 @@ import {
   finishLogin,
   loadAccount,
   loginWithGoogle,
-  mountGoogleButton,
+  initializeGoogleSignIn,
   sameOriginBase,
   type AuthConfig,
+  type GsiId,
 } from '../../lib/account';
 
 type Phase = 'probing' | 'signin' | 'other';
@@ -37,8 +38,10 @@ export function LoginGate({ onSkip, skipLabel }: { onSkip: () => void; skipLabel
   const [phase, setPhase] = useState<Phase>(server ? 'probing' : 'signin');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const host = useRef<HTMLDivElement>(null);
-  const detach = useRef<(() => void) | null>(null);
+  const [googleReady, setGoogleReady] = useState(false);
+  const [googleFailed, setGoogleFailed] = useState(false);
+  const prompt = useRef<GsiId['prompt'] | null>(null);
+  const credentialStarted = useRef(false);
 
   // 問一次這台部署的模式：只有它回「account」才有必要顯示 Google 按鈕
   useEffect(() => {
@@ -68,6 +71,7 @@ export function LoginGate({ onSkip, skipLabel }: { onSkip: () => void; skipLabel
 
   const signIn = useCallback(
     async (credential: string) => {
+      credentialStarted.current = true;
       setBusy(true);
       setError('');
       try {
@@ -77,6 +81,7 @@ export function LoginGate({ onSkip, skipLabel }: { onSkip: () => void; skipLabel
         window.location.hash = '#/';
         window.location.reload();
       } catch (err) {
+        credentialStarted.current = false;
         setError(describeAuthError(err, t));
         setBusy(false);
       }
@@ -84,30 +89,53 @@ export function LoginGate({ onSkip, skipLabel }: { onSkip: () => void; skipLabel
     [server, t],
   );
 
-  // Client ID 到手才掛按鈕；卸掉時要把官方腳本塞進來的節點清乾淨
+  // 預先載入 Google 腳本，按鈕一點擊就立刻 prompt，不因非同步載入而失去手勢。
   useEffect(() => {
-    if (phase !== 'signin' || !cfg?.clientId || !host.current) return;
-    const node = host.current;
+    if (phase !== 'signin' || !cfg?.clientId) {
+      setGoogleReady(false);
+      setGoogleFailed(false);
+      prompt.current = null;
+      return;
+    }
     let dead = false;
-    mountGoogleButton(node, {
+    setGoogleReady(false);
+    setGoogleFailed(false);
+    initializeGoogleSignIn({
       clientId: cfg.clientId,
-      locale: lang === 'en' ? 'en' : 'zh-TW',
       onCredential: (token) => void signIn(token),
     })
-      .then((fn) => {
-        if (dead) fn();
-        else detach.current = fn;
+      .then((next) => {
+        if (dead) return;
+        prompt.current = next.prompt;
+        setGoogleReady(true);
       })
       .catch((err) => {
-        if (!dead) setError(describeAuthError(err, t));
+        if (!dead) {
+          setGoogleFailed(true);
+          setError(describeAuthError(err, t));
+        }
       });
     return () => {
       dead = true;
-      detach.current?.();
-      detach.current = null;
-      node.replaceChildren();
+      prompt.current = null;
     };
-  }, [phase, cfg?.clientId, lang, signIn, t]);
+  }, [phase, cfg?.clientId, signIn, t]);
+
+  function openGoogle() {
+    if (!prompt.current || busy) return;
+    credentialStarted.current = false;
+    setBusy(true);
+    setError('');
+    prompt.current((state) => {
+      if (credentialStarted.current) return;
+      if (state.isNotDisplayed()) {
+        setError(t('auth.errUnknown'));
+        setBusy(false);
+      } else if (state.isSkippedMoment() || state.isDismissedMoment()) {
+        setBusy(false);
+      }
+    });
+  }
 
   return (
     <div className="auth-page">
@@ -212,9 +240,11 @@ export function LoginGate({ onSkip, skipLabel }: { onSkip: () => void; skipLabel
             {phase === 'signin' ? (
               <div className="auth-signin">
                 {cfg?.clientId ? (
-                  <div className="auth-google-shell">
-                    <div ref={host} className="auth-gsi" />
-                  </div>
+                  <button type="button" className="google-signin" onClick={openGoogle} disabled={!googleReady || googleFailed || busy}>
+                    <GoogleMark />
+                    <span>{lang === 'en' ? 'Sign in with Google' : '使用 Google 帳號登入'}</span>
+                    {!googleReady && !busy && !googleFailed ? <span className="google-signin-spinner" aria-hidden="true" /> : null}
+                  </button>
                 ) : null}
                 {busy ? <p className="auth-status" role="status"><span className="spin" />{t('auth.working')}</p> : null}
                 {!server ? <p className="auth-help">{t('auth.needServer')}</p> : null}
@@ -246,6 +276,17 @@ export function LoginGate({ onSkip, skipLabel }: { onSkip: () => void; skipLabel
 
       <footer className="auth-footer">{t('auth.footer')}</footer>
     </div>
+  );
+}
+
+function GoogleMark() {
+  return (
+    <svg className="google-mark" width="20" height="20" viewBox="0 0 48 48" aria-hidden="true">
+      <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5Z" />
+      <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65Z" />
+      <path fill="#FBBC05" d="M10.53 28.59A14.42 14.42 0 0 1 9.75 24c0-1.59.27-3.14.76-4.59l-7.98-6.19A23.85 23.85 0 0 0 0 24c0 3.86.92 7.51 2.53 10.78l8-6.19Z" />
+      <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.8l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48Z" />
+    </svg>
   );
 }
 

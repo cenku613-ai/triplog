@@ -88,6 +88,7 @@ function input(overrides: Partial<PrintInput> = {}): PrintInput {
     sections: { ...DEFAULT_SECTIONS },
     photos: [],
     mapImage: null,
+    itemMaps: {},
     ...overrides,
   };
 }
@@ -171,7 +172,7 @@ describe('buildPrintHtml', () => {
 
   it('開著地圖但擷取失敗時，講清楚而不是留一個空白區塊', () => {
     const html = buildPrintHtml(input({ mapImage: null }));
-    expect(html).toContain('地圖擷取失敗');
+    expect(html).toContain('旅程總覽擷取失敗');
     expect(html).not.toContain('class="mapshot"');
   });
 
@@ -208,5 +209,48 @@ describe('buildPrintHtml', () => {
     expect(html).toContain('<html lang="en">');
     expect(html).toContain('Travel record');
     setLang('zh-Hant');
+  });
+
+  it('每個有座標的行程點都有自己的地圖，放在該點資料旁邊', () => {
+    const mappedItems = [
+      { ...items[0], lat: 35.0116, lng: 135.7681 },
+      { ...items[1], lat: 35.6812, lng: 139.7671 },
+    ];
+    const html = buildPrintHtml(input({
+      items: mappedItems,
+      itemMaps: { i1: 'data:image/png;base64,POINT1', i2: 'data:image/png;base64,POINT2' },
+    }));
+    expect(html.match(/class="item-map"/g)).toHaveLength(2);
+    expect(html).toContain('一保堂茶鋪 周邊地圖');
+    expect(html).toContain('東急 Stay 入住 周邊地圖');
+    expect(html.indexOf('POINT1')).toBeGreaterThan(html.indexOf('一保堂茶鋪'));
+    expect(html.indexOf('POINT1')).toBeLessThan(html.indexOf('東急 Stay 入住'));
+    expect(html.indexOf('POINT2')).toBeGreaterThan(html.indexOf('東急 Stay 入住'));
+    expect(html).not.toContain('這一點的地圖暫時無法擷取');
+  });
+
+  it('單一地點擷取失敗只標示那一點，不會影響其他地圖', () => {
+    const html = buildPrintHtml(input({
+      items: [{ ...items[0], lat: 35.0116, lng: 135.7681 }],
+      itemMaps: { i1: null },
+    }));
+    expect(html).toContain('這一點的地圖暫時無法擷取');
+    expect(html).not.toContain('class="item-map"');
+  });
+
+  it('沒有座標或座標非法的行程點不會要求或顯示地圖', () => {
+    const html = buildPrintHtml(input({ items: [{ ...items[0], lat: 999, lng: 135.7681 }] }));
+    expect(html).not.toContain('class="item-map"');
+    expect(html).not.toContain('這一點的地圖暫時無法擷取');
+  });
+
+  it('關掉地圖後，連行程點地圖也不會出現', () => {
+    const html = buildPrintHtml(input({
+      items: [{ ...items[0], lat: 35.0116, lng: 135.7681 }],
+      sections: off(DEFAULT_SECTIONS, 'map'),
+      itemMaps: { i1: 'data:image/png;base64,POINT1' },
+    }));
+    expect(html).not.toContain('POINT1');
+    expect(html).not.toContain('class="item-map"');
   });
 });

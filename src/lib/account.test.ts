@@ -8,6 +8,7 @@ import {
   finishLogin,
   finishLogout,
   gateFor,
+  initializeGoogleSignIn,
   loadAccount,
   loginWithGoogle,
   normalizeBase,
@@ -151,6 +152,28 @@ describe('該不擋在登入畫面前面', () => {
 
   it('離線時給一條生路：這是一個離線先用的 app', () => {
     expect(gateFor('account', null, false)).toBe('offline');
+  });
+});
+
+describe('Google Identity 自訂按鈕', () => {
+  it('預先 initialize，點擊時把 moment listener 轉交 prompt', async () => {
+    const onCredential = vi.fn();
+    const prompt = vi.fn();
+    const initialize = vi.fn();
+    vi.stubGlobal('document', {});
+    vi.stubGlobal('window', { google: { accounts: { id: { initialize, prompt } } } });
+    const signIn = await initializeGoogleSignIn({ clientId: 'cid.apps.googleusercontent.com', onCredential });
+    expect(initialize).toHaveBeenCalledWith(expect.objectContaining({
+      client_id: 'cid.apps.googleusercontent.com',
+      ux_mode: 'popup',
+      auto_select: false,
+    }));
+    const options = initialize.mock.calls[0][0];
+    options.callback({ credential: 'google-id-token' });
+    expect(onCredential).toHaveBeenCalledWith('google-id-token');
+    const listener = vi.fn();
+    signIn.prompt(listener);
+    expect(prompt).toHaveBeenCalledWith(listener);
   });
 });
 
