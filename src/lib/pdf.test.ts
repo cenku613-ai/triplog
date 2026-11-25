@@ -141,6 +141,16 @@ describe('buildPrintHtml', () => {
     expect(html).toContain('Alice');
   });
 
+  it('地圖排在封面之後、每日行程之前', () => {
+    const html = buildPrintHtml(input({ mapImage: 'data:image/png;base64,AAAA' }));
+    const mapAt = html.indexOf('<h2>地圖</h2>');
+    const itineraryAt = html.indexOf('<h2>行程</h2>');
+    const firstDayAt = html.indexOf('class="day-head"');
+    expect(mapAt).toBeGreaterThan(html.indexOf('</header>'));
+    expect(itineraryAt).toBeGreaterThan(mapAt);
+    expect(firstDayAt).toBeGreaterThan(mapAt);
+  });
+
   it('關掉的區塊就不會出現在文件裡', () => {
     const all = { ...DEFAULT_SECTIONS };
     expect(buildPrintHtml(input({ sections: off(all, 'itinerary') }))).not.toContain('class="day-head"');

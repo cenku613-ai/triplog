@@ -385,10 +385,10 @@ export function buildPrintHtml(input: PrintInput): string {
     if (!sections[key]) return;
     parts.push(`<section><h2>${esc(title)}</h2>${body}</section>`);
   };
+  section(t('print.mapTitle'), 'map', mapSection(input));
   section(t('tab.plan'), 'itinerary', itinerarySection(input));
   section(t('tab.money'), 'expenses', expensesSection(input));
   section(t('tab.stats'), 'stats', statsSection(input));
-  section(t('print.mapTitle'), 'map', mapSection(input));
   section(t('photo.title'), 'photos', photosSection(input));
 
   const locale = lang() === 'en' ? 'en' : 'zh-Hant';
