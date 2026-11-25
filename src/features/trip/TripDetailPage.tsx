@@ -10,6 +10,7 @@ import { ExpensesTab } from '../expenses/ExpensesTab';
 import { StatsTab } from '../stats/StatsTab';
 /** Leaflet 約 40 KB gzip，沒開地圖頁就不必跟著首頻一起載 */
 const MapTab = lazy(() => import('./MapTab').then((m) => ({ default: m.MapTab })));
+const WeatherTab = lazy(() => import('./WeatherTab').then((m) => ({ default: m.WeatherTab })));
 /** PDF 文件會順帶拉進地圖擷取（Leaflet），所以連對話框一起延後載入 */
 const PrintDialog = lazy(() => import('./PrintDialog').then((m) => ({ default: m.PrintDialog })));
 /** 分享對話框只在按下去時才載：它帶的是網路邏輯，平常用不到 */
@@ -25,8 +26,8 @@ import { summarize } from '../../lib/stats';
 import { useUi } from '../../app/ui';
 import { useI18n } from '../../i18n';
 
-type Tab = 'plan' | 'checklist' | 'money' | 'stats' | 'map';
-const TAB_IDS: Tab[] = ['plan', 'checklist', 'money', 'stats', 'map'];
+type Tab = 'plan' | 'weather' | 'checklist' | 'money' | 'stats' | 'map';
+const TAB_IDS: Tab[] = ['plan', 'weather', 'checklist', 'money', 'stats', 'map'];
 
 export function TripDetailPage() {
   const { tripId = '' } = useParams();
@@ -46,6 +47,7 @@ export function TripDetailPage() {
 
   const TABS: { id: Tab; label: string }[] = [
     { id: 'plan', label: t('tab.plan') },
+    { id: 'weather', label: t('tab.weather') },
     { id: 'checklist', label: t('tab.checklist') },
     { id: 'money', label: t('tab.money') },
     { id: 'stats', label: t('tab.stats') },
@@ -167,6 +169,7 @@ export function TripDetailPage() {
             key={x.id}
             role="tab"
             aria-selected={tab === x.id}
+            aria-controls="trip-tab-panel"
             onClick={() => {
               const next = new URLSearchParams(params);
               next.set('tab', x.id);
@@ -179,7 +182,12 @@ export function TripDetailPage() {
       </div>
 
       <div className="trip-cols">
-        <div style={{ minWidth: 0 }}>
+        <div
+          id="trip-tab-panel"
+          role="tabpanel"
+          aria-label={TABS.find((x) => x.id === tab)?.label}
+          style={{ minWidth: 0 }}
+        >
           {tab === 'plan' ? (
             <ItineraryTab
               trip={trip}
@@ -190,6 +198,11 @@ export function TripDetailPage() {
               onEditItem={openItem}
               onAddExpense={(itemId, date) => openExpense({ itemId, date })}
             />
+          ) : null}
+          {tab === 'weather' ? (
+            <Suspense fallback={<div className="tiny">{t('weather.loading')}</div>}>
+              <WeatherTab trip={trip} items={items} onAddLocation={() => openItem({ item: items[0] })} />
+            </Suspense>
           ) : null}
           {tab === 'checklist' ? <ChecklistTab tripId={trip.id} items={checkItems} /> : null}
           {tab === 'money' ? (
