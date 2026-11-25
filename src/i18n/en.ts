@@ -303,6 +303,8 @@ export const en: Dict = {
   'map.attribution': 'Basemaps © OpenStreetMap contributors',
   'map.listAria': 'Itinerary items with coordinates',
   'map.openItem': 'Edit this item',
+  'map.navigate': 'Navigate with Google Maps',
+  'map.navigateAria': 'Navigate to “{title}” with Google Maps',
   'item.map': 'Pin it on the map',
   'item.note': 'Note (optional)',
   'item.notePlaceholder': 'Train number, booking ref, reminders…',

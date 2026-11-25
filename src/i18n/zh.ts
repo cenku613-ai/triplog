@@ -297,6 +297,8 @@ export const zh = {
   'map.attribution': '圖資 © OpenStreetMap contributors',
   'map.listAria': '有座標的行程項',
   'map.openItem': '編輯這個行程項',
+  'map.navigate': 'Google 地圖導航',
+  'map.navigateAria': '用 Google 地圖導航到「{title}」',
   'item.map': '在地圖上選位置',
   'item.note': '備註（選填）',
   'item.notePlaceholder': '車次、訂位編號、注意事項…',

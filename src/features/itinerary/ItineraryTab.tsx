@@ -9,6 +9,7 @@ import { dateRange, dayIndex, dayLabel, formatDuration, prettyDate } from '../..
 import { useUi } from '../../app/ui';
 import { useI18n } from '../../i18n';
 import { categoryChar, categoryLabel, expenseLabel } from '../../lib/labels';
+import { NavigationLink } from '../../components/NavigationLink';
 
 const NO_PHOTOS: Photo[] = [];
 const EMPTY_MAP = new Map<string, Photo[]>();
@@ -118,6 +119,7 @@ export function ItineraryTab({
                         {it.location ? ` · ${it.location}` : ''}
                         {it.note ? ` · ${it.note}` : ''}
                       </div>
+                      <NavigationLink lat={it.lat} lng={it.lng} title={it.title} />
                       {linked(it.id).length > 0 ? (
                         <div className="sub">
                           <span className="badge" style={{ color: 'var(--brand-strong)' }}>

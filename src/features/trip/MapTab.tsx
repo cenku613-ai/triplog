@@ -6,6 +6,7 @@ import { dayLabel, formatDuration, prettyDate } from '../../lib/dates';
 import { Empty } from '../../components/Controls';
 import type { DayItem, Trip } from '../../db/types';
 import { useI18n } from '../../i18n';
+import { NavigationLink } from '../../components/NavigationLink';
 
 /**
  * 旅行地圖：把有座標的行程項畫在同一張圖上，同一天同一色。
@@ -144,6 +145,7 @@ export function MapTab({
                   >
                     {p.item.title}
                   </button>
+                  <NavigationLink lat={p.lat} lng={p.lng} title={p.item.title} compact />
                   <button
                     type="button"
                     className="icon-btn"

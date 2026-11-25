@@ -326,6 +326,8 @@ button.chip[aria-pressed='true'] {
 
 .timeline {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
   gap: var(--sp-2);
   padding-left: var(--sp-2);
   border-left: 2px solid var(--line);
@@ -401,6 +403,38 @@ button.chip[aria-pressed='true'] {
   color: var(--text);
 }
 
+.google-nav-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.2;
+}
+
+.google-nav-link svg {
+  flex: 0 0 auto;
+}
+
+.google-nav-link:hover {
+  background: var(--brand-soft);
+  color: var(--brand-strong);
+}
+
+.google-nav-item {
+  margin-top: var(--sp-2);
+  padding: 0 10px;
+  background: var(--brand-soft);
+  color: var(--brand-strong);
+}
+
+.google-nav-compact {
+  flex: 0 0 auto;
+  color: var(--brand-strong);
+}
+
 /* 觸控裝置上把次要按鈕放大到 44px 的擊區 */
 @media (pointer: coarse) {
   .icon-btn {
@@ -409,8 +443,24 @@ button.chip[aria-pressed='true'] {
     font-size: 17px;
   }
 
+  .google-nav-link {
+    min-height: 44px;
+  }
+
   .btn-sm {
     min-height: 40px;
+  }
+}
+
+@media (max-width: 420px) {
+  .tl-item {
+    flex-wrap: wrap;
+    row-gap: var(--sp-2);
+  }
+
+  .tl-item .tools {
+    flex: 0 0 calc(100% - 64px);
+    margin-left: 64px;
   }
 }
 
