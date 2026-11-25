@@ -8,6 +8,7 @@ html,
 body,
 #root {
   height: 100%;
+  min-width: 0;
 }
 
 body {
@@ -140,18 +141,26 @@ table {
 
 .stack {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--sp-3);
 }
 
 .stack-s {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--sp-2);
 }
 
 .grid2 {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--sp-3);
+}
+
+@media (max-width: 359px) {
+  .grid2 {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .hide {

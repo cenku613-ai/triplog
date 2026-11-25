@@ -109,33 +109,35 @@ export function StatsTab({
 
       <div className="card card-pad">
         <h3 style={{ marginBottom: 'var(--sp-3)' }}>{t('stats.byCurrency')}</h3>
-        <table>
-          <thead>
-            <tr className="tiny" style={{ textAlign: 'left' }}>
-              <th>{t('stats.colCurrency')}</th>
-              <th>{t('stats.colCount')}</th>
-              <th className="right">{t('stats.colOriginal')}</th>
-              <th className="right">{t('stats.colBase', { code: trip.baseCurrency })}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {s.byCurrency.map((b) => {
-              const baseSum = expenses
-                .filter((e) => e.currency === b.key)
-                .reduce((sum, e) => sum + e.baseAmount, 0);
-              return (
-                <tr key={b.key}>
-                  <td>
-                    <strong>{b.key}</strong>
-                  </td>
-                  <td className="muted">{b.count}</td>
-                  <td className="right num">{formatAmount(b.amount, b.key)}</td>
-                  <td className="right num">{formatAmount(baseSum, trip.baseCurrency)}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+        <div className="table-scroll">
+          <table className="stats-currency-table">
+            <thead>
+              <tr className="tiny" style={{ textAlign: 'left' }}>
+                <th>{t('stats.colCurrency')}</th>
+                <th>{t('stats.colCount')}</th>
+                <th className="right">{t('stats.colOriginal')}</th>
+                <th className="right">{t('stats.colBase', { code: trip.baseCurrency })}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {s.byCurrency.map((b) => {
+                const baseSum = expenses
+                  .filter((e) => e.currency === b.key)
+                  .reduce((sum, e) => sum + e.baseAmount, 0);
+                return (
+                  <tr key={b.key}>
+                    <td>
+                      <strong>{b.key}</strong>
+                    </td>
+                    <td className="muted">{b.count}</td>
+                    <td className="right num">{formatAmount(b.amount, b.key)}</td>
+                    <td className="right num">{formatAmount(baseSum, trip.baseCurrency)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
         {s.byCurrency.some((b) => b.key !== trip.baseCurrency) ? (
           <p className="tiny" style={{ marginTop: 'var(--sp-2)' }}>
             {t('stats.rateNote')}

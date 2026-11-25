@@ -91,10 +91,10 @@ function Shell() {
   const signedIn = Boolean(shared && isSessionToken(shared.apiKey));
   const { busy: signingOut, signOut } = useSignOut();
   const nav = [
-    { to: '/', label: t('nav.trips'), icon: '🧳', end: true },
-    { to: '/expenses', label: t('nav.expenses'), icon: '💸', end: false },
-    ...(signedIn ? [{ to: '/shared', label: t('invite.mineTitle'), icon: '🤝', end: false }] : []),
-    { to: '/settings', label: t('nav.settings'), icon: '⚙', end: false },
+    { to: '/', label: t('nav.trips'), icon: 'trips', end: true },
+    { to: '/expenses', label: t('nav.expenses'), icon: 'expenses', end: false },
+    ...(signedIn ? [{ to: '/shared', label: t('invite.mineTitle'), icon: 'shared', end: false }] : []),
+    { to: '/settings', label: t('nav.settings'), icon: 'settings', end: false },
   ];
 
   // 桌面快速鍵
@@ -132,7 +132,7 @@ function Shell() {
         </div>
         {nav.map((n) => (
           <NavLink key={n.to} to={n.to} end={n.end}>
-            <span aria-hidden="true">{n.icon}</span>
+            <NavIcon name={n.icon} />
             {n.label}
           </NavLink>
         ))}
@@ -159,13 +159,15 @@ function Shell() {
         <div className="actions">
           {/* 手機沒有側欄，共筆的入口與登出都掛在標頭上；金鑰模式下這兩顆不出現 */}
           {signedIn ? (
-            <Link to="/shared" className="btn btn-sm">
-              {t('invite.mineTitle')}
+            <Link to="/shared" className="btn btn-sm topbar-icon-action" aria-label={t('invite.mineTitle')} title={t('invite.mineTitle')}>
+              <NavIcon name="shared" />
+              <span className="topbar-action-label">{t('invite.mineTitle')}</span>
             </Link>
           ) : null}
           {signedIn ? (
-            <button type="button" className="btn btn-sm" onClick={() => void signOut()} disabled={signingOut}>
-              {t('auth.logout')}
+            <button type="button" className="btn btn-sm topbar-icon-action" onClick={() => void signOut()} disabled={signingOut} aria-label={t('auth.logout')} title={t('auth.logout')}>
+              <LogoutIcon />
+              <span className="topbar-action-label">{t('auth.logout')}</span>
             </button>
           ) : null}
           <button className="btn btn-sm" onClick={() => setQuick(true)}>
@@ -208,13 +210,23 @@ function Shell() {
 
       <nav className="tabbar" aria-label={t('nav.main')}>
         <NavLink to="/" end>
-          <span aria-hidden="true">🧳</span>
-          {t('nav.trips')}
+          <NavIcon name="trips" />
+          <span className="tabbar-label">{t('nav.trips')}</span>
+        </NavLink>
+        <NavLink to="/expenses">
+          <NavIcon name="expenses" />
+          <span className="tabbar-label">{t('nav.expenses')}</span>
         </NavLink>
         <span className="fab-host">{fab}</span>
+        {signedIn ? (
+          <NavLink to="/shared">
+            <NavIcon name="shared" />
+            <span className="tabbar-label">{t('invite.mineTitle')}</span>
+          </NavLink>
+        ) : null}
         <NavLink to="/settings">
-          <span aria-hidden="true">⚙</span>
-          {t('nav.settings')}
+          <NavIcon name="settings" />
+          <span className="tabbar-label">{t('nav.settings')}</span>
         </NavLink>
       </nav>
 
@@ -242,6 +254,24 @@ function Logo() {
         d="M12 5.6c-2.4 0-4.3 1.9-4.3 4.3 0 3 4.3 8.1 4.3 8.1s4.3-5.1 4.3-8.1c0-2.4-1.9-4.3-4.3-4.3Zm0 6a1.7 1.7 0 1 1 0-3.4 1.7 1.7 0 0 1 0 3.4Z"
         fill="#fff"
       />
+    </svg>
+  );
+}
+
+function NavIcon({ name }: { name: string }) {
+  const paths: Record<string, ReactNode> = {
+    trips: <><rect x="4" y="7" width="16" height="13" rx="3" /><path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M8 11v5m8-5v5" /></>,
+    expenses: <><path d="M6 3h12v18l-3-2-3 2-3-2-3 2V3Z" /><path d="M9 8h6M9 12h6M9 16h3" /></>,
+    shared: <><circle cx="9" cy="8" r="3" /><path d="M3 20v-2a6 6 0 0 1 12 0v2M16 5a3 3 0 0 1 0 6m2 3a5 5 0 0 1 3 4v2" /></>,
+    settings: <><circle cx="12" cy="12" r="3" /><path d="m9.5 3-.7 2.2-2 .9-2.1-.6-2.1 3.6 1.6 1.7v2.4l-1.6 1.7 2.1 3.6 2.1-.6 2 .9.7 2.2h5l.7-2.2 2-.9 2.1.6 2.1-3.6-1.6-1.7v-2.4l1.6-1.7-2.1-3.6-2.1.6-2-.9L14.5 3h-5Z" /></>,
+  };
+  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
+}
+
+function LogoutIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M10 4H5v16h5M14 8l4 4-4 4m4-4H9" />
     </svg>
   );
 }

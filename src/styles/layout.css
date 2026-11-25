@@ -3,6 +3,7 @@
 }
 
 .shell {
+  min-width: 0;
   min-height: 100%;
   display: grid;
   grid-template-areas:
@@ -21,7 +22,7 @@
   display: flex;
   align-items: center;
   gap: var(--sp-2);
-  padding: 0 var(--sp-3);
+  padding: 0 max(var(--sp-3), env(safe-area-inset-right)) 0 max(var(--sp-3), env(safe-area-inset-left));
   padding-top: env(safe-area-inset-top);
   height: calc(var(--header-h) + env(safe-area-inset-top));
   background: var(--surface);
@@ -32,6 +33,7 @@
   display: flex;
   align-items: center;
   gap: var(--sp-2);
+  min-width: 0;
   font-weight: 700;
   letter-spacing: 0.2px;
 }
@@ -48,15 +50,28 @@
   margin-left: auto;
   display: flex;
   align-items: center;
+  flex: 0 0 auto;
   gap: var(--sp-2);
+  min-width: 0;
+}
+
+.topbar .topbar-icon-action svg {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+}
+
+.topbar .topbar-icon-action {
+  flex: 0 0 auto;
 }
 
 .page {
   grid-area: page;
   width: 100%;
+  min-width: 0;
   max-width: 1180px;
   margin: 0 auto;
-  padding: var(--sp-4) var(--sp-3) var(--sp-6);
+  padding: max(var(--sp-4), env(safe-area-inset-right)) max(var(--sp-3), env(safe-area-inset-left)) var(--sp-6);
 }
 
 .page.wide {
@@ -85,6 +100,8 @@
   gap: var(--sp-1);
   height: calc(var(--nav-h) + env(safe-area-inset-bottom));
   padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
   background: var(--surface);
   border-top: 1px solid var(--line);
 }
@@ -95,10 +112,25 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 2px;
-  color: var(--text-3);
-  font-size: 11px;
+  gap: 3px;
   min-width: 0;
+  padding: 6px 2px;
+  color: var(--text-3);
+  font-size: 10.5px;
+}
+
+.tabbar a > svg {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+}
+
+.tabbar .tabbar-label {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tabbar a[aria-current='page'] {
@@ -178,7 +210,7 @@
   }
 }
 
-/* 手機：行程 / 支出 單欄 */
+/* 平板／桌機：主內容與側欄 */
 .trip-cols {
   display: grid;
   gap: var(--sp-4);
@@ -198,11 +230,6 @@
     font-size: 26px;
   }
 
-  .trip-cols {
-    grid-template-columns: minmax(0, 1fr) 300px;
-    align-items: start;
-  }
-
   .trips-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -213,6 +240,14 @@
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--sp-4);
+  }
+}
+
+/* 640–819px 保留單欄；八百多後主欄仍有約 470px，才放得下 280px 側欄。 */
+@media (min-width: 820px) {
+  .trip-cols {
+    grid-template-columns: minmax(0, 1fr) 280px;
+    align-items: start;
   }
 }
 
@@ -267,6 +302,12 @@
     min-height: var(--tap);
   }
 
+  .sidenav a > svg {
+    width: 20px;
+    height: 20px;
+    flex: 0 0 auto;
+  }
+
   .sidenav a:hover {
     background: var(--surface-2);
     color: var(--text);
@@ -296,10 +337,42 @@
   }
 
   .stats-grid {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .modal.wide {
     width: min(880px, 96vw);
+  }
+}
+
+/* 登入後的帳號動作物件在手機上收成圖示，保留完整觸控面積與無障礙名稱。 */
+@media (max-width: 560px) {
+  .topbar .topbar-action-label {
+    display: none;
+  }
+
+  .topbar .topbar-icon-action {
+    width: var(--tap);
+    min-width: var(--tap);
+    min-height: var(--tap);
+    padding: 0;
+  }
+}
+
+@media (max-width: 480px) {
+  .topbar .badge {
+    display: none;
+  }
+}
+
+@media (max-width: 379px) {
+  .topbar .title {
+    display: none;
+  }
+}
+
+@media (min-width: 1280px) {
+  .stats-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
